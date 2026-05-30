@@ -1078,6 +1078,13 @@ impl State {
             AxNotificationKind::MenuClosed => self.send_event(Event::MenuClosed(self.pid)),
             AxNotificationKind::WindowDestroyed => {
                 let Ok(wid) = self.wid_for_notification(&elem, hinted_wid) else {
+                    // Some apps — the Microsoft Office suite is the reported
+                    // case — never fire a window-closed notification and only
+                    // destroy the element, whose id no longer resolves by the
+                    // time this runs. Without this sweep their window keeps its
+                    // slot in the layout until something else happens to clear
+                    // it, leaving a gap where the window used to be.
+                    self.remove_stale_windows();
                     return;
                 };
                 // A refreshed AXUIElement can reuse the same stable WindowServer-backed
