@@ -188,16 +188,33 @@ pub unsafe fn switch_to_space_index(index: usize) {
     unsafe { switch_space_repeated(direction, steps.unsigned_abs()) };
 }
 
+/// The macOS space at 1-based `index` on the display holding the active space.
+pub fn space_at_index(index: usize) -> Option<SpaceId> {
+    let target = index.checked_sub(1)?;
+    spaces_on_active_display()?.get(target).copied()
+}
+
+/// The currently active macOS space.
+pub fn active_space() -> SpaceId {
+    SpaceId::new(unsafe { CGSGetActiveSpace(SLSMainConnectionID()) })
+}
+
+/// The ordered spaces of the display holding the active space.
+fn spaces_on_active_display() -> Option<Vec<SpaceId>> {
+    let active = active_space();
+    crate::sys::screen::managed_display_space_ids()
+        .into_values()
+        .find(|ids| ids.contains(&active))
+}
+
 /// Signed number of spaces between the active one and `index` on the same
 /// display. `None` when the index is out of range or the space is already
 /// active.
 fn steps_to_space_index(index: usize) -> Option<isize> {
     let target = index.checked_sub(1)?;
-    let active = SpaceId::new(unsafe { CGSGetActiveSpace(SLSMainConnectionID()) });
+    let active = active_space();
 
-    let spaces = crate::sys::screen::managed_display_space_ids()
-        .into_values()
-        .find(|ids| ids.contains(&active))?;
+    let spaces = spaces_on_active_display()?;
     if target >= spaces.len() {
         return None;
     }

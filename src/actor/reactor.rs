@@ -1642,6 +1642,27 @@ impl Reactor {
                 unsafe { crate::sys::space_switch::switch_to_space_index(index) };
                 return Ok(EventOutcome::default());
             }
+            Event::Command(Command::Reactor(ReactorCommand::MoveWindowToSpace {
+                index,
+                follow,
+            })) => {
+                self.move_focused_window_to_space(index, follow);
+                return Ok(EventOutcome::default());
+            }
+            Event::Command(Command::Reactor(ReactorCommand::CreateSpace)) => {
+                let active = crate::sys::space_switch::active_space();
+                if !crate::sys::scripting_addition::create_space(active.get()) {
+                    warn!("Creating a space needs yabai's scripting addition");
+                }
+                return Ok(EventOutcome::default());
+            }
+            Event::Command(Command::Reactor(ReactorCommand::DestroySpace)) => {
+                let active = crate::sys::space_switch::active_space();
+                if !crate::sys::scripting_addition::destroy_space(active.get()) {
+                    warn!("Destroying a space needs yabai's scripting addition");
+                }
+                return Ok(EventOutcome::default());
+            }
             Event::Command(Command::Reactor(ReactorCommand::ToggleSpaceActivated)) => {
                 let space = self.active_display_space();
                 let display_uuid = space.and_then(|space| {
@@ -3326,6 +3347,44 @@ impl Reactor {
                 app.handle.send(Request::SetWindowFrame(wid, frame, transaction, true))
         {
             warn!(window = ?wid, %error, "failed to apply modifier drag");
+        }
+    }
+
+    /// Moves the focused window to a macOS space by 1-based index.
+    ///
+    /// Goes through yabai's scripting addition, because macOS 26 leaves no
+    /// unprivileged way to do it — see `sys::scripting_addition`. The window
+    /// server tells rift where the window went, so nothing here has to update
+    /// the model by hand.
+    fn move_focused_window_to_space(&mut self, index: usize, follow: bool) {
+        let Some(space) = crate::sys::space_switch::space_at_index(index) else {
+            debug!(index, "No macOS space at that index");
+            return;
+        };
+        let Some(wid) = self.main_window().or_else(|| self.window_id_under_cursor()) else {
+            debug!("No window to move");
+            return;
+        };
+        let Some(window_server_id) =
+            self.state.windows.window(wid).and_then(|window| window.info.sys_id)
+        else {
+            warn!(?wid, "Cannot move a window with no window-server id to a space");
+            return;
+        };
+
+        if !crate::sys::scripting_addition::move_window_to_space(
+            window_server_id.as_u32(),
+            space.get(),
+        ) {
+            warn!(
+                ?wid,
+                ?space,
+                "Moving a window to a space needs yabai's scripting addition"
+            );
+            return;
+        }
+        if follow {
+            unsafe { crate::sys::space_switch::switch_to_space_index(index) };
         }
     }
 

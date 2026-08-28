@@ -260,6 +260,17 @@ enum SpaceCommands {
     ToggleActivated,
     /// Switch to a macOS space by number (1-based), instantly and without the slide animation
     SwitchTo { index: usize },
+    /// Move the focused window to a macOS space by number (1-based). Needs yabai's scripting addition
+    MoveWindow {
+        index: usize,
+        /// Switch to the destination space after moving the window.
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Create a space on the active display. Needs yabai's scripting addition
+    Create,
+    /// Destroy the active space. Needs yabai's scripting addition
+    Destroy,
     /// Switch to an adjacent macOS space (Mission Control spaces, not virtual workspaces)
     Switch {
         /// Direction to switch (left, right, up, down)
@@ -1079,6 +1090,14 @@ fn map_space_command(cmd: SpaceCommands) -> Result<CliCommand, String> {
             }
             reactor::ReactorCommand::SwitchToSpace(index)
         }
+        SpaceCommands::MoveWindow { index, follow } => {
+            if index == 0 {
+                return Err("space numbers are 1-based".to_string());
+            }
+            reactor::ReactorCommand::MoveWindowToSpace { index, follow }
+        }
+        SpaceCommands::Create => reactor::ReactorCommand::CreateSpace,
+        SpaceCommands::Destroy => reactor::ReactorCommand::DestroySpace,
     };
 
     Ok(CliCommand::Reactor(reactor::Command::Reactor(command)))

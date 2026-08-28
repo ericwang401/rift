@@ -104,6 +104,18 @@ pub enum ReactorCommand {
     SwitchSpace(Direction),
     /// Switch to a macOS space by its position on the active display, 1-based.
     SwitchToSpace(usize),
+    /// Move a window to a macOS space by its position on the active display,
+    /// 1-based. Defaults to the focused window. Needs yabai's scripting
+    /// addition: macOS 26 has no unprivileged API left that can do this.
+    MoveWindowToSpace {
+        index: usize,
+        #[serde(default)]
+        follow: bool,
+    },
+    /// Create a macOS space on the active display. Scripting addition only.
+    CreateSpace,
+    /// Destroy the active macOS space. Scripting addition only.
+    DestroySpace,
     ToggleSpaceActivated,
     FocusWindow {
         window_id: WindowId,

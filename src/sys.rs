@@ -27,6 +27,7 @@ pub mod run_loop;
 pub mod screen;
 pub mod service;
 pub mod skylight;
+pub mod scripting_addition;
 pub mod space_switch;
 pub mod timer;
 pub mod window_notify;
