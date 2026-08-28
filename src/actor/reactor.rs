@@ -126,11 +126,17 @@ pub struct ReactorHandle {
 }
 
 impl ReactorHandle {
-    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self { Self { sender, queries } }
+    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self {
+        Self { sender, queries }
+    }
 
-    pub fn sender(&self) -> Sender { self.sender.clone() }
+    pub fn sender(&self) -> Sender {
+        self.sender.clone()
+    }
 
-    pub fn send(&self, event: Event) { self.sender.send(event) }
+    pub fn send(&self, event: Event) {
+        self.sender.send(event)
+    }
 
     pub fn try_send(
         &self,
@@ -143,7 +149,9 @@ impl ReactorHandle {
 impl std::ops::Deref for ReactorHandle {
     type Target = ReactorQueryHandle;
 
-    fn deref(&self) -> &Self::Target { &self.queries }
+    fn deref(&self) -> &Self::Target {
+        &self.queries
+    }
 }
 
 use crate::model::server::RuntimeWindowData;
@@ -468,7 +476,9 @@ impl Reactor {
         }
     }
 
-    fn is_space_active(&self, space: SpaceId) -> bool { self.active_spaces.contains(&space) }
+    fn is_space_active(&self, space: SpaceId) -> bool {
+        self.active_spaces.contains(&space)
+    }
 
     fn iter_active_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
         self.active_spaces.iter().copied()
@@ -490,7 +500,9 @@ impl Reactor {
         }
     }
 
-    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> { self.space_state.screens.clone() }
+    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> {
+        self.space_state.screens.clone()
+    }
 
     fn display_uuids_for_current_screens(&self) -> Vec<Option<String>> {
         self.space_state
@@ -967,7 +979,9 @@ impl Reactor {
         self.refresh_quarantine_manager.state()
     }
 
-    fn refreshes_blocked(&self) -> bool { self.refresh_quarantine_manager.blocks_refreshes() }
+    fn refreshes_blocked(&self) -> bool {
+        self.refresh_quarantine_manager.blocks_refreshes()
+    }
 
     fn defer_visible_refresh(&mut self, track_mission_control_refresh: bool) {
         self.refresh_quarantine_manager.pending_visible_refresh = true;
@@ -1639,7 +1653,12 @@ impl Reactor {
                 return command_workflow::handle_switch_native_space(direction);
             }
             Event::Command(Command::Reactor(ReactorCommand::SwitchToSpace(index))) => {
-                unsafe { crate::sys::space_switch::switch_to_space_index(index) };
+                unsafe {
+                    crate::sys::space_switch::switch_to_space_index(
+                        index,
+                        self.config.settings.space_switch_method,
+                    )
+                };
                 return Ok(EventOutcome::default());
             }
             Event::Command(Command::Reactor(ReactorCommand::MoveWindowToSpace {
@@ -2062,7 +2081,9 @@ impl Reactor {
         }
 
         if let Some(direction) = outcome.switch_native_space {
-            unsafe { window_server::switch_space(direction) };
+            unsafe {
+                window_server::switch_space(direction, self.config.settings.space_switch_method)
+            };
         }
 
         for (pid, window) in outcome.make_key_windows {
@@ -2693,11 +2714,14 @@ impl Reactor {
                     .windows
                     .get_window_server_info(wsid)
                     .or_else(|| window_server::get_window(wsid));
-                (wsid, window_discovery::StaleWindowObservation {
-                    info,
-                    suitable: window_server::app_window_suitability(wsid),
-                    ordered_in: window_server::window_ordered_in(wsid),
-                })
+                (
+                    wsid,
+                    window_discovery::StaleWindowObservation {
+                        info,
+                        suitable: window_server::app_window_suitability(wsid),
+                        ordered_in: window_server::window_ordered_in(wsid),
+                    },
+                )
             })
             .collect();
         let stale_snapshot = window_discovery::StaleCleanupSnapshot {
@@ -3384,7 +3408,12 @@ impl Reactor {
             return;
         }
         if follow {
-            unsafe { crate::sys::space_switch::switch_to_space_index(index) };
+            unsafe {
+                crate::sys::space_switch::switch_to_space_index(
+                    index,
+                    self.config.settings.space_switch_method,
+                )
+            };
         }
     }
 
@@ -3395,8 +3424,11 @@ impl Reactor {
         if self.config.settings.mouse_follows_focus_blacklist.is_empty() {
             return true;
         }
-        let Some(bundle_id) =
-            self.app_manager.apps.get(&wid.pid).and_then(|app| app.info.bundle_id.as_deref())
+        let Some(bundle_id) = self
+            .app_manager
+            .apps
+            .get(&wid.pid)
+            .and_then(|app| app.info.bundle_id.as_deref())
         else {
             return true;
         };
@@ -4581,7 +4613,9 @@ impl Reactor {
     // Uses the same "pending refresh" path as Mission Control recovery so a bulk
     // visibility rediscovery can reconcile tracked windows without treating a
     // transient empty AX window list as authoritative removal.
-    fn force_refresh_all_windows(&mut self) { self.request_visible_windows_for_apps(true); }
+    fn force_refresh_all_windows(&mut self) {
+        self.request_visible_windows_for_apps(true);
+    }
 
     fn has_user_space_context(&self) -> bool {
         self.raw_command_space().is_some_and(|space| !self.is_fullscreen_space(space))
@@ -4600,7 +4634,9 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn main_window(&self) -> Option<WindowId> { self.main_window_tracker.main_window() }
+    pub(crate) fn main_window(&self) -> Option<WindowId> {
+        self.main_window_tracker.main_window()
+    }
 
     fn main_window_space(&self) -> Option<SpaceId> {
         // TODO: Optimize this with a cache or something.
@@ -4619,7 +4655,9 @@ impl Reactor {
         (self.workspace_command_space() == Some(space)).then_some((space, window))
     }
 
-    fn raw_command_space(&self) -> Option<SpaceId> { self.space_state.command_space }
+    fn raw_command_space(&self) -> Option<SpaceId> {
+        self.space_state.command_space
+    }
 
     fn active_display_space(&self) -> Option<SpaceId> {
         self.raw_command_space()

@@ -142,7 +142,9 @@ pub struct LayoutEventOutcome {
 impl std::ops::Deref for LayoutEventOutcome {
     type Target = EventResponse;
 
-    fn deref(&self) -> &Self::Target { &self.response }
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
 }
 
 pub struct LayoutEngine {
@@ -172,7 +174,9 @@ pub(crate) struct WorkspaceLayoutQuerySnapshot {
 }
 
 impl LayoutEngine {
-    pub fn focused_window(&self) -> Option<WindowId> { self.focused_window }
+    pub fn focused_window(&self) -> Option<WindowId> {
+        self.focused_window
+    }
 
     /// Resolve an optional workspace index and snapshot its layout for read-only consumers.
     pub(crate) fn query_workspace_layout(
@@ -1414,7 +1418,9 @@ impl LayoutEngine {
             .mark_last_saved(resize.space, resize.workspace_id, layout);
     }
 
-    pub fn debug_tree(&self, space: SpaceId) { self.debug_tree_desc(space, "", false); }
+    pub fn debug_tree(&self, space: SpaceId) {
+        self.debug_tree_desc(space, "", false);
+    }
 
     pub fn debug_tree_desc(&self, space: SpaceId, desc: &'static str, print: bool) {
         if let Some(workspace_id) = self.virtual_workspace_manager.active_workspace(space) {
@@ -2049,6 +2055,7 @@ impl LayoutEngine {
             | LayoutCommand::SwitchToWorkspace(_)
             | LayoutCommand::MoveWindowToWorkspace { .. }
             | LayoutCommand::SetWorkspaceLayout { .. }
+            | LayoutCommand::ToggleWorkspaceLayout(_)
             | LayoutCommand::CreateWorkspace
             | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace => EventResponse::default(),
@@ -2774,8 +2781,7 @@ impl LayoutEngine {
                     }
 
                     if !is_floating {
-                        if let Some(target_layout) =
-                            self.workspace_layouts.active(space, successor)
+                        if let Some(target_layout) = self.workspace_layouts.active(space, successor)
                         {
                             self.workspace_tree_mut(successor)
                                 .add_window_after_selection(target_layout, wid);
@@ -2815,6 +2821,38 @@ impl LayoutEngine {
                     return self.activate_workspace(window_store, space, last_workspace, None);
                 }
                 EventResponse::default()
+            }
+            LayoutCommand::ToggleWorkspaceLayout(modes) => {
+                if modes.is_empty() {
+                    return EventResponse::default();
+                }
+                let Some(workspace_id) = self.workspace_id_for_index(space, None) else {
+                    return EventResponse::default();
+                };
+                let current = self
+                    .virtual_workspace_manager
+                    .workspace_info(space, workspace_id)
+                    .map(|workspace| workspace.layout_mode());
+                // Land on the first mode when the current one is not in the
+                // list, so a cycle started from an unrelated layout is still
+                // predictable.
+                let next = current
+                    .and_then(|current| modes.iter().position(|mode| *mode == current))
+                    .map_or(0, |index| (index + 1) % modes.len());
+
+                if !self.switch_workspace_layout_mode(
+                    window_store,
+                    space,
+                    workspace_id,
+                    modes[next],
+                ) {
+                    return EventResponse::default();
+                }
+                self.broadcast_workspace_changed(space);
+                EventResponse {
+                    changed: true,
+                    ..EventResponse::default()
+                }
             }
             LayoutCommand::SetWorkspaceLayout { workspace, mode } => {
                 let Some(workspace_id) = self.workspace_id_for_index(space, *workspace) else {
@@ -2860,7 +2898,9 @@ impl LayoutEngine {
         self.switch_to_workspace(window_store, space, workspace_index, Some(focus_window))
     }
 
-    pub fn virtual_workspace_manager(&self) -> &WorkspaceStore { &self.virtual_workspace_manager }
+    pub fn virtual_workspace_manager(&self) -> &WorkspaceStore {
+        &self.virtual_workspace_manager
+    }
 
     pub fn virtual_workspace_manager_mut(&mut self) -> &mut WorkspaceStore {
         &mut self.virtual_workspace_manager
@@ -3543,12 +3583,15 @@ mod tests {
         assert_eq!(frame.size.width, 234.0);
 
         let user_frame = CGRect::new(new_frame.origin, CGSize::new(400.0, new_frame.size.height));
-        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowResized {
-            wid: window,
-            old_frame: new_frame,
-            new_frame: user_frame,
-            screens: vec![(space, screen, None)],
-        });
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::WindowResized {
+                wid: window,
+                old_frame: new_frame,
+                new_frame: user_frame,
+                screens: vec![(space, screen, None)],
+            },
+        );
         let frames = engine.calculate_layout(
             space,
             screen,

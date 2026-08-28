@@ -40,6 +40,7 @@ use tracing::{debug, warn};
 /// yabai's opcodes. Only the ones rift has no other way to perform are listed;
 /// the numbering belongs to yabai's `enum sa_opcode`.
 mod opcode {
+    pub const SPACE_FOCUS: u8 = 0x02;
     pub const SPACE_CREATE: u8 = 0x03;
     pub const SPACE_DESTROY: u8 = 0x04;
     pub const WINDOW_TO_SPACE: u8 = 0x13;
@@ -105,6 +106,22 @@ pub fn move_window_to_space(window_server_id: u32, space: u64) -> bool {
     args.extend_from_slice(&space.to_ne_bytes());
     args.extend_from_slice(&window_server_id.to_ne_bytes());
     send(opcode::WINDOW_TO_SPACE, &args)
+}
+
+/// Focuses a space by id, with no animation whatsoever.
+///
+/// Inside Dock this is `SLSShowSpaces` / `SLSHideSpaces` /
+/// `SLSManagedDisplaySetCurrentSpace` plus a patch of Dock's own
+/// `_currentSpace` ivar — a teleport, not a gesture, so nothing slides. The
+/// synthetic-swipe path in `sys::space_switch` still shows a single frame of
+/// movement because it drives the Dock's real swipe machinery; this does not.
+///
+/// The trade is state: this sets the window server's idea of the current space
+/// directly, and issuing many in quick succession has been observed to leave
+/// Dock settling somewhere other than the last space asked for. Fine for
+/// ordinary use, worse than the gesture under repeated rapid switching.
+pub fn focus_space(space: u64) -> bool {
+    send(opcode::SPACE_FOCUS, &space.to_ne_bytes())
 }
 
 /// Creates a space on the display holding `space`.

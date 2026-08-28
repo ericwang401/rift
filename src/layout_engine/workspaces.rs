@@ -24,7 +24,9 @@ struct SpaceLayoutInfo {
 pub(crate) struct WorkspaceLayoutSnapshot(SpaceLayoutInfo);
 
 impl SpaceLayoutInfo {
-    fn active(&self) -> Option<LayoutId> { self.configurations.get(&self.active_size).copied() }
+    fn active(&self) -> Option<LayoutId> {
+        self.configurations.get(&self.active_size).copied()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
@@ -305,11 +307,14 @@ impl WorkspaceLayouts {
         let mut configurations = crate::common::collections::HashMap::default();
         configurations.insert(active_size, new_layout);
 
-        self.map.insert((space, workspace_id), SpaceLayoutInfo {
-            configurations,
-            active_size,
-            last_saved: Some(new_layout),
-        });
+        self.map.insert(
+            (space, workspace_id),
+            SpaceLayoutInfo {
+                configurations,
+                active_size,
+                last_saved: Some(new_layout),
+            },
+        );
     }
 
     /// Drops the layout bookkeeping for a destroyed workspace.

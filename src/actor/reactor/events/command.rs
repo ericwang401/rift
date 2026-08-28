@@ -57,6 +57,7 @@ pub fn handle_command_layout(
             | LayoutCommand::SwitchToWorkspace(_)
             | LayoutCommand::MoveWindowToWorkspace { follow: true, .. }
             | LayoutCommand::SetWorkspaceLayout { .. }
+            | LayoutCommand::ToggleWorkspaceLayout(_)
             | LayoutCommand::CreateWorkspace
             | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace
@@ -68,6 +69,7 @@ pub fn handle_command_layout(
             | LayoutCommand::SwitchToWorkspace(_)
             | LayoutCommand::MoveWindowToWorkspace { .. }
             | LayoutCommand::SetWorkspaceLayout { .. }
+            | LayoutCommand::ToggleWorkspaceLayout(_)
             | LayoutCommand::CreateWorkspace
             | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace
@@ -91,6 +93,7 @@ pub fn handle_command_layout(
         | LayoutCommand::PrevWorkspace(_)
         | LayoutCommand::SwitchToWorkspace(_)
         | LayoutCommand::SetWorkspaceLayout { .. }
+        | LayoutCommand::ToggleWorkspaceLayout(_)
         | LayoutCommand::CreateWorkspace
         | LayoutCommand::DestroyWorkspace
         | LayoutCommand::SwitchToLastWorkspace => {
@@ -276,10 +279,13 @@ pub fn handle_command_reactor_toggle_space_activated(
     let Some(space) = payload.space else {
         return Ok(EventOutcome::no_change());
     };
-    policy.toggle_space_activated(payload.config, ToggleSpaceContext {
-        space,
-        display_uuid: payload.display_uuid,
-    });
+    policy.toggle_space_activated(
+        payload.config,
+        ToggleSpaceContext {
+            space,
+            display_uuid: payload.display_uuid,
+        },
+    );
     Ok(EventOutcome::layout_changed(false).with_active_space_recompute())
 }
 

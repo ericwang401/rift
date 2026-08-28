@@ -74,6 +74,12 @@ pub enum LayoutCommand {
         workspace: Option<usize>,
         mode: LayoutMode,
     },
+    /// Cycle the active workspace through the given layout modes.
+    ///
+    /// yabai had no such command either; its users wrote the toggle out as a
+    /// shell pipeline that queried the space's current type and picked the
+    /// other one. Two modes make that a toggle; more make it a cycle.
+    ToggleWorkspaceLayout(Vec<LayoutMode>),
     CreateWorkspace,
     DestroyWorkspace,
     SwitchToLastWorkspace,
@@ -248,7 +254,9 @@ impl From<TypedRiftCommand> for RiftCommand {
 
 impl<'de> Deserialize<'de> for RiftCommand {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum CommandInput {
@@ -264,7 +272,9 @@ impl<'de> Deserialize<'de> for RiftCommand {
 }
 
 fn decode_legacy_command<E>(command: &str) -> Result<RiftCommand, E>
-where E: DeError {
+where
+    E: DeError,
+{
     match serde_json::from_str::<LegacyCommand>(command)
         .map_err(|error| E::custom(format!("invalid legacy command JSON: {error}")))?
     {

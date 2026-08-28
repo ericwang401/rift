@@ -466,7 +466,9 @@ fn add_submenu(
     (item, submenu)
 }
 
-fn add_separator(menu: &NSMenu) { menu.addItem(&menu_separator()); }
+fn add_separator(menu: &NSMenu) {
+    menu.addItem(&menu_separator());
+}
 
 fn menu_separator() -> Retained<NSMenuItem> {
     unsafe { msg_send![NSMenuItem::class(), separatorItem] }
@@ -820,13 +822,17 @@ impl MenuActionHandler {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn emit(&self, action: MenuAction) { let _ = self.ivars().action_tx.send(action); }
+    fn emit(&self, action: MenuAction) {
+        let _ = self.ivars().action_tx.send(action);
+    }
 
     fn set_layout_files(&self, paths: Vec<PathBuf>) {
         *self.ivars().layout_files.borrow_mut() = paths;
     }
 
-    fn set_layout_folder(&self, path: PathBuf) { *self.ivars().layout_folder.borrow_mut() = path; }
+    fn set_layout_folder(&self, path: PathBuf) {
+        *self.ivars().layout_folder.borrow_mut() = path;
+    }
 
     fn layout_file_for_item(&self, item: Option<&NSMenuItem>) -> Option<PathBuf> {
         let index = usize::try_from(item?.tag()).ok()?;

@@ -300,6 +300,12 @@ enum WorkspaceCommands {
     Destroy,
     /// Switch to the last workspace
     Last,
+    /// Cycle the active workspace through layout modes, e.g. `toggle-layout bsp stack`
+    ToggleLayout {
+        /// Two or more of: traditional, bsp, stack, master_stack, scrolling
+        #[arg(required = true, num_args = 1..)]
+        modes: Vec<String>,
+    },
     /// Set layout mode for a workspace (or active workspace when omitted)
     SetLayout {
         /// Workspace index (0-based). Defaults to active workspace if omitted.
@@ -726,7 +732,8 @@ fn into_protocol_command(command: CliCommand) -> Result<rift_protocol::RiftComma
 fn decode_protocol<T, U>(value: T) -> Result<U, String>
 where
     T: Serialize,
-    U: DeserializeOwned, {
+    U: DeserializeOwned,
+{
     serde_json::from_value(serde_json::to_value(value).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
 }
@@ -895,6 +902,15 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<CliCommand, String> {
         WorkspaceCommands::Last => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),
+        WorkspaceCommands::ToggleLayout { modes } => {
+            let modes = modes
+                .iter()
+                .map(|mode| parse_layout_mode(mode))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CliCommand::Reactor(reactor::Command::Layout(
+                LC::ToggleWorkspaceLayout(modes),
+            )))
+        }
         WorkspaceCommands::SetLayout { workspace_id, mode } => {
             let mode = parse_layout_mode(&mode)?;
             Ok(CliCommand::Reactor(reactor::Command::Layout(
@@ -944,9 +960,7 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
                 "y" | "y-axis" => rift_protocol::MirrorAxis::Y,
                 other => return Err(format!("invalid axis {other}; expected x or y")),
             };
-            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Mirror(
-                axis,
-            ))))
+            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Mirror(axis))))
         }
         LayoutCommands::ToggleFocusFloat => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::ToggleFocusFloating,

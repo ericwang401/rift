@@ -42,12 +42,10 @@ fn sync_existing_window_state(
 
     let outcome = match (was_minimized, info.is_minimized) {
         (false, true) => window::handle_window_minimized(state, wid)?,
-        (true, false) => {
-            window::handle_window_deminiaturized(state, window::WindowDeminiaturizedPayload {
-                window: wid,
-                active_space,
-            })?
-        }
+        (true, false) => window::handle_window_deminiaturized(
+            state,
+            window::WindowDeminiaturizedPayload { window: wid, active_space },
+        )?,
         _ => {
             if let Some(existing) = state.windows.window_mut(wid) {
                 existing.info.is_minimized = info.is_minimized;
