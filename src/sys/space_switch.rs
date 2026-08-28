@@ -21,10 +21,9 @@ const K_CGS_EVENT_TYPE_FIELD: CGEventField = CGEventField(55);
 const K_CGS_EVENT_MARKER: i64 = 29;
 const K_CGS_EVENT_DOCK_CONTROL: i64 = 30;
 
-const K_GESTURE_SUBTYPE_FIELD: CGEventField = CGEventField(41);
-const K_GESTURE_SUBTYPE: i64 = 33231;
 
 const K_GESTURE_HID_TYPE_FIELD: CGEventField = CGEventField(110);
+const K_GESTURE_SCROLL_Y_FIELD: CGEventField = CGEventField(119);
 const K_GESTURE_SWIPE_MASK_FIELD: CGEventField = CGEventField(115);
 const K_GESTURE_SWIPE_MOTION_FIELD: CGEventField = CGEventField(123);
 const K_GESTURE_SWIPE_PROGRESS_FIELD: CGEventField = CGEventField(124);
@@ -38,8 +37,6 @@ const K_GESTURE_PROGRESS_BITS_FIELD: CGEventField = CGEventField(135);
 const K_GESTURE_FLAVOR_FIELD: CGEventField = CGEventField(138);
 const K_GESTURE_POSITION_FALLBACK_FIELD: CGEventField = CGEventField(139);
 const K_GESTURE_TIMESTAMP_FIELD: CGEventField = CGEventField(169);
-const K_GESTURE_UNUSED_ZERO_FIELD: CGEventField = CGEventField(136);
-const K_GESTURE_LEGACY_ONE_FIELD: CGEventField = CGEventField(165);
 
 const K_IOHID_EVENT_TYPE_DOCK_SWIPE: i64 = 23;
 const K_IOHID_EVENT_TYPE_VELOCITY: u32 = 9;
@@ -48,14 +45,17 @@ const K_IOHID_EVENT_TYPE_FLUID_TOUCH_GESTURE: u32 = 23;
 const K_CG_GESTURE_MOTION_HORIZONTAL: i64 = 1;
 
 const K_GESTURE_BEGAN: i64 = 1;
+const K_GESTURE_CHANGED: i64 = 2;
 const K_GESTURE_ENDED: i64 = 4;
+
+/// Smallest positive subnormal f32. See `switch_space_legacy`.
+const K_LEGACY_TRUE_MIN: f32 = f32::from_bits(1);
+const K_LEGACY_SWITCH_VELOCITY: f64 = 400.0;
 
 const K_EPSILON: f64 = 1e-15;
 const K_INSTANT_SWITCH_VELOCITY: f64 = 100.0;
 const K_GESTURE_FLAVOR_DOCK_PRIMARY: f64 = 3.0;
 const K_GESTURE_SWIPE_POSITION_X: f64 = 0.1;
-const K_LEGACY_TINY_FLOAT: f64 = f32::MIN_POSITIVE as f64;
-const K_LEGACY_ONE: i64 = 1;
 const K_GESTURE_DELAY_NS: i64 = 15 * 1_000_000;
 const K_CGEVENT_DATA_HID_FIELD: u16 = 4205;
 const K_CGEVENT_DATA_VERSION: i32 = 2;
@@ -233,25 +233,68 @@ pub unsafe fn switch_space(direction: Direction) {
     }
 }
 
+/// Pre-macOS-27 path, following joshuarli/iss (ISC).
+///
+/// The previous implementation here posted a two-phase gesture to the HID tap
+/// with a progress magnitude of +/-2.25, and does not move the space at all on
+/// macOS 26. What works is iss's shape, which differs in every part that turns
+/// out to matter: three phases rather than two, posted to the *session* tap,
+/// each paired with a plain gesture companion event, and — the load-bearing
+/// detail — a progress field holding the bits of the smallest positive
+/// subnormal float rather than a real magnitude. iss's own note on that value
+/// is "empirically, +/-FLT_TRUE_MIN here makes switching instant".
 unsafe fn switch_space_legacy(direction: Direction) {
-    let Some(magnitude) = horizontal_direction_value(direction, -2.25, 2.25) else {
+    let Some(right) = horizontal_direction_value(direction, false, true) else {
         return;
     };
 
-    let begin_marker = raw_marker_event();
-    let begin_gesture = raw_legacy_gesture_event(K_GESTURE_BEGAN, magnitude, None);
-    post_events(CGEventTapLocation::HID, [&begin_gesture, &begin_marker]);
-
-    queue::main().after_f_s(
-        Time::new_after(Time::NOW, K_GESTURE_DELAY_NS),
-        magnitude,
-        |magnitude| {
-            let gesture = 200.0 * magnitude;
-            let end_marker = raw_marker_event();
-            let end_gesture = raw_legacy_gesture_event(K_GESTURE_ENDED, magnitude, Some(gesture));
-            post_events(CGEventTapLocation::HID, [&end_gesture, &end_marker]);
-        },
+    // Begin and Changed carry no velocity; the terminal event's velocity is what
+    // makes the WindowServer treat the gesture as a flick and skip the slide.
+    post_legacy_pair(K_GESTURE_BEGAN, right, None);
+    post_legacy_pair(K_GESTURE_CHANGED, right, None);
+    post_legacy_pair(
+        K_GESTURE_ENDED,
+        right,
+        Some(if right {
+            K_LEGACY_SWITCH_VELOCITY
+        } else {
+            -K_LEGACY_SWITCH_VELOCITY
+        }),
     );
+}
+
+/// One phase of a legacy dock swipe: the DockControl event and the companion
+/// gesture event the Dock expects alongside it.
+fn post_legacy_pair(phase: i64, right: bool, velocity_x: Option<f64>) {
+    let dock = new_event();
+    configure_dock_swipe_event(&dock, phase);
+
+    // Field 135 holds the raw bits of an f32, not a number the field's own type
+    // would suggest. Only its sign and non-zeroness appear to matter.
+    let progress = if right {
+        K_LEGACY_TRUE_MIN
+    } else {
+        -K_LEGACY_TRUE_MIN
+    };
+    set_integer_fields(&dock, &[(
+        K_GESTURE_PROGRESS_BITS_FIELD,
+        progress.to_bits() as i32 as i64,
+    )]);
+    set_double_fields(&dock, &[
+        (K_GESTURE_SCROLL_Y_FIELD, 0.0),
+        (K_GESTURE_POSITION_FALLBACK_FIELD, K_LEGACY_TRUE_MIN as f64),
+    ]);
+    if let Some(velocity_x) = velocity_x {
+        set_double_fields(&dock, &[
+            (K_GESTURE_SWIPE_VELOCITY_X_FIELD, velocity_x),
+            (K_GESTURE_SWIPE_VELOCITY_Y_FIELD, 0.0),
+        ]);
+    }
+
+    let companion = new_event();
+    set_integer_fields(&companion, &[(K_CGS_EVENT_TYPE_FIELD, K_CGS_EVENT_MARKER)]);
+
+    post_events(CGEventTapLocation::Session, [&dock, &companion]);
 }
 
 unsafe fn switch_space_macos_27(direction: Direction) {
@@ -278,46 +321,6 @@ unsafe fn switch_space_macos_27(direction: Direction) {
             post_augmented_session_event(&end_event);
         },
     );
-}
-
-fn raw_marker_event() -> CFRetained<CGEvent> {
-    let event = new_event();
-    set_integer_fields(&event, &[
-        (K_CGS_EVENT_TYPE_FIELD, K_CGS_EVENT_MARKER),
-        (K_GESTURE_SUBTYPE_FIELD, K_GESTURE_SUBTYPE),
-    ]);
-    event
-}
-
-fn raw_legacy_gesture_event(
-    phase: i64,
-    magnitude: f64,
-    velocity_x: Option<f64>,
-) -> CFRetained<CGEvent> {
-    let event = new_event();
-    let magnitude_bits = (magnitude as f32).to_bits() as i64;
-
-    configure_dock_swipe_event(&event, phase);
-    set_integer_fields(&event, &[
-        (K_GESTURE_PROGRESS_BITS_FIELD, magnitude_bits),
-        (K_GESTURE_LEGACY_ONE_FIELD, K_LEGACY_ONE),
-        (K_GESTURE_SUBTYPE_FIELD, K_GESTURE_SUBTYPE),
-        (K_GESTURE_UNUSED_ZERO_FIELD, 0),
-    ]);
-    set_double_fields(&event, &[
-        (K_GESTURE_SWIPE_PROGRESS_FIELD, magnitude),
-        (K_GESTURE_SWIPE_POSITION_X_FIELD, K_LEGACY_TINY_FLOAT),
-        (K_GESTURE_POSITION_FALLBACK_FIELD, K_LEGACY_TINY_FLOAT),
-    ]);
-
-    if let Some(velocity_x) = velocity_x {
-        set_double_fields(&event, &[
-            (K_GESTURE_SWIPE_VELOCITY_X_FIELD, velocity_x),
-            (K_GESTURE_SWIPE_VELOCITY_Y_FIELD, velocity_x),
-        ]);
-    }
-
-    event
 }
 
 fn dock_control_gesture_event(
