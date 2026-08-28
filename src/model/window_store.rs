@@ -45,6 +45,13 @@ pub struct WindowRecord {
     pending_operation: Option<PendingWindowOperation>,
     operation_generation: u64,
     rule_floating: bool,
+    /// Set when the user toggles this window's floating state by hand.
+    ///
+    /// App rules are re-evaluated whenever a space activates, so without this a
+    /// rule carrying `floating` would re-assert itself over every manual
+    /// toggle: tile a window, switch space and back, and it is floating again.
+    /// A deliberate choice outranks the rule that set the default.
+    user_floating: Option<bool>,
 }
 
 impl WindowRecord {
@@ -749,11 +756,12 @@ impl WindowStore {
             return;
         }
 
-        let (workspace, rule_floating, placement, visibility, pending, generation) =
+        let (workspace, rule_floating, user_floating, placement, visibility, pending, generation) =
             match self.windows.get(&from) {
                 Some(record) => (
                     record.workspace,
                     record.rule_floating,
+                    record.user_floating,
                     record.placement,
                     record.visibility,
                     record.pending_operation,
@@ -777,6 +785,9 @@ impl WindowStore {
             target.workspace = workspace;
         }
         target.rule_floating |= rule_floating;
+        if user_floating.is_some() {
+            target.user_floating = user_floating;
+        }
         target.placement = placement;
         target.visibility = visibility;
         target.pending_operation = pending;
@@ -786,6 +797,7 @@ impl WindowStore {
         if let Some(source) = self.windows.get_mut(&from) {
             source.workspace = None;
             source.rule_floating = false;
+            source.user_floating = None;
             source.pending_operation = None;
         }
 
@@ -830,6 +842,17 @@ impl WindowStore {
         self.prune_window_record(window_id);
     }
 
+    /// Records that the user set this window's floating state by hand, so app
+    /// rules stop overriding it. See `WindowRecord::user_floating`.
+    pub fn set_user_floating(&mut self, window_id: WindowId, floating: bool) {
+        self.windows.entry(window_id).or_default().user_floating = Some(floating);
+    }
+
+    /// The user's own choice for this window, if they have made one.
+    pub fn user_floating(&self, window_id: WindowId) -> Option<bool> {
+        self.windows.get(&window_id).and_then(|record| record.user_floating)
+    }
+
     pub fn rule_floating(&self, window_id: WindowId) -> bool {
         self.windows.get(&window_id).is_some_and(|record| record.rule_floating)
     }
@@ -837,6 +860,7 @@ impl WindowStore {
     pub fn clear_rule_metadata(&mut self, window_id: WindowId) {
         if let Some(record) = self.windows.get_mut(&window_id) {
             record.rule_floating = false;
+            record.user_floating = None;
         }
         self.prune_window_record(window_id);
     }

@@ -1368,6 +1368,12 @@ impl LayoutEngine {
         if should_float {
             self.floating.add_floating(window);
             self.floating.add_active(space, window.pid, window);
+            // A window the rules float must leave the tiling tree, the same way
+            // the manual toggle takes it out. Leaving it behind meant the next
+            // toggle-to-tiled inserted a *second* leaf for it, and the tree
+            // ended up dividing the screen between several copies of the same
+            // window.
+            self.remove_window_from_all_tiling_trees(window);
         } else if was_floating {
             self.floating.remove_floating(window);
         }
@@ -1755,6 +1761,9 @@ impl LayoutEngine {
                 }
                 self.floating.remove_floating(wid);
                 self.floating.set_last_focus(None);
+                // Outrank the app rule that set this window's default, which is
+                // otherwise re-asserted on the next space activation.
+                window_store.set_user_floating(wid, false);
             } else {
                 if let Some(space) = space {
                     self.floating.add_active(space, wid.pid, wid);
@@ -1791,6 +1800,7 @@ impl LayoutEngine {
                 }
                 self.floating.add_floating(wid);
                 self.floating.set_last_focus(Some(wid));
+                window_store.set_user_floating(wid, true);
                 debug!("Removed window {:?} from tiling tree, now floating", wid);
             }
             return EventResponse::default();

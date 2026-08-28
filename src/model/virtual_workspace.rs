@@ -1106,7 +1106,7 @@ impl WorkspaceStore {
             }));
         }
 
-        let (workspace, floating, position, size, focus) =
+        let (workspace, rule_floating, position, size, focus) =
             rule_decision.map_or((None, false, None, None, false), |decision| {
                 (
                     decision.workspace,
@@ -1116,6 +1116,12 @@ impl WorkspaceStore {
                     decision.focus,
                 )
             });
+        // A floating state the user chose by hand outranks the rule's default.
+        // Rules are re-evaluated on every space activation, so without this a
+        // catch-all `floating` rule undoes each manual toggle the next time you
+        // switch spaces.
+        let floating = window_store.user_floating(window_id).unwrap_or(rule_floating);
+
         let workspace_id =
             self.resolve_rule_workspace(space, workspace.as_ref(), existing_assignment)?;
         if !self.ensure_window_assignment(window_store, window_id, WindowWorkspaceInfo {

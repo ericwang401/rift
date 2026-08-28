@@ -839,6 +839,26 @@ mod tests {
     }
 
     #[test]
+    fn re_adding_a_window_moves_it_instead_of_duplicating_its_leaf() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        // This is what a floating window being toggled back to tiled does, and
+        // what a rule re-floating it used to leave possible: the window is
+        // still in the tree when it is added again. Live trees were observed
+        // holding five leaves for two real windows, so a newly tiled window got
+        // a fifth of the screen instead of a half.
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(1));
+
+        let leaves = system.draw_tree(layout).lines().filter(|l| l.contains("Leaf")).count();
+        assert_eq!(leaves, 2, "one leaf per window, however often it is re-added");
+        assert_eq!(system.windows_for_app(layout, w(1).pid).len(), 2);
+    }
+
+    #[test]
     fn mirror_reverses_only_the_matching_axis() {
         use rift_protocol::MirrorAxis;
 
@@ -1373,6 +1393,14 @@ impl LayoutSystem for BspLayoutSystem {
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
+        if self.windows_for_app(layout, wid.pid).contains(&wid) {
+            // Re-adding an existing window means "move it to the selection", so
+            // retire the old leaf first. window_to_node holds one node per
+            // window, so inserting without this strands the previous leaf: the
+            // tree goes on rendering it and dividing space for it, while
+            // nothing can reach it to take it out again.
+            self.remove_window(wid);
+        }
         if self.layouts.get(layout).is_some() {
             if self.window_insertion_point == WindowInsertionPoint::EndOfTree {
                 let root = self.layouts[layout].root;
