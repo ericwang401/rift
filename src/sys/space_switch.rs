@@ -14,7 +14,8 @@ use once_cell::sync::Lazy;
 use crate::common::collections::BTreeMap;
 use crate::layout_engine::Direction;
 use crate::sys::dispatch::DispatchExt;
-use crate::sys::skylight::{CGEventPost, CGEventTapLocation};
+use crate::sys::screen::SpaceId;
+use crate::sys::skylight::{CGEventPost, CGEventTapLocation, CGSGetActiveSpace, SLSMainConnectionID};
 
 const K_CGS_EVENT_TYPE_FIELD: CGEventField = CGEventField(55);
 const K_CGS_EVENT_MARKER: i64 = 29;
@@ -165,6 +166,63 @@ struct IOHIDVelocityEventData {
     velocity_x: i32,
     velocity_y: i32,
     velocity_z: i32,
+}
+
+/// Gap between chained switches. One switch is a begin/end pair spaced
+/// `K_GESTURE_DELAY_NS` apart, and the Dock needs to settle before it will
+/// accept the next one, so steps are spaced well clear of that pair.
+const K_SPACE_STEP_DELAY_NS: i64 = 90 * 1_000_000;
+
+/// Switches to a macOS space by its position on the active display, 1-based to
+/// match the way macOS numbers desktops.
+///
+/// yabai had `space --focus N`; rift's own workspaces are a separate concept
+/// that hides windows offscreen, so this is the command for people who want
+/// their native spaces and keep rift for tiling within them. Nothing happens if
+/// the index is out of range or already active.
+pub unsafe fn switch_to_space_index(index: usize) {
+    let Some(steps) = steps_to_space_index(index) else {
+        return;
+    };
+    let direction = if steps > 0 { Direction::Right } else { Direction::Left };
+    unsafe { switch_space_repeated(direction, steps.unsigned_abs()) };
+}
+
+/// Signed number of spaces between the active one and `index` on the same
+/// display. `None` when the index is out of range or the space is already
+/// active.
+fn steps_to_space_index(index: usize) -> Option<isize> {
+    let target = index.checked_sub(1)?;
+    let active = SpaceId::new(unsafe { CGSGetActiveSpace(SLSMainConnectionID()) });
+
+    let spaces = crate::sys::screen::managed_display_space_ids()
+        .into_values()
+        .find(|ids| ids.contains(&active))?;
+    if target >= spaces.len() {
+        return None;
+    }
+
+    let current = spaces.iter().position(|id| *id == active)?;
+    let steps = target as isize - current as isize;
+    (steps != 0).then_some(steps)
+}
+
+/// Posts `steps` switches in one direction, one after another.
+///
+/// The Dock drives each switch itself, so they have to be spaced out in time
+/// rather than posted back to back.
+unsafe fn switch_space_repeated(direction: Direction, steps: usize) {
+    if steps == 0 {
+        return;
+    }
+    unsafe { switch_space(direction) };
+    if steps > 1 {
+        queue::main().after_f_s(
+            Time::new_after(Time::NOW, K_SPACE_STEP_DELAY_NS),
+            (direction, steps - 1),
+            |(direction, remaining)| unsafe { switch_space_repeated(direction, remaining) },
+        );
+    }
 }
 
 pub unsafe fn switch_space(direction: Direction) {

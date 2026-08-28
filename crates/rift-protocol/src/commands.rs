@@ -102,6 +102,8 @@ pub enum ReactorCommand {
         source: RestoreSource,
     },
     SwitchSpace(Direction),
+    /// Switch to a macOS space by its position on the active display, 1-based.
+    SwitchToSpace(usize),
     ToggleSpaceActivated,
     FocusWindow {
         window_id: WindowId,

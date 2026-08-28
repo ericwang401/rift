@@ -1638,6 +1638,10 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::SwitchSpace(direction))) => {
                 return command_workflow::handle_switch_native_space(direction);
             }
+            Event::Command(Command::Reactor(ReactorCommand::SwitchToSpace(index))) => {
+                unsafe { crate::sys::space_switch::switch_to_space_index(index) };
+                return Ok(EventOutcome::default());
+            }
             Event::Command(Command::Reactor(ReactorCommand::ToggleSpaceActivated)) => {
                 let space = self.active_display_space();
                 let display_uuid = space.and_then(|space| {

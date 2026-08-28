@@ -258,6 +258,8 @@ struct LayoutFileSelection {
 enum SpaceCommands {
     /// Toggle whether rift manages the current macOS space
     ToggleActivated,
+    /// Switch to a macOS space by number (1-based), instantly and without the slide animation
+    SwitchTo { index: usize },
     /// Switch to an adjacent macOS space (Mission Control spaces, not virtual workspaces)
     Switch {
         /// Direction to switch (left, right, up, down)
@@ -1070,6 +1072,12 @@ fn map_space_command(cmd: SpaceCommands) -> Result<CliCommand, String> {
         SpaceCommands::ToggleActivated => reactor::ReactorCommand::ToggleSpaceActivated,
         SpaceCommands::Switch { direction } => {
             reactor::ReactorCommand::SwitchSpace(parse_focus_direction(&direction)?)
+        }
+        SpaceCommands::SwitchTo { index } => {
+            if index == 0 {
+                return Err("space numbers are 1-based".to_string());
+            }
+            reactor::ReactorCommand::SwitchToSpace(index)
         }
     };
 
