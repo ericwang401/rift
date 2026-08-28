@@ -47,6 +47,7 @@ pub fn handle_command_layout(
             | LayoutCommand::PrevWorkspace(_)
             | LayoutCommand::SwitchToWorkspace(_)
             | LayoutCommand::MoveWindowToWorkspace { follow: true, .. }
+            | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace
     );
     let requires_workspace_space = matches!(
@@ -57,6 +58,7 @@ pub fn handle_command_layout(
             | LayoutCommand::MoveWindowToWorkspace { follow: true, .. }
             | LayoutCommand::SetWorkspaceLayout { .. }
             | LayoutCommand::CreateWorkspace
+            | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace
     );
     let is_virtual_workspace_command = matches!(
@@ -67,6 +69,7 @@ pub fn handle_command_layout(
             | LayoutCommand::MoveWindowToWorkspace { .. }
             | LayoutCommand::SetWorkspaceLayout { .. }
             | LayoutCommand::CreateWorkspace
+            | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace
     );
     let workspace_space = if requires_workspace_space {
@@ -89,6 +92,7 @@ pub fn handle_command_layout(
         | LayoutCommand::SwitchToWorkspace(_)
         | LayoutCommand::SetWorkspaceLayout { .. }
         | LayoutCommand::CreateWorkspace
+        | LayoutCommand::DestroyWorkspace
         | LayoutCommand::SwitchToLastWorkspace => {
             if let Some(space) = workspace_space {
                 layout.layout_engine.handle_virtual_workspace_command(

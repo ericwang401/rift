@@ -462,6 +462,64 @@ impl WorkspaceStore {
         Ok(workspace_id)
     }
 
+    /// The workspace that would adopt `workspace_id`'s windows if it were
+    /// destroyed: its left-hand neighbour, or the right-hand one when it is
+    /// itself the first. `None` when it is the only workspace on the space.
+    pub fn workspace_absorbing(
+        &self,
+        space: SpaceId,
+        workspace_id: VirtualWorkspaceId,
+    ) -> Option<VirtualWorkspaceId> {
+        let ordered = self.ordered_workspace_ids(space);
+        if ordered.len() <= 1 {
+            return None;
+        }
+        let position = ordered.iter().position(|id| *id == workspace_id)?;
+        Some(if position == 0 { ordered[1] } else { ordered[position - 1] })
+    }
+
+    /// Destroys a workspace, returning the neighbour that should become active.
+    ///
+    /// Callers must have already moved the workspace's windows out — this drops
+    /// the workspace's own state and does not touch `WindowStore`, so any window
+    /// still assigned here would be orphaned. The last workspace on a space is
+    /// never destroyed: a space needs somewhere to put the windows on it.
+    pub fn remove_workspace(
+        &mut self,
+        space: SpaceId,
+        workspace_id: VirtualWorkspaceId,
+    ) -> Result<VirtualWorkspaceId, WorkspaceError> {
+        if self.workspaces.get(workspace_id).map(|workspace| workspace.space) != Some(space) {
+            return Err(WorkspaceError::InvalidWorkspaceId(workspace_id));
+        }
+        let Some(successor) = self.workspace_absorbing(space, workspace_id) else {
+            return Err(WorkspaceError::InconsistentState(format!(
+                "Refusing to destroy the only workspace on space {:?}",
+                space
+            )));
+        };
+
+        self.workspaces.remove(workspace_id);
+        if let Some(ids) = self.workspaces_by_space.get_mut(&space) {
+            ids.retain(|id| *id != workspace_id);
+        }
+
+        // The destroyed workspace may be sitting in either half of the
+        // (last, active) pair; a dangling id in `last` would make
+        // switch_to_last_workspace fail silently later on.
+        if let Some((last, active)) = self.active_workspace_per_space.get_mut(&space) {
+            if *last == Some(workspace_id) {
+                *last = None;
+            }
+            if *active == workspace_id {
+                *last = None;
+                *active = successor;
+            }
+        }
+
+        Ok(successor)
+    }
+
     pub fn last_workspace(&self, space: SpaceId) -> Option<VirtualWorkspaceId> {
         self.active_workspace_per_space.get(&space)?.0
     }

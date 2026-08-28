@@ -154,6 +154,10 @@ pub enum SpaceEventKind {
     Fullscreen,
 }
 
+/// Floor for modifier-drag resizing, so a fast drag cannot collapse a window
+/// to nothing (or invert it) before the user lets go.
+const MIN_MODIFIER_DRAG_SIZE: f64 = 100.0;
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Event {
@@ -244,6 +248,16 @@ pub enum Event {
     /// FIXME: This can be interleaved incorrectly with the MouseState in app
     /// actor events.
     MouseUp,
+    /// A modifier-held drag over `window`, in window-server coordinates.
+    ///
+    /// The event tap resolves the window and swallows the drag so the
+    /// application never sees it; the reactor owns what the gesture means.
+    MouseModifierDrag {
+        window: WindowServerId,
+        dx: f64,
+        dy: f64,
+        action: crate::common::config::MouseAction,
+    },
     /// Sent by the event tap only when the cursor enters a different window.
     /// Window resolution and transition deduplication stay on the input
     /// thread; the reactor only applies the model-dependent focus/raise work.
@@ -1497,6 +1511,10 @@ impl Reactor {
             }
             Event::MenuClosed(pid) => {
                 return Ok(system_workflow::handle_menu_closed(&mut self.menu_manager, pid)?);
+            }
+            Event::MouseModifierDrag { window, dx, dy, action } => {
+                self.handle_mouse_modifier_drag(window, dx, dy, action);
+                return Ok(EventOutcome::default());
             }
             Event::MouseMoved(wsid) => {
                 let window = self.state.windows.tracked_window_id(wsid);
@@ -3253,6 +3271,80 @@ impl Reactor {
             && warp_space.is_some_and(|space| self.warp_mouse_to_space_center(space))
     }
 
+    /// Whether `mouse_follows_focus` should warp the cursor onto this window.
+    ///
+    /// Global setting first, then the per-app opt-out. The window keeps focus
+    /// either way; only the cursor warp is suppressed.
+    /// Applies a modifier-held drag to the window under the cursor.
+    ///
+    /// Only floating windows move: a tiled window's frame is owned by its
+    /// layout, which would overwrite anything written here on the next arrange
+    /// pass, so dragging one would fight the tree rather than move the window.
+    fn handle_mouse_modifier_drag(
+        &mut self,
+        window_server_id: WindowServerId,
+        dx: f64,
+        dy: f64,
+        action: crate::common::config::MouseAction,
+    ) {
+        use crate::common::config::MouseAction;
+
+        let Some(wid) = self.state.windows.tracked_window_id(window_server_id) else {
+            return;
+        };
+        if !self.layout_manager.layout_engine.is_window_floating(wid) {
+            trace!(?wid, "Ignoring modifier drag on a tiled window");
+            return;
+        }
+        let Some(window) = self.state.windows.window(wid) else {
+            return;
+        };
+
+        let mut frame = window.frame_monotonic;
+        match action {
+            MouseAction::Move => {
+                frame.origin.x += dx;
+                frame.origin.y += dy;
+            }
+            MouseAction::Resize => {
+                // Keep the origin fixed and grow toward the cursor, and never
+                // let a window invert through zero.
+                frame.size.width = (frame.size.width + dx).max(MIN_MODIFIER_DRAG_SIZE);
+                frame.size.height = (frame.size.height + dy).max(MIN_MODIFIER_DRAG_SIZE);
+            }
+            MouseAction::None => return,
+        }
+
+        let transaction = self.transaction_manager.generate_next_txid(window_server_id);
+        self.transaction_manager.store_txid(window_server_id, transaction, frame);
+        if let Some(app) = self.app_manager.apps.get(&wid.pid)
+            && let Err(error) =
+                app.handle.send(Request::SetWindowFrame(wid, frame, transaction, true))
+        {
+            warn!(window = ?wid, %error, "failed to apply modifier drag");
+        }
+    }
+
+    fn mouse_follows_focus_allowed_for(&self, wid: WindowId) -> bool {
+        if !self.config.settings.mouse_follows_focus {
+            return false;
+        }
+        if self.config.settings.mouse_follows_focus_blacklist.is_empty() {
+            return true;
+        }
+        let Some(bundle_id) =
+            self.app_manager.apps.get(&wid.pid).and_then(|app| app.info.bundle_id.as_deref())
+        else {
+            return true;
+        };
+        !self
+            .config
+            .settings
+            .mouse_follows_focus_blacklist
+            .iter()
+            .any(|blocked| blocked == bundle_id)
+    }
+
     fn insert_app_handle_for_window(
         &self,
         app_handles: &mut HashMap<pid_t, AppThreadHandle>,
@@ -3963,7 +4055,7 @@ impl Reactor {
                 .push(wid);
         }
         let focus_window_with_warp = focus_window.map(|wid| {
-            let warp = if self.config.settings.mouse_follows_focus {
+            let warp = if self.mouse_follows_focus_allowed_for(wid) {
                 if self.workspace_switch_manager.workspace_switch_state
                     == WorkspaceSwitchState::Active
                 {

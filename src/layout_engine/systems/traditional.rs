@@ -450,7 +450,72 @@ impl Drop for TraditionalLayoutSystem {
     }
 }
 
+impl TraditionalLayoutSystem {
+    /// Every node of a layout, collected before any mutation — the tree is
+    /// relinked as rotate/mirror walk it.
+    fn nodes_in_layout(&self, layout: LayoutId) -> Vec<NodeId> {
+        if !self.layout_roots.contains_key(layout) {
+            return Vec::new();
+        }
+        self.root(layout).traverse_preorder(&self.tree.map).collect()
+    }
+
+    /// Reverses a container's children in place.
+    ///
+    /// Containers here are n-ary, not binary, so this is a full reversal rather
+    /// than a swap. Detaching each child in reverse order and pushing it to the
+    /// back walks the list backwards into place; per-child sizes live on the
+    /// nodes, so they travel along.
+    fn reverse_children(&mut self, node: NodeId) {
+        let children: Vec<NodeId> = node.children(&self.tree.map).collect();
+        if children.len() < 2 {
+            return;
+        }
+        for child in children.into_iter().rev() {
+            child.detach(&mut self.tree).push_back(node);
+        }
+    }
+
+    /// Turns a container's axis while preserving whether it is stacked.
+    fn flipped_kind(kind: LayoutKind) -> LayoutKind {
+        match kind {
+            LayoutKind::Horizontal => LayoutKind::Vertical,
+            LayoutKind::Vertical => LayoutKind::Horizontal,
+            LayoutKind::HorizontalStack => LayoutKind::VerticalStack,
+            LayoutKind::VerticalStack => LayoutKind::HorizontalStack,
+        }
+    }
+}
+
 impl LayoutSystem for TraditionalLayoutSystem {
+    fn rotate(&mut self, layout: LayoutId, degrees: rift_protocol::RotateDegrees) {
+        use rift_protocol::RotateDegrees;
+
+        for node in self.nodes_in_layout(layout) {
+            let kind = self.tree.data.layout.kind(node);
+            let reverse = match degrees {
+                RotateDegrees::Ninety => kind.orientation() == Orientation::Horizontal,
+                RotateDegrees::TwoSeventy => kind.orientation() == Orientation::Vertical,
+                RotateDegrees::OneEighty => true,
+            };
+            if reverse {
+                self.reverse_children(node);
+            }
+            if degrees != RotateDegrees::OneEighty {
+                self.tree.data.layout.set_kind(node, Self::flipped_kind(kind));
+            }
+        }
+    }
+
+    fn mirror(&mut self, layout: LayoutId, axis: rift_protocol::MirrorAxis) {
+        let target = axis.orientation();
+        for node in self.nodes_in_layout(layout) {
+            if self.tree.data.layout.kind(node).orientation() == target {
+                self.reverse_children(node);
+            }
+        }
+    }
+
     fn create_layout(&mut self) -> LayoutId {
         let root = OwnedNode::new_root_in(&mut self.tree, "layout_root");
         self.layout_roots.insert(root)

@@ -312,6 +312,19 @@ impl WorkspaceLayouts {
         });
     }
 
+    /// Drops the layout bookkeeping for a destroyed workspace.
+    ///
+    /// The layout trees themselves live on the workspace and go away with it;
+    /// this is the side index, which would otherwise keep a (space, workspace)
+    /// entry pointing at a workspace id that no longer resolves.
+    pub(crate) fn remove_workspace(
+        &mut self,
+        space: SpaceId,
+        workspace_id: crate::model::VirtualWorkspaceId,
+    ) {
+        self.map.remove(&(space, workspace_id));
+    }
+
     pub(crate) fn spaces(&self) -> crate::common::collections::BTreeSet<SpaceId> {
         self.map.keys().map(|(sp, _)| *sp).collect()
     }

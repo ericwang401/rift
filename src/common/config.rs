@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::collections::HashMap;
 use crate::actor::wm_controller::WmCommand;
-use crate::sys::hotkey::{Hotkey, HotkeySpec};
+use crate::sys::hotkey::{Hotkey, HotkeySpec, Modifiers};
 
 pub const MAX_WORKSPACES: usize = 128;
 
@@ -412,6 +412,75 @@ impl<'de> Deserialize<'de> for Config {
 unsafe impl Send for Config {}
 unsafe impl Sync for Config {}
 
+/// What a modifier-held drag of a mouse button does.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseAction {
+    /// Leave the button alone; the drag reaches the application as usual.
+    #[default]
+    None,
+    /// Move the window under the cursor.
+    Move,
+    /// Resize the window under the cursor from its nearest corner.
+    Resize,
+}
+
+/// A modifier-only spec, e.g. "Alt" or "Ctrl + Alt".
+///
+/// Deserialized from a string rather than reusing `Modifiers` directly, whose
+/// derived impl reads the raw bitfield integer.
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+pub struct MouseModifier(pub Modifiers);
+
+impl<'de> Deserialize<'de> for MouseModifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        let raw = String::deserialize(deserializer)?;
+        crate::sys::hotkey::modifiers_from_str(&raw)
+            .map(MouseModifier)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// yabai's `mouse_modifier` / `mouse_action1` / `mouse_action2`, which have no
+/// equivalent in a stock rift: dragging a window there means grabbing its title
+/// bar, and resizing means hitting its edge.
+///
+/// Both actions apply to floating windows. A tiled window's geometry belongs to
+/// its layout, so a modifier-drag on one is ignored rather than fought with.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MouseSettings {
+    /// Modifier that turns a drag into a move or resize. Omit to disable
+    /// modifier-dragging entirely, which is the default.
+    #[serde(default)]
+    pub modifier: Option<MouseModifier>,
+    /// What a modifier + left-button drag does.
+    #[serde(default)]
+    pub action1: MouseAction,
+    /// What a modifier + right-button drag does.
+    #[serde(default)]
+    pub action2: MouseAction,
+}
+
+impl MouseSettings {
+    /// The action for a button, or `None` when modifier-dragging is off.
+    pub fn action_for(&self, button: MouseButton) -> Option<(Modifiers, MouseAction)> {
+        let modifier = self.modifier?.0;
+        let action = match button {
+            MouseButton::Left => self.action1,
+            MouseButton::Right => self.action2,
+        };
+        (action != MouseAction::None).then_some((modifier, action))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MouseButton {
+    Left,
+    Right,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -440,6 +509,17 @@ pub struct Settings {
     /// inappropriately steal focus and shouldn't cause workspace switches.
     #[serde(default)]
     pub auto_focus_blacklist: Vec<String>,
+    /// Apps the mouse should never be warped onto when `mouse_follows_focus` is
+    /// on. List of bundle identifiers. Screenshot and overlay tools are the
+    /// usual case: they take focus for a transient, often invisible window, and
+    /// dragging the cursor onto it interrupts whatever the user was pointing at.
+    /// Focus itself is unaffected — only the warp is suppressed.
+    #[serde(default)]
+    pub mouse_follows_focus_blacklist: Vec<String>,
+    /// Modifier-drag: hold a modifier and drag anywhere in a window to move or
+    /// resize it, instead of aiming for its title bar or edges.
+    #[serde(default)]
+    pub mouse: MouseSettings,
     #[serde(default)]
     pub layout: LayoutSettings,
     #[serde(default)]
@@ -1618,7 +1698,11 @@ impl Config {
 mod tests {
     use super::*;
     use crate::actor::reactor;
+    use crate::actor::wm_controller::ConfiguredLayoutCommand;
     use crate::layout_engine::{LayoutCommand, ResizeOrientation};
+    use rift_protocol::{
+        FloatingWindowSize, FloatingWindowSizePreset, ToggleWindowFloatingOptions,
+    };
 
     #[test]
     fn layout_insertion_point_supports_global_default_and_per_mode_override() {
@@ -1777,6 +1861,89 @@ mod tests {
                 ResizeOrientation::Smart
             )))
         );
+    }
+
+    #[test]
+    fn toggle_window_floating_accepts_its_documented_option_forms() {
+        #[derive(Deserialize)]
+        struct TestConfig {
+            keys: HashMap<String, WmCommand>,
+        }
+
+        let config: TestConfig = toml::from_str(
+            r#"
+            [keys]
+            bare = "toggle_window_floating"
+            centered = { toggle_window_floating = { center = true } }
+            smart = { toggle_window_floating = { center = true, size = "smart" } }
+            sized = { toggle_window_floating = { center = false, size = { w = 640.0, h = 480.0 } } }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.keys["bare"],
+            WmCommand::ReactorCommand(reactor::Command::Layout(
+                LayoutCommand::ToggleWindowFloating
+            ))
+        );
+        assert_eq!(
+            config.keys["centered"],
+            WmCommand::ConfiguredLayout(ConfiguredLayoutCommand::ToggleWindowFloating(
+                ToggleWindowFloatingOptions { center: true, size: None }
+            ))
+        );
+        assert_eq!(
+            config.keys["smart"],
+            WmCommand::ConfiguredLayout(ConfiguredLayoutCommand::ToggleWindowFloating(
+                ToggleWindowFloatingOptions {
+                    center: true,
+                    size: Some(FloatingWindowSize::Preset(FloatingWindowSizePreset::Smart)),
+                }
+            ))
+        );
+        assert_eq!(
+            config.keys["sized"],
+            WmCommand::ConfiguredLayout(ConfiguredLayoutCommand::ToggleWindowFloating(
+                ToggleWindowFloatingOptions {
+                    center: false,
+                    size: Some(FloatingWindowSize::Dimensions { w: 640.0, h: 480.0 }),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn mouse_modifier_drag_settings_parse_and_default_to_off() {
+        let default: MouseSettings = toml::from_str("").unwrap();
+        assert_eq!(default.modifier, None);
+        assert_eq!(default.action_for(MouseButton::Left), None);
+
+        let settings: MouseSettings = toml::from_str(
+            r#"
+            modifier = "Alt"
+            action1 = "move"
+            action2 = "resize"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.action_for(MouseButton::Left),
+            Some((Modifiers::ALT, MouseAction::Move))
+        );
+        assert_eq!(
+            settings.action_for(MouseButton::Right),
+            Some((Modifiers::ALT, MouseAction::Resize))
+        );
+
+        // An action set to none stays inert even with a modifier configured.
+        let one_sided: MouseSettings =
+            toml::from_str("modifier = \"Ctrl + Alt\"\naction1 = \"move\"").unwrap();
+        assert_eq!(one_sided.action_for(MouseButton::Right), None);
+
+        // A modifier spec naming a real key is a config error, not a silent
+        // binding of the modifier alone.
+        assert!(toml::from_str::<MouseSettings>("modifier = \"Alt + T\"").is_err());
     }
 
     #[test]

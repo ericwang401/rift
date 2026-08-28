@@ -72,6 +72,7 @@ pub enum WmCmd {
     SwitchToWorkspace(WorkspaceSelector),
     MoveWindowToWorkspace(WorkspaceSelector),
     CreateWorkspace,
+    DestroyWorkspace,
     SwitchToLastWorkspace,
 
     ShowMissionControlAll,
@@ -343,6 +344,11 @@ impl WmController {
                         follow: false,
                         window_id: None,
                     },
+                )));
+            }
+            Command(Wm(DestroyWorkspace)) => {
+                self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
+                    layout::LayoutCommand::DestroyWorkspace,
                 )));
             }
             Command(Wm(CreateWorkspace)) => {

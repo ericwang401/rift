@@ -37,6 +37,31 @@ mouse_hides_on_focus = true
 #   "com.raycast.macos", "com.apple.Spotlight"
 auto_focus_blacklist = []
 
+# Apps the cursor should never be warped onto when mouse_follows_focus is on.
+# Bundle identifiers, same shape as auto_focus_blacklist above. Screenshot and
+# overlay tools are the usual case: they take focus for a transient window, and
+# dragging the cursor to it interrupts whatever you were pointing at. Focus is
+# unaffected; only the warp is suppressed.
+# Example:
+#   mouse_follows_focus_blacklist = ["pl.maketheweb.cleanshotx"]
+mouse_follows_focus_blacklist = []
+
+# Modifier-drag: hold a modifier and drag anywhere in a window to move or resize
+# it, rather than aiming for its title bar or its edge.
+# - modifier: the modifier that claims the drag ("Alt", "Ctrl + Alt", ...).
+#   Omit it (the default) to disable modifier-dragging entirely.
+#   The held modifiers must match exactly, so a configured "Alt" does not fire
+#   on Cmd+Alt+drag.
+# - action1 / action2: what a drag of the left / right button does, one of
+#   "none" (default), "move" or "resize". Resize keeps the origin fixed and
+#   grows toward the cursor.
+# Both actions apply to floating windows only: a tiled window's frame belongs to
+# its layout, which would overwrite anything a drag wrote.
+#[settings.mouse]
+#modifier = "Alt"
+#action1 = "move"
+#action2 = "resize"
+
 # Run commands on start
 #
 # Tip: You can subscribe to rift events and trigger your own scripts. The command will
@@ -396,6 +421,8 @@ comb1 = "Alt + Shift"
 # - move_window_to_workspace = { workspace = N|"next"|"prev", follow = true|false, window_id = 123 }
 #   (follow and window_id are optional)
 # - create_workspace
+# - destroy_workspace (moves its windows to the neighbouring workspace first;
+#   the last workspace on a space is never destroyed)
 # - switch_to_last_workspace
 # - set_workspace_layout = { mode = "traditional"|"bsp"|"stack"|"master_stack"|"scrolling" } (active workspace)
 # - set_workspace_layout = { workspace = N, mode = "traditional"|"bsp"|"stack"|"master_stack"|"scrolling" }
@@ -406,6 +433,10 @@ comb1 = "Alt + Shift"
 # - join_window = "left"|"right"|"up"|"down"
 # - consume_or_expel_window = "left"|"right"|"up"|"down"
 # - toggle_stack / toggle_orientation / unjoin_windows
+# - rotate = "90"|"180"|"270"  (turns the whole tree a quarter turn)
+# - mirror = "x"|"y"           (flips the whole tree across an axis)
+#   Both apply to the tree layouts (traditional, bsp) and are no-ops in the
+#   stack, master_stack and scrolling layouts, which have no tree to turn.
 # - toggle_focus_floating / toggle_window_floating / toggle_fullscreen / toggle_fullscreen_within_gaps
 # - resize_window_grow / resize_window_shrink (without param, horizontal is default)
 # - resize_window_grow = "horizontal"|"vertical"|"smart"
@@ -462,6 +493,9 @@ comb1 = "Alt + Shift"
 "Alt + Shift + Down" = { join_window = "down" }
 "Alt + Comma" = "toggle_stack"
 "Alt + Slash" = "toggle_orientation"
+# "Alt + Shift + R" = { rotate = "270" }
+# "Alt + Shift + Y" = { mirror = "y" }
+# "Alt + Shift + X" = { mirror = "x" }
 "Alt + Ctrl + E" = "unjoin_windows"
 
 "Alt + Shift + Space" = "toggle_window_floating"

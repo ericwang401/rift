@@ -2040,6 +2040,7 @@ impl LayoutEngine {
             | LayoutCommand::MoveWindowToWorkspace { .. }
             | LayoutCommand::SetWorkspaceLayout { .. }
             | LayoutCommand::CreateWorkspace
+            | LayoutCommand::DestroyWorkspace
             | LayoutCommand::SwitchToLastWorkspace => EventResponse::default(),
             LayoutCommand::JoinWindow(direction) => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
@@ -2063,6 +2064,22 @@ impl LayoutEngine {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 self.workspace_tree_mut(workspace_id).unjoin_selection(layout);
                 EventResponse::default()
+            }
+            LayoutCommand::Rotate(degrees) => {
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                self.workspace_tree_mut(workspace_id).rotate(layout, degrees);
+                EventResponse {
+                    changed: true,
+                    ..EventResponse::default()
+                }
+            }
+            LayoutCommand::Mirror(axis) => {
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                self.workspace_tree_mut(workspace_id).mirror(layout, axis);
+                EventResponse {
+                    changed: true,
+                    ..EventResponse::default()
+                }
             }
             LayoutCommand::ToggleOrientation => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
@@ -2709,6 +2726,63 @@ impl LayoutEngine {
                 EventResponse {
                     changed: true,
                     ..EventResponse::default()
+                }
+            }
+            LayoutCommand::DestroyWorkspace => {
+                let Some(doomed) = self.virtual_workspace_manager.active_workspace(space) else {
+                    return EventResponse::default();
+                };
+                let Some(successor) =
+                    self.virtual_workspace_manager.workspace_absorbing(space, doomed)
+                else {
+                    warn!("Refusing to destroy the only workspace on {:?}", space);
+                    return EventResponse::default();
+                };
+
+                // Windows have to leave before the workspace does, or they are
+                // orphaned on a workspace id that no longer resolves. Floating
+                // and tiled windows leave by different routes, same as
+                // MoveWindowToWorkspace.
+                let windows =
+                    self.virtual_workspace_manager.workspace_windows(window_store, space, doomed);
+                for wid in windows {
+                    let is_floating = self.floating.is_floating(wid);
+                    if is_floating {
+                        self.floating.remove_active_for_window(wid);
+                    } else {
+                        self.remove_window_from_all_tiling_trees(wid);
+                    }
+
+                    if !self.virtual_workspace_manager.assign_window_to_workspace(
+                        window_store,
+                        space,
+                        wid,
+                        successor,
+                    ) {
+                        warn!(?wid, "Could not rehome window while destroying workspace");
+                        continue;
+                    }
+
+                    if !is_floating {
+                        if let Some(target_layout) =
+                            self.workspace_layouts.active(space, successor)
+                        {
+                            self.workspace_tree_mut(successor)
+                                .add_window_after_selection(target_layout, wid);
+                        }
+                    }
+                }
+
+                match self.virtual_workspace_manager.remove_workspace(space, doomed) {
+                    Ok(successor) => {
+                        self.workspace_layouts.remove_workspace(space, doomed);
+                        self.broadcast_workspace_changed(space);
+                        self.activate_workspace(window_store, space, successor, None)
+                    }
+                    Err(e) => {
+                        warn!("Failed to destroy workspace: {:?}", e);
+                        EventResponse::default()
+                    }
                 }
             }
             LayoutCommand::CreateWorkspace => {

@@ -283,6 +283,8 @@ enum WorkspaceCommands {
     },
     /// Create a new workspace
     Create,
+    /// Destroy the active workspace, moving its windows to the neighbouring one
+    Destroy,
     /// Switch to the last workspace
     Last,
     /// Set layout mode for a workspace (or active workspace when omitted)
@@ -313,6 +315,10 @@ enum LayoutCommands {
     ToggleOrientation,
     /// Unjoin previously joined windows
     Unjoin,
+    /// Rotate the whole tree a quarter turn (90, 180 or 270)
+    Rotate { degrees: String },
+    /// Mirror the whole tree across an axis (x or y)
+    Mirror { axis: String },
     /// Toggle floating on the focused selection (tree focus)
     ToggleFocusFloat,
     /// Adjust master ratio by a delta (master/stack layout only)
@@ -870,6 +876,9 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<CliCommand, String> {
         WorkspaceCommands::Create => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::CreateWorkspace,
         ))),
+        WorkspaceCommands::Destroy => Ok(CliCommand::Reactor(reactor::Command::Layout(
+            LC::DestroyWorkspace,
+        ))),
         WorkspaceCommands::Last => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),
@@ -904,6 +913,27 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
         ))),
         LayoutCommands::Unjoin => {
             Ok(CliCommand::Reactor(reactor::Command::Layout(LC::UnjoinWindows)))
+        }
+        LayoutCommands::Rotate { degrees } => {
+            let degrees = match degrees.as_str() {
+                "90" => rift_protocol::RotateDegrees::Ninety,
+                "180" => rift_protocol::RotateDegrees::OneEighty,
+                "270" => rift_protocol::RotateDegrees::TwoSeventy,
+                other => return Err(format!("invalid rotation {other}; expected 90, 180 or 270")),
+            };
+            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Rotate(
+                degrees,
+            ))))
+        }
+        LayoutCommands::Mirror { axis } => {
+            let axis = match axis.to_ascii_lowercase().as_str() {
+                "x" | "x-axis" => rift_protocol::MirrorAxis::X,
+                "y" | "y-axis" => rift_protocol::MirrorAxis::Y,
+                other => return Err(format!("invalid axis {other}; expected x or y")),
+            };
+            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Mirror(
+                axis,
+            ))))
         }
         LayoutCommands::ToggleFocusFloat => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::ToggleFocusFloating,

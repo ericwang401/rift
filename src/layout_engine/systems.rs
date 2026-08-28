@@ -160,6 +160,17 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn toggle_fullscreen_within_gaps_of_selection(&mut self, layout: LayoutId) -> Vec<WindowId>;
     fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool;
 
+    /// Rotates the whole layout by a quarter turn, yabai's `space --rotate`.
+    ///
+    /// Only the tree layouts implement this; a stack, master-stack or scrolling
+    /// layout has no tree to turn, so the default is deliberately a no-op
+    /// rather than an approximation.
+    fn rotate(&mut self, _layout: LayoutId, _degrees: rift_protocol::RotateDegrees) {}
+
+    /// Flips the whole layout across an axis, yabai's `space --mirror`.
+    /// No-op for the non-tree layouts, as with `rotate`.
+    fn mirror(&mut self, _layout: LayoutId, _axis: rift_protocol::MirrorAxis) {}
+
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction);
     fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
         self.join_selection_with_direction(layout, direction);

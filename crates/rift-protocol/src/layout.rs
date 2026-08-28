@@ -9,6 +9,41 @@ pub enum Orientation {
     Vertical,
 }
 
+/// Quarter-turns for `LayoutCommand::Rotate`, spelled as yabai spells them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RotateDegrees {
+    #[serde(rename = "90")]
+    Ninety,
+    #[serde(rename = "180")]
+    OneEighty,
+    #[serde(rename = "270")]
+    TwoSeventy,
+}
+
+/// The axis a `LayoutCommand::Mirror` flips the tree across.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorAxis {
+    /// Flip top and bottom.
+    #[serde(alias = "x-axis")]
+    X,
+    /// Flip left and right.
+    #[serde(alias = "y-axis")]
+    Y,
+}
+
+impl MirrorAxis {
+    /// The split orientation whose children this axis reverses: mirroring left
+    /// and right reorders the containers that lay their children out
+    /// horizontally, and vice versa.
+    pub const fn orientation(self) -> Orientation {
+        match self {
+            MirrorAxis::Y => Orientation::Horizontal,
+            MirrorAxis::X => Orientation::Vertical,
+        }
+    }
+}
+
 impl Default for Orientation {
     fn default() -> Self { Self::Horizontal }
 }

@@ -34,10 +34,12 @@ use crate::actor;
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{Config, LayoutMode, StackLineHoverMode};
+use crate::common::config::{
+    Config, LayoutMode, MouseAction, MouseButton, MouseSettings, StackLineHoverMode,
+};
 use crate::sys::event::{self, Hotkey, KeyCode, MouseState, set_mouse_state};
 use crate::sys::hotkey::{
-    Modifiers, is_modifier_key, key_code_from_event, modifier_key_is_active,
+    Modifiers, is_modifier_key, key_code_from_event, modifier_key_is_active, modifiers_from_flags,
     modifiers_from_flags_with_keys,
 };
 use crate::sys::screen::{CoordinateConverter, SpaceId};
@@ -71,6 +73,7 @@ pub struct EventTap {
     mouse_move_last_timestamp: Cell<Option<u64>>,
     mouse_move_min_interval_ns: Cell<u64>,
     mouse_window: Cell<MouseWindow>,
+    modifier_drag: Cell<Option<ModifierDrag>>,
     tap: RefCell<Option<crate::sys::event_tap::EventTap>>,
     tap_generation: Cell<u64>,
     disable_hotkey: RefCell<Option<Hotkey>>,
@@ -105,6 +108,20 @@ struct State {
     screen_spaces: Vec<(CGRect, SpaceId)>,
     layout_mode_by_space: HashMap<SpaceId, crate::common::config::LayoutMode>,
     last_stack_line_hit: Option<bool>,
+    mouse: MouseSettings,
+}
+
+/// An in-flight modifier-held drag.
+///
+/// The window is resolved once, at mouse-down, and held for the life of the
+/// gesture: re-resolving per drag event would hand the window off to whatever
+/// happens to be under the cursor once the drag outruns the window.
+#[derive(Clone, Copy)]
+struct ModifierDrag {
+    button: MouseButton,
+    action: MouseAction,
+    window: WindowServerId,
+    last: CGPoint,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -134,6 +151,7 @@ impl Default for State {
             screen_spaces: Vec::new(),
             layout_mode_by_space: HashMap::default(),
             last_stack_line_hit: None,
+            mouse: MouseSettings::default(),
         }
     }
 }
@@ -280,6 +298,7 @@ impl EventTap {
         state.stack_line_enabled = config.settings.ui.stack_line.enabled;
         state.stack_line_hover_mode = config.settings.ui.stack_line.hover;
         state.default_layout_mode = config.settings.layout.mode;
+        state.mouse = config.settings.mouse;
         state.disable_hotkey_active = disable_hotkey
             .as_ref()
             .map(|target| state.compute_disable_hotkey_active(target))
@@ -298,6 +317,7 @@ impl EventTap {
             mouse_move_last_timestamp: Cell::new(None),
             mouse_move_min_interval_ns: Cell::new(mouse_move_min_interval_ns),
             mouse_window: Cell::new(MouseWindow::default()),
+            modifier_drag: Cell::new(None),
             tap: RefCell::new(None),
             tap_generation: Cell::new(0),
             disable_hotkey: RefCell::new(disable_hotkey),
@@ -444,6 +464,7 @@ impl EventTap {
                     state.stack_line_enabled = stack_line_enabled;
                     state.stack_line_hover_mode = stack_line_hover_mode;
                     state.default_layout_mode = default_layout_mode;
+                    state.mouse = new_config.settings.mouse;
                     let prev_active = state.disable_hotkey_active;
                     state.disable_hotkey_active = self
                         .disable_hotkey
@@ -562,6 +583,14 @@ impl EventTap {
 
                 let loc = CGEvent::location(Some(event));
 
+                // Modifier-drag claims the whole gesture, so the press must not
+                // reach the application: otherwise the app sees a click (and
+                // often a focus/selection change) under every drag.
+                if let Some(drag) = self.begin_modifier_drag(event_type, event, &state, loc) {
+                    self.modifier_drag.set(Some(drag));
+                    return false;
+                }
+
                 // The event tap is the single source of hit-testing for
                 // stack-line indicators. Only forward the click and
                 // suppress propagation when it lands on a visible,
@@ -579,8 +608,18 @@ impl EventTap {
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 set_mouse_state(MouseState::Down);
+                if self.continue_modifier_drag(event_type, event) {
+                    return false;
+                }
             }
-            CGEventType::LeftMouseUp | CGEventType::RightMouseUp => set_mouse_state(MouseState::Up),
+            CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
+                set_mouse_state(MouseState::Up);
+                // Swallow the release that closes a drag we swallowed the press
+                // for, so the application never sees half a click.
+                if self.end_modifier_drag(event_type) {
+                    return false;
+                }
+            }
             _ => {}
         }
 
@@ -612,6 +651,70 @@ impl EventTap {
             _ => (),
         }
 
+        true
+    }
+
+    /// Starts a modifier-held drag, if this press is one.
+    ///
+    /// The held modifiers must match the configured set exactly. A subset would
+    /// fire on a bare click; a superset would steal, say, Cmd+Alt+click from the
+    /// application underneath.
+    fn begin_modifier_drag(
+        &self,
+        event_type: CGEventType,
+        event: &CGEvent,
+        state: &State,
+        loc: CGPoint,
+    ) -> Option<ModifierDrag> {
+        if !state.event_processing_enabled {
+            return None;
+        }
+        let button = mouse_button(event_type)?;
+        let (modifier, action) = state.mouse.action_for(button)?;
+        let held = modifiers_from_flags(CGEvent::flags(Some(event)));
+        if held != modifier {
+            return None;
+        }
+        let window = mouse_window_hint(event)?;
+        debug!(?button, ?action, ?window, "Beginning modifier drag");
+        Some(ModifierDrag { button, action, window, last: loc })
+    }
+
+    /// Forwards drag movement to the reactor. Returns whether the event was
+    /// consumed by an in-flight modifier drag.
+    fn continue_modifier_drag(&self, event_type: CGEventType, event: &CGEvent) -> bool {
+        let Some(mut drag) = self.modifier_drag.get() else {
+            return false;
+        };
+        if mouse_button(event_type) != Some(drag.button) {
+            return false;
+        }
+        let loc = CGEvent::location(Some(event));
+        let dx = loc.x - drag.last.x;
+        let dy = loc.y - drag.last.y;
+        drag.last = loc;
+        self.modifier_drag.set(Some(drag));
+        if dx != 0.0 || dy != 0.0 {
+            _ = self.events_tx.send(Event::MouseModifierDrag {
+                window: drag.window,
+                dx,
+                dy,
+                action: drag.action,
+            });
+        }
+        true
+    }
+
+    /// Ends an in-flight drag. Returns whether this release closed one.
+    fn end_modifier_drag(&self, event_type: CGEventType) -> bool {
+        let Some(drag) = self.modifier_drag.get() else {
+            return false;
+        };
+        if mouse_button(event_type) != Some(drag.button) {
+            return false;
+        }
+        trace!("Ending modifier drag");
+        self.modifier_drag.set(None);
         true
     }
 
@@ -988,6 +1091,19 @@ fn mouse_move_sampling_profile(low_power_mode: bool) -> u64 {
         MOUSE_MOVE_MIN_INTERVAL_NS_LOW_POWER
     } else {
         MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL
+    }
+}
+
+#[inline]
+fn mouse_button(event_type: CGEventType) -> Option<MouseButton> {
+    match event_type {
+        CGEventType::LeftMouseDown | CGEventType::LeftMouseDragged | CGEventType::LeftMouseUp => {
+            Some(MouseButton::Left)
+        }
+        CGEventType::RightMouseDown
+        | CGEventType::RightMouseDragged
+        | CGEventType::RightMouseUp => Some(MouseButton::Right),
+        _ => None,
     }
 }
 

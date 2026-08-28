@@ -484,6 +484,35 @@ impl FromStr for KeyCode {
             "enter" | "return" => KeyCode::Enter,
             "esc" | "escape" => KeyCode::Escape,
             "fn" => KeyCode::Fn,
+            // "delete" below is the forward delete key. On an Apple keyboard the
+            // key labelled Delete is backspace, so accept both spellings for it.
+            "backspace" | "backwarddelete" => KeyCode::Backspace,
+            "capslock" => KeyCode::CapsLock,
+            "contextmenu" | "menu" => KeyCode::ContextMenu,
+
+            "volumeup" | "audiovolumeup" => KeyCode::AudioVolumeUp,
+            "volumedown" | "audiovolumedown" => KeyCode::AudioVolumeDown,
+            "mute" | "audiovolumemute" => KeyCode::AudioVolumeMute,
+
+            "numpad0" | "kp0" => KeyCode::Numpad0,
+            "numpad1" | "kp1" => KeyCode::Numpad1,
+            "numpad2" | "kp2" => KeyCode::Numpad2,
+            "numpad3" | "kp3" => KeyCode::Numpad3,
+            "numpad4" | "kp4" => KeyCode::Numpad4,
+            "numpad5" | "kp5" => KeyCode::Numpad5,
+            "numpad6" | "kp6" => KeyCode::Numpad6,
+            "numpad7" | "kp7" => KeyCode::Numpad7,
+            "numpad8" | "kp8" => KeyCode::Numpad8,
+            "numpad9" | "kp9" => KeyCode::Numpad9,
+            "numpadenter" | "kpenter" => KeyCode::NumpadEnter,
+            "numpadadd" | "kpplus" => KeyCode::NumpadAdd,
+            "numpadsubtract" | "kpminus" => KeyCode::NumpadSubtract,
+            "numpadmultiply" | "kpmultiply" => KeyCode::NumpadMultiply,
+            "numpaddivide" | "kpdivide" => KeyCode::NumpadDivide,
+            "numpaddecimal" | "kpdecimal" => KeyCode::NumpadDecimal,
+            "numpadequal" | "kpequal" => KeyCode::NumpadEqual,
+            "numpadcomma" | "kpcomma" => KeyCode::NumpadComma,
+            "numlock" | "numpadclear" => KeyCode::NumLock,
 
             "pageup" => KeyCode::PageUp,
             "pagedown" => KeyCode::PageDown,
@@ -554,6 +583,21 @@ fn parse_mods_and_optional_key(s: &str) -> Result<(Modifiers, Option<KeyCode>), 
     }
 
     Ok((mods, key_opt))
+}
+
+/// Parses a modifier-only spec such as "Alt" or "Ctrl + Alt".
+///
+/// Rejects specs that name a non-modifier key, so a config that says
+/// `modifier = "Alt + T"` fails loudly instead of silently binding Alt.
+pub fn modifiers_from_str(s: &str) -> Result<Modifiers, anyhow::Error> {
+    let (mods, key) = parse_mods_and_optional_key(s)?;
+    if key.is_some() {
+        return Err(anyhow!("Expected modifiers only, but found a key in: {}", s));
+    }
+    if mods == Modifiers::empty() {
+        return Err(anyhow!("No modifiers specified in: {}", s));
+    }
+    Ok(mods)
 }
 
 impl FromStr for Hotkey {
@@ -1062,6 +1106,30 @@ fn fallback_keycode_from_char(ch: &str) -> Option<KeyCode> {
 }
 
 mod tests {
+
+    #[test]
+    fn parser_names_the_keys_that_have_no_character() {
+        // Backspace in particular had no token at all, which made
+        // "Ctrl + Alt + Backspace" unbindable.
+        assert_eq!(KeyCode::from_str("Backspace").unwrap(), KeyCode::Backspace);
+        assert_eq!(KeyCode::from_str("backspace").unwrap(), KeyCode::Backspace);
+        assert_eq!(KeyCode::from_str("Numpad5").unwrap(), KeyCode::Numpad5);
+        assert_eq!(KeyCode::from_str("CapsLock").unwrap(), KeyCode::CapsLock);
+        assert_eq!(KeyCode::from_str("Delete").unwrap(), KeyCode::Delete);
+
+        let hotkey = Hotkey::from_str("Ctrl + Alt + Backspace").unwrap();
+        assert_eq!(hotkey.key_code, KeyCode::Backspace);
+        assert!(hotkey.modifiers.contains(Modifiers::CONTROL));
+        assert!(hotkey.modifiers.contains(Modifiers::ALT));
+    }
+
+    #[test]
+    fn modifiers_from_str_rejects_specs_that_name_a_key() {
+        assert_eq!(modifiers_from_str("Alt").unwrap(), Modifiers::ALT);
+        assert!(modifiers_from_str("Ctrl + Alt").unwrap().contains(Modifiers::CONTROL));
+        assert!(modifiers_from_str("Alt + T").is_err());
+        assert!(modifiers_from_str("").is_err());
+    }
     #[allow(unused)]
     use super::*;
 

@@ -41,6 +41,46 @@ pub struct BspLayoutSystem {
 }
 
 impl BspLayoutSystem {
+    /// Every node of a layout, collected before any mutation.
+    ///
+    /// Rotating and mirroring relink children as they go, so the traversal has
+    /// to finish before the tree starts moving underneath it.
+    fn nodes_in_layout(&self, layout: LayoutId) -> Vec<NodeId> {
+        self.layouts
+            .get(layout)
+            .map(|state| state.root.traverse_preorder(&self.tree.map).collect())
+            .unwrap_or_default()
+    }
+
+    /// Reverses a split's two children and its ratio with them, so the
+    /// proportions travel with the windows instead of staying put.
+    fn reverse_split_children(&mut self, node: NodeId) {
+        let children: Vec<NodeId> = node.children(&self.tree.map).collect();
+        if children.len() != 2 {
+            return;
+        }
+        if let Some(NodeKind::Split { ratio, .. }) = self.kind.get_mut(node) {
+            *ratio = 1.0 - *ratio;
+        }
+        children[0].detach(&mut self.tree).push_back(node);
+    }
+
+    fn split_orientation(&self, node: NodeId) -> Option<Orientation> {
+        match self.kind.get(node) {
+            Some(NodeKind::Split { orientation, .. }) => Some(*orientation),
+            _ => None,
+        }
+    }
+
+    fn flip_split_orientation(&mut self, node: NodeId) {
+        if let Some(NodeKind::Split { orientation, .. }) = self.kind.get_mut(node) {
+            *orientation = match *orientation {
+                Orientation::Horizontal => Orientation::Vertical,
+                Orientation::Vertical => Orientation::Horizontal,
+            };
+        }
+    }
+
     fn find_neighbor_leaf(&self, from_leaf: NodeId, direction: Direction) -> Option<NodeId> {
         let mut current = from_leaf;
 
@@ -783,6 +823,84 @@ mod tests {
         assert_eq!(system.window_in_direction(layout, Direction::Up), Some(w(2)));
     }
 
+    /// Tree shape as `draw_tree` renders it: the split line, then the leaves in
+    /// child order. Rotation and mirroring are defined on that order, so this
+    /// is what the assertions below compare.
+    fn shape(system: &BspLayoutSystem, layout: LayoutId) -> Vec<String> {
+        system.draw_tree(layout).lines().map(|line| line.trim().to_string()).collect()
+    }
+
+    fn two_window_layout() -> (BspLayoutSystem, LayoutId) {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        (system, layout)
+    }
+
+    #[test]
+    fn mirror_reverses_only_the_matching_axis() {
+        use rift_protocol::MirrorAxis;
+
+        let (mut system, layout) = two_window_layout();
+        let before = shape(&system, layout);
+        assert!(before[0].starts_with("Split Horizontal"));
+
+        // Mirroring across x reorders vertical splits, of which there are none.
+        system.mirror(layout, MirrorAxis::X);
+        assert_eq!(shape(&system, layout), before, "x mirror must not touch a horizontal split");
+
+        // Mirroring across y reverses it.
+        system.mirror(layout, MirrorAxis::Y);
+        let after = shape(&system, layout);
+        assert!(after[0].starts_with("Split Horizontal"), "mirroring must not turn the split");
+        assert_eq!(after[1], before[2]);
+        assert_eq!(after[2], before[1]);
+    }
+
+    #[test]
+    fn rotate_90_turns_the_split_and_reverses_it() {
+        use rift_protocol::RotateDegrees;
+
+        let (mut system, layout) = two_window_layout();
+        let before = shape(&system, layout);
+
+        system.rotate(layout, RotateDegrees::Ninety);
+
+        let after = shape(&system, layout);
+        assert!(after[0].starts_with("Split Vertical"), "a quarter turn changes the axis");
+        assert_eq!(after[1], before[2], "and reverses the children with it");
+        assert_eq!(after[2], before[1]);
+    }
+
+    #[test]
+    fn rotate_180_reverses_without_turning() {
+        use rift_protocol::RotateDegrees;
+
+        let (mut system, layout) = two_window_layout();
+        let before = shape(&system, layout);
+
+        system.rotate(layout, RotateDegrees::OneEighty);
+
+        let after = shape(&system, layout);
+        assert!(after[0].starts_with("Split Horizontal"), "a half turn keeps the axis");
+        assert_eq!(after[1], before[2]);
+        assert_eq!(after[2], before[1]);
+    }
+
+    #[test]
+    fn opposite_quarter_turns_restore_the_original_tree() {
+        use rift_protocol::RotateDegrees;
+
+        let (mut system, layout) = two_window_layout();
+        let before = shape(&system, layout);
+
+        system.rotate(layout, RotateDegrees::Ninety);
+        system.rotate(layout, RotateDegrees::TwoSeventy);
+
+        assert_eq!(shape(&system, layout), before);
+    }
+
     #[test]
     fn fibonacci_spiral_alternates_split_orientation() {
         let mut system = BspLayoutSystem::default();
@@ -979,6 +1097,42 @@ mod tests {
 }
 
 impl LayoutSystem for BspLayoutSystem {
+    /// A quarter turn is a swap plus an axis flip, applied to every split.
+    ///
+    /// Which splits swap depends on the direction of the turn: turning
+    /// clockwise reverses the horizontal splits (what was left becomes top),
+    /// counter-clockwise reverses the vertical ones, and a half turn reverses
+    /// everything and flips nothing.
+    fn rotate(&mut self, layout: LayoutId, degrees: rift_protocol::RotateDegrees) {
+        use rift_protocol::RotateDegrees;
+
+        for node in self.nodes_in_layout(layout) {
+            let Some(orientation) = self.split_orientation(node) else {
+                continue;
+            };
+            let reverse = match degrees {
+                RotateDegrees::Ninety => orientation == Orientation::Horizontal,
+                RotateDegrees::TwoSeventy => orientation == Orientation::Vertical,
+                RotateDegrees::OneEighty => true,
+            };
+            if reverse {
+                self.reverse_split_children(node);
+            }
+            if degrees != RotateDegrees::OneEighty {
+                self.flip_split_orientation(node);
+            }
+        }
+    }
+
+    fn mirror(&mut self, layout: LayoutId, axis: rift_protocol::MirrorAxis) {
+        let target = axis.orientation();
+        for node in self.nodes_in_layout(layout) {
+            if self.split_orientation(node) == Some(target) {
+                self.reverse_split_children(node);
+            }
+        }
+    }
+
     fn create_layout(&mut self) -> LayoutId {
         let leaf = self.make_leaf(None);
         let state = LayoutState { root: leaf };

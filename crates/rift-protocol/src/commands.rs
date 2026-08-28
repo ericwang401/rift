@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Direction, DisplaySelector, LayoutMode, ResizeOrientation, RestoreScope, RestoreSource,
-    WindowId, WorkspaceSelector,
+    Direction, DisplaySelector, LayoutMode, MirrorAxis, ResizeOrientation, RestoreScope,
+    RestoreSource, RotateDegrees, WindowId, WorkspaceSelector,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -44,6 +44,8 @@ pub enum LayoutCommand {
     ConsumeOrExpelWindow(Direction),
     ToggleStack,
     ToggleOrientation,
+    Rotate(RotateDegrees),
+    Mirror(MirrorAxis),
     UnjoinWindows,
     ToggleFocusFloating,
     ToggleWindowFloating,
@@ -73,6 +75,7 @@ pub enum LayoutCommand {
         mode: LayoutMode,
     },
     CreateWorkspace,
+    DestroyWorkspace,
     SwitchToLastWorkspace,
     SwapWindows(WindowId, WindowId),
     AdjustMasterRatio(f64),

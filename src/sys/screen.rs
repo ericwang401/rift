@@ -242,9 +242,17 @@ impl<S: System> ScreenCache<S> {
     }
 }
 
-const DOCK_ORIENTATION_LEFT: i32 = 1;
+// Values returned by CoreDockGetOrientationAndPinning. These are 1-based
+// starting at top, so left is 3 and right is 4 — NOT 1 and 3. The old constants
+// had left = 1 and right = 3, which left bottom (2) correct by coincidence and
+// silently mis-classified both side positions: a left dock reported 3 and took
+// the right-hand branch below, subtracting the dock's width from the usable
+// frame without advancing its origin, so tiled windows began underneath the
+// dock and stopped short of the opposite screen edge.
+const DOCK_ORIENTATION_TOP: i32 = 1;
 const DOCK_ORIENTATION_BOTTOM: i32 = 2;
-const DOCK_ORIENTATION_RIGHT: i32 = 3;
+const DOCK_ORIENTATION_LEFT: i32 = 3;
+const DOCK_ORIENTATION_RIGHT: i32 = 4;
 
 fn menu_bar_hidden() -> bool {
     let mut status = 0;
@@ -349,6 +357,10 @@ fn constrain_display_bounds(did: u32, raw: CGRect, notch_height: f64) -> CGRect 
                 frame.size.width = (frame.size.width - dock.size.width).max(0.0);
             }
             DOCK_ORIENTATION_BOTTOM => {
+                frame.size.height = (frame.size.height - dock.size.height).max(0.0);
+            }
+            DOCK_ORIENTATION_TOP => {
+                frame.origin.y += dock.size.height;
                 frame.size.height = (frame.size.height - dock.size.height).max(0.0);
             }
             _ => {
