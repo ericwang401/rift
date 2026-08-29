@@ -1218,6 +1218,42 @@ fn external_resize_requests_one_arrange_pass() {
     assert!(outcome.arrange.is_resize);
 }
 
+/// Dropping a dragged window has to lay the space out again even when nothing
+/// was swapped: layout was skipped for the window while it followed the
+/// pointer, so its frame no longer matches the tree and it would otherwise be
+/// left wherever the drag ended.
+#[test]
+fn dropping_with_no_swap_still_arranges_the_window_back() {
+    let (mut reactor, wid, _wsid, space1, _space2, _frame) = reactor_with_window_on_space1();
+    let (visible_spaces, visible_space_centers) = reactor.visible_spaces_for_layout(true);
+
+    // The state a drag ends in once it has had, and then lost, a swap target:
+    // no session left, but layout was skipped along the way.
+    reactor.drag_manager.drag_state = DragState::Inactive;
+    reactor.drag_manager.skip_layout_for_window = Some(wid);
+
+    let outcome = crate::actor::reactor::events::drag::handle_mouse_up(
+        &mut reactor.state,
+        &mut reactor.layout_manager,
+        &mut reactor.drag_manager,
+        crate::actor::reactor::events::drag::MouseUpPayload {
+            pending_swap: None,
+            drop_action: None,
+            swap_space: Some(space1),
+            final_space: Some(space1),
+            visible_spaces,
+            visible_space_centers,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        outcome.arrange.requested && outcome.arrange.passes > 0,
+        "a drop that skipped layout must arrange, got {:?}",
+        outcome.arrange
+    );
+}
+
 /// A modifier resize moves the edges the press landed nearest, so the window
 /// follows the cursor. Growing from the origin instead moves the right and
 /// bottom edges whichever way the cursor goes, which reads as the window

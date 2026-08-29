@@ -121,6 +121,14 @@ pub fn handle_mouse_up(
     let skipped = drag.skip_layout_for_window.is_some();
     drag.skip_layout_for_window = None;
 
+    // Having skipped layout for a window during the drag is itself the reason
+    // to run one now: its frame was left to follow the pointer and no longer
+    // matches the tree. Without this the window simply stays wherever it was
+    // dropped, which happens whenever the drag ends with no swap to perform —
+    // the session's own dirty flag stops being updated once a swap candidate
+    // promotes the drag out of the Active state.
+    needs_layout |= skipped;
+
     let passes = if needs_layout {
         if skipped { 3 } else { 2 }
     } else {

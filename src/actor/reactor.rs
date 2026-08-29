@@ -4476,40 +4476,44 @@ impl Reactor {
     /// the split when the pointer is near an edge — so what is drawn is a
     /// promise about what will happen, not a hint.
     fn preview_drop_region(&self, dragged: WindowId, target: WindowId) {
-        let Some(tx) = &self.communication_manager.drop_overlay_tx else {
+        // Anything that leaves nothing to promise hides the overlay rather
+        // than merely declining to update it, or a region drawn a moment ago
+        // stays on screen for the rest of the drag.
+        let Some((screen, region)) = self.drop_preview_region(dragged, target) else {
+            self.hide_drop_region();
             return;
         };
+        if let Some(tx) = &self.communication_manager.drop_overlay_tx {
+            tx.send(crate::actor::drop_overlay::Event::Aim { screen, region });
+        }
+    }
+
+    /// The screen and region a drop would land in, or `None` when the drop
+    /// would not rearrange anything.
+    fn drop_preview_region(&self, dragged: WindowId, target: WindowId) -> Option<(CGRect, CGRect)> {
         if !self.config.settings.ui.drop_overlay.enabled {
-            return;
+            return None;
         }
         // Only the tree can swap or split, so a floating window on either end
-        // of the drag has nothing to preview: the drop will not rearrange
-        // anything.
+        // of the drag has nothing to preview.
         let engine = &self.layout_manager.layout_engine;
         if engine.is_window_floating(dragged) || engine.is_window_floating(target) {
-            return;
+            return None;
         }
-        let Some(frame) = self.state.windows.window(target).map(|w| w.frame_monotonic) else {
-            return;
-        };
-        let Ok(cursor) = window_server::current_cursor_location() else {
-            return;
-        };
-        let Some(screen) = self
+        let frame = self.state.windows.window(target).map(|w| w.frame_monotonic)?;
+        let cursor = window_server::current_cursor_location().ok()?;
+        let screen = self
             .space_state
             .screens
             .iter()
             .find(|screen| screen.frame.contains(cursor))
-            .map(|screen| screen.frame)
-        else {
-            return;
-        };
+            .map(|screen| screen.frame)?;
 
         let region = match crate::actor::drag_swap::DragManager::drop_action(frame, cursor) {
             crate::actor::drag_swap::DropAction::Swap => frame,
             crate::actor::drag_swap::DropAction::Insert(direction) => half_of(frame, direction),
         };
-        tx.send(crate::actor::drop_overlay::Event::Aim { screen, region });
+        Some((screen, region))
     }
 
     fn hide_drop_region(&self) {
