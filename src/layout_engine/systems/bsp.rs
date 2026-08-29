@@ -869,6 +869,30 @@ mod tests {
     }
 
     #[test]
+    fn inserting_beside_a_target_splits_it_without_duplicating_the_window() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        // Drop w(2) below w(1): the tree must split w(1) vertically and hold
+        // one leaf each, not gain a third from the window it already had.
+        assert!(system.insert_window_next_to(layout, w(1), Direction::Down, w(2)));
+
+        let tree = system.draw_tree(layout);
+        let leaves = tree.lines().filter(|line| line.contains("Leaf")).count();
+        assert_eq!(leaves, 2, "one leaf per window after inserting:\n{tree}");
+        assert!(
+            tree.contains("Vertical"),
+            "a downward drop splits vertically:\n{tree}"
+        );
+        assert_eq!(system.windows_for_app(layout, w(1).pid).len(), 2);
+
+        // A window cannot be dropped on itself.
+        assert!(!system.insert_window_next_to(layout, w(1), Direction::Left, w(1)));
+    }
+
+    #[test]
     fn balance_resets_every_split_to_an_even_share() {
         let mut system = BspLayoutSystem::default();
         let layout = system.create_layout();
@@ -2019,6 +2043,30 @@ impl LayoutSystem for BspLayoutSystem {
     ///
     /// A bsp tree carries its proportions on the splits rather than on the
     /// leaves, so an even tree is one whose splits are all half and half.
+    fn insert_window_next_to(
+        &mut self,
+        layout: LayoutId,
+        target: WindowId,
+        direction: Direction,
+        window: WindowId,
+    ) -> bool {
+        if target == window {
+            return false;
+        }
+        // The window is normally already somewhere in this tree, so it has to
+        // leave before it can be re-inserted; splitting first would strand its
+        // old leaf, since window_to_node holds one node per window.
+        self.remove_window(window);
+        let Some(&leaf) = self.window_to_node.get(&target) else {
+            return false;
+        };
+        if !self.layouts.contains_key(layout) {
+            return false;
+        }
+        self.split_leaf_in_direction(leaf, direction, window);
+        true
+    }
+
     fn rebalance(&mut self, layout: LayoutId) {
         for node in self.nodes_in_layout(layout) {
             if let Some(NodeKind::Split { ratio, .. }) = self.kind.get_mut(node) {

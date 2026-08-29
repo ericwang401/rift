@@ -4,6 +4,7 @@ use objc2_core_foundation::{CGPoint, CGRect};
 
 use crate::actor::app::WindowId;
 use crate::common::config::WindowSnappingSettings;
+use crate::layout_engine::Direction;
 use crate::sys::geometry::CGRectExt;
 
 // less overlap once activated for a sticky
@@ -48,6 +49,46 @@ impl DragManager {
             active_candidate: None,
             config,
         }
+    }
+
+    /// What dropping the dragged window on a target should do.
+    ///
+    /// yabai divides the target into a centre box and four edge triangles
+    /// (`mouse_determine_drop_action`): the middle swaps the two windows, and
+    /// each edge inserts the dragged window on that side, splitting the target.
+    /// Rift only ever swapped, so there was no way to put two windows above one
+    /// another on half the screen by dragging.
+    pub fn drop_action(target: CGRect, cursor: CGPoint) -> DropAction {
+        let w = target.size.width;
+        let h = target.size.height;
+        if w <= 0.0 || h <= 0.0 {
+            return DropAction::Swap;
+        }
+        // Cursor relative to the target's top-left, so the zones below can be
+        // written in plain fractions of its size.
+        let p = CGPoint::new(cursor.x - target.origin.x, cursor.y - target.origin.y);
+
+        let centre = CGRect::new(
+            CGPoint::new(0.25 * w, 0.25 * h),
+            objc2_core_foundation::CGSize::new(0.5 * w, 0.5 * h),
+        );
+        if rect_contains(centre, p) {
+            return DropAction::Swap;
+        }
+
+        let mid = CGPoint::new(0.5 * w, 0.5 * h);
+        let corners = [
+            (CGPoint::new(0.0, 0.0), CGPoint::new(w, 0.0), Direction::Up),
+            (CGPoint::new(w, 0.0), CGPoint::new(w, h), Direction::Right),
+            (CGPoint::new(w, h), CGPoint::new(0.0, h), Direction::Down),
+            (CGPoint::new(0.0, h), CGPoint::new(0.0, 0.0), Direction::Left),
+        ];
+        for (a, b, direction) in corners {
+            if triangle_contains(a, mid, b, p) {
+                return DropAction::Insert(direction);
+            }
+        }
+        DropAction::Swap
     }
 
     pub fn on_frame_change(
@@ -205,6 +246,31 @@ mod tests {
     }
 
     #[test]
+    fn drop_zones_follow_the_cursor_within_the_target() {
+        use super::{DragManager, DropAction};
+        use crate::layout_engine::Direction;
+
+        let target = rect(100.0, 100.0, 400.0, 400.0);
+        let at = |x: f64, y: f64| DragManager::drop_action(target, CGPoint::new(x, y));
+
+        // The middle half in each axis swaps.
+        assert_eq!(at(300.0, 300.0), DropAction::Swap);
+        assert_eq!(at(210.0, 210.0), DropAction::Swap);
+
+        // Each edge triangle inserts on that side.
+        assert_eq!(at(300.0, 110.0), DropAction::Insert(Direction::Up));
+        assert_eq!(at(490.0, 300.0), DropAction::Insert(Direction::Right));
+        assert_eq!(at(300.0, 490.0), DropAction::Insert(Direction::Down));
+        assert_eq!(at(110.0, 300.0), DropAction::Insert(Direction::Left));
+
+        // A degenerate target cannot be divided, so it can only swap.
+        assert_eq!(
+            DragManager::drop_action(rect(0.0, 0.0, 0.0, 0.0), CGPoint::new(0.0, 0.0)),
+            DropAction::Swap
+        );
+    }
+
+    #[test]
     fn selects_candidate_based_on_scored_overlap() {
         let mut dm = DragManager::new(WindowSnappingSettings { drag_swap_fraction: 0.3 });
 
@@ -290,4 +356,33 @@ mod tests {
         assert_eq!(switched, Some(WindowId::new(7, 2)));
         assert_eq!(dm.last_target(), Some(WindowId::new(7, 2)));
     }
+}
+
+/// What a drop on a target window means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropAction {
+    /// Exchange the two windows' places.
+    Swap,
+    /// Split the target and put the dragged window on that side of it.
+    Insert(Direction),
+}
+
+fn rect_contains(rect: CGRect, point: CGPoint) -> bool {
+    point.x >= rect.origin.x
+        && point.y >= rect.origin.y
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+/// Whether `p` lies inside triangle `abc`, by consistent winding of the three
+/// edge cross products.
+fn triangle_contains(a: CGPoint, b: CGPoint, c: CGPoint, p: CGPoint) -> bool {
+    let cross =
+        |u: CGPoint, v: CGPoint, w: CGPoint| (v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x);
+    let d1 = cross(a, b, p);
+    let d2 = cross(b, c, p);
+    let d3 = cross(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
 }

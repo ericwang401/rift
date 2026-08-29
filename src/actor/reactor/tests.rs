@@ -1400,6 +1400,7 @@ fn cross_display_drag_clears_source_floating_position() {
         &mut reactor.drag_manager,
         crate::actor::reactor::events::drag::MouseUpPayload {
             pending_swap: None,
+            drop_action: None,
             swap_space: Some(space2),
             final_space: Some(space2),
             visible_spaces,

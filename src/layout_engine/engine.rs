@@ -3196,6 +3196,28 @@ impl LayoutEngine {
         self.floating.is_floating(window_id)
     }
 
+    /// Splits `target` and puts `window` on the given side of it, for a drop on
+    /// a window's edge. Reports whether the layout could express it, so the
+    /// caller can fall back to swapping the two.
+    pub fn insert_window_next_to(
+        &mut self,
+        space: SpaceId,
+        target: WindowId,
+        direction: Direction,
+        window: WindowId,
+    ) -> bool {
+        let Some((ws_id, layout)) = self.workspace_and_layout(space) else {
+            return false;
+        };
+        let inserted = self
+            .workspace_tree_mut(ws_id)
+            .insert_window_next_to(layout, target, direction, window);
+        if inserted {
+            self.workspace_layouts.mark_last_saved(space, ws_id, layout);
+        }
+        inserted
+    }
+
     pub fn store_floating_position(
         &mut self,
         space: SpaceId,

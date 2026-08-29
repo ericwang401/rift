@@ -1586,6 +1586,14 @@ impl Reactor {
                         .or_else(|| self.best_space_for_frame(&session.last_frame))
                         .or_else(|| self.best_space_for_window_id(session.window))
                 });
+                // Where the pointer sits inside the target decides whether the
+                // drop swaps or splits, so it has to be read before the drag
+                // state is torn down.
+                let drop_action = pending_swap.and_then(|(_, target)| {
+                    let frame = self.state.windows.window(target)?.frame_monotonic;
+                    let cursor = window_server::current_cursor_location().ok()?;
+                    Some(crate::actor::drag_swap::DragManager::drop_action(frame, cursor))
+                });
                 let focused = self.window_id_under_cursor().and_then(|window| {
                     self.best_space_for_window_id(window).map(|space| (space, window))
                 });
@@ -1595,6 +1603,7 @@ impl Reactor {
                     &mut self.drag_manager,
                     interaction_workflow::MouseUpPayload {
                         pending_swap,
+                        drop_action,
                         swap_space,
                         final_space,
                         visible_spaces,

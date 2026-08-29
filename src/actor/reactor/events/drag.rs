@@ -13,6 +13,9 @@ use crate::sys::screen::SpaceId;
 #[derive(Debug, Clone)]
 pub struct MouseUpPayload {
     pub pending_swap: Option<(WindowId, WindowId)>,
+    /// What the drop means, from where the cursor sits inside the target.
+    /// `None` falls back to swapping, which is what a drop always used to do.
+    pub drop_action: Option<crate::actor::drag_swap::DropAction>,
     pub swap_space: Option<SpaceId>,
     pub final_space: Option<SpaceId>,
     pub visible_spaces: Vec<SpaceId>,
@@ -29,17 +32,30 @@ pub fn handle_mouse_up(
     let mut needs_layout = false;
 
     if let Some((dragged, target)) = payload.pending_swap {
-        trace!(?dragged, ?target, "performing deferred drag swap");
         drag.skip_layout_for_window = Some(dragged);
         if state.windows.contains_window(dragged) && state.windows.contains_window(target) {
-            let response = layout.layout_engine.handle_command(
-                &mut state.windows,
-                payload.swap_space,
-                &payload.visible_spaces,
-                &payload.visible_space_centers,
-                LayoutCommand::SwapWindows(dragged.into(), target.into()),
-            );
-            outcome = outcome.with_layout_response(response, None);
+            // Dropping on the middle of a window exchanges the two; dropping
+            // near an edge splits the target and puts the dragged window on
+            // that side. A layout that cannot express the split says so, and
+            // the drop falls back to the swap it would have been before.
+            let inserted = match (payload.drop_action, payload.swap_space) {
+                (Some(crate::actor::drag_swap::DropAction::Insert(direction)), Some(space)) => {
+                    trace!(?dragged, ?target, ?direction, "inserting beside the drop target");
+                    layout.layout_engine.insert_window_next_to(space, target, direction, dragged)
+                }
+                _ => false,
+            };
+            if !inserted {
+                trace!(?dragged, ?target, "performing deferred drag swap");
+                let response = layout.layout_engine.handle_command(
+                    &mut state.windows,
+                    payload.swap_space,
+                    &payload.visible_spaces,
+                    &payload.visible_space_centers,
+                    LayoutCommand::SwapWindows(dragged.into(), target.into()),
+                );
+                outcome = outcome.with_layout_response(response, None);
+            }
         }
         needs_layout = true;
     }

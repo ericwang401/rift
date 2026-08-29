@@ -173,6 +173,21 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     /// No-op for the non-tree layouts, as with `rotate`.
     fn mirror(&mut self, _layout: LayoutId, _axis: rift_protocol::MirrorAxis) {}
 
+    /// Splits `target` and puts `window` on the given side of it.
+    ///
+    /// This is what dropping a window on the edge of another should do, as
+    /// opposed to swapping their places. Only the tree layouts can express it;
+    /// the default reports failure so the caller can fall back to a swap.
+    fn insert_window_next_to(
+        &mut self,
+        _layout: LayoutId,
+        _target: WindowId,
+        _direction: Direction,
+        _window: WindowId,
+    ) -> bool {
+        false
+    }
+
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction);
     fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
         self.join_selection_with_direction(layout, direction);
