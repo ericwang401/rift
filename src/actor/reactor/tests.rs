@@ -5490,6 +5490,65 @@ fn split_preview_is_where_the_window_lands_not_half_of_the_target() {
     assert!(reactor.layout_manager.layout_engine.is_window_tiled(space, right));
 }
 
+mod mouse_follows_focus {
+    use test_log::test;
+
+    use super::*;
+
+    /// A window that gains focus by any route — here cmd-tab between apps,
+    /// nothing rift did — pulls the pointer with it, floating or not, unless
+    /// the pointer is already inside it.
+    #[test]
+    fn focus_change_not_caused_by_rift_warps_the_pointer_even_for_floating_windows() {
+        let (mut apps, mut reactor) = test_context();
+        reactor.config.settings.mouse_follows_focus = true;
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+
+        let a = WindowId::new(1, 1);
+        let b = WindowId::new(2, 1);
+        let far_away = CGPoint::new(-5000., -5000.);
+        crate::sys::window_server::set_cursor_location_override(Some(far_away));
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(1), Some(a), true, true));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_events(apps.make_app_with_opts(2, make_windows(1), Some(b), false, true));
+        apps.simulate_until_quiet(&mut reactor);
+        // Both float: the pointer must follow regardless of window state.
+        reactor.layout_manager.layout_engine.mark_window_floating(a);
+        reactor.layout_manager.layout_engine.mark_window_floating(b);
+        assert_eq!(reactor.main_window(), Some(a));
+        reactor.test_mouse_warps.clear();
+
+        // cmd-tab to app 2.
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        reactor.handle_event(Event::ApplicationActivated(2, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(b));
+        let b_center = reactor.state.windows.window(b).unwrap().frame_monotonic.mid();
+        assert_eq!(
+            reactor.test_mouse_warps,
+            vec![b_center],
+            "the pointer follows to b"
+        );
+
+        // Back to app 1 by clicking in `a`: the pointer is already there.
+        let a_center = reactor.state.windows.window(a).unwrap().frame_monotonic.mid();
+        crate::sys::window_server::set_cursor_location_override(Some(a_center));
+        reactor.test_mouse_warps.clear();
+        reactor.handle_event(Event::ApplicationDeactivated(2));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(a));
+        assert!(
+            reactor.test_mouse_warps.is_empty(),
+            "no warp when the pointer is already in the window"
+        );
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+}
+
 mod fullscreen_slots {
     use test_log::test;
 
@@ -6221,6 +6280,76 @@ mod display_archive {
             "the restored tree has a slot for each window that came home"
         );
         assert!(restored.iter().all(|(wid, _)| *wid != adopted));
+        clear_overrides(&f.exiled_wsids);
+        sa::set_available(false);
+    }
+
+    #[test]
+    fn a_shown_space_without_a_layout_is_exposed_even_when_its_size_did_not_change() {
+        let mut f = fixture();
+        // The aftermath of a remap: space 2's workspaces now live under
+        // another id, and space 2 itself has none.
+        f.reactor.layout_manager.layout_engine.remap_space(
+            &mut f.reactor.state.windows,
+            space2(),
+            SpaceId::new(99),
+        );
+        assert!(!f.reactor.layout_manager.layout_engine.has_active_layout(space2()));
+
+        // The same screens again, same sizes: nothing "resized".
+        f.reactor.handle_event(space_state_event(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2())],
+        ));
+        assert!(
+            f.reactor.layout_manager.layout_engine.has_active_layout(space2()),
+            "a shown space must always have a layout to tile into"
+        );
+    }
+
+    #[test]
+    fn homing_does_not_remap_a_space_another_display_still_lists() {
+        let mut f = fixture();
+        sa::set_available(true);
+        unplug(&mut f);
+        // The second display returns on a fresh space, but its old space is
+        // now one of the first display's desktops.
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let window_spaces: Vec<_> = std::iter::once((survivor_wsid, space1()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space1())))
+            .collect();
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2_returned())],
+            move |state| {
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                state
+                    .display_space_ids
+                    .insert("test-display-0".to_string(), vec![space1(), space2()]);
+                state.display_space_ids.insert(DISPLAY2.to_string(), vec![space2_returned()]);
+                for (wsid, space) in window_spaces {
+                    state.active_window_spaces.insert(wsid, space);
+                }
+            },
+        ));
+        assert!(
+            f.reactor
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .initialized_spaces()
+                .contains(&space2()),
+            "space 2 still belongs to a display and keeps its workspaces"
+        );
+        windows_land(&mut f);
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(
+            test_layout(&mut f.reactor, space2_returned(), screen2()),
+            f.layout_before
+        );
         clear_overrides(&f.exiled_wsids);
         sa::set_available(false);
     }

@@ -708,7 +708,21 @@ pub fn is_point_occluded_by_external_window(mut point: CGPoint) -> bool {
     false
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CURSOR_LOCATION_OVERRIDE: RefCell<Option<CGPoint>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_cursor_location_override(point: Option<CGPoint>) {
+    TEST_CURSOR_LOCATION_OVERRIDE.with(|cell| *cell.borrow_mut() = point);
+}
+
 pub fn current_cursor_location() -> Result<CGPoint, CGError> {
+    #[cfg(test)]
+    if let Some(point) = TEST_CURSOR_LOCATION_OVERRIDE.with(|cell| *cell.borrow()) {
+        return Ok(point);
+    }
     let mut point = CGPoint::new(0.0, 0.0);
     cg_ok(unsafe { SLSGetCurrentCursorLocation(*G_CONNECTION, &mut point) })?;
     Ok(point)

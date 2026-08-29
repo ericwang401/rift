@@ -3318,6 +3318,13 @@ impl LayoutEngine {
         inserted
     }
 
+    /// Whether `space` has an active workspace with a layout to tile into.
+    /// A space can lack one after its workspaces were remapped elsewhere, or
+    /// when it was listed but never shown.
+    pub fn has_active_layout(&self, space: SpaceId) -> bool {
+        self.workspace_and_layout(space).is_some()
+    }
+
     /// `window`'s place in the active layout of `space`, if the layout is a
     /// tree. See `LayoutSystem::slot_of`.
     pub fn slot_of(&self, space: SpaceId, window: WindowId) -> Option<Slot> {

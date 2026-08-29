@@ -463,6 +463,8 @@ pub struct Reactor {
     display_archive: display_archive::DisplayArchive,
     fullscreen_slots: fullscreen_slots::FullscreenSlots,
     pub animation_tx: Option<AnimationSender>,
+    #[cfg(test)]
+    pub(crate) test_mouse_warps: Vec<CGPoint>,
 }
 
 impl Reactor {
@@ -591,6 +593,8 @@ impl Reactor {
             active_spaces: HashSet::default(),
             display_archive: Default::default(),
             fullscreen_slots: Default::default(),
+            #[cfg(test)]
+            test_mouse_warps: Vec::new(),
             animation_tx: None,
         };
         reactor
@@ -1170,6 +1174,7 @@ impl Reactor {
                     && let Some(focused_window) = focused_window
                 {
                     outcome = outcome.with_focused_window_broadcast(focused_window);
+                    self.follow_focus_with_mouse(focused_window, &mut outcome);
                 }
                 if let Some(homing) = self.advance_display_homing() {
                     outcome.absorb(homing);
@@ -2934,6 +2939,29 @@ impl Reactor {
                 .list_workspaces(space);
             outcome = outcome.with_layout_event(LayoutEvent::SpaceExposed(space, size));
         }
+        // A shown space with no layout is exposed too, whatever its size did.
+        // The resize list only covers spaces whose geometry changed; a space
+        // that comes back the same size after its workspaces were moved to
+        // another id (a display's other desktop, after a remap) would
+        // otherwise never get a tree again.
+        let unexposed: Vec<(SpaceId, CGSize)> = self
+            .space_state
+            .screens
+            .iter()
+            .filter_map(|screen| Some((screen.space?, screen.frame.size)))
+            .filter(|(space, _)| {
+                self.is_space_active(*space)
+                    && !self.layout_manager.layout_engine.has_active_layout(*space)
+            })
+            .collect();
+        for (space, size) in unexposed {
+            debug!(space = space.get(), "Shown space has no layout; exposing it");
+            self.layout_manager
+                .layout_engine
+                .virtual_workspace_manager_mut()
+                .list_workspaces(space);
+            outcome = outcome.with_layout_event(LayoutEvent::SpaceExposed(space, size));
+        }
         if let Some(delta) = topology_window_delta {
             outcome.absorb(self.apply_topology_window_delta(delta));
         }
@@ -3154,6 +3182,34 @@ impl Reactor {
                 .max_by_key(|(area, _)| *area)
                 .map(|(_, space)| space)
         })
+    }
+
+    /// yabai warps the pointer on *every* focus change (`WINDOW_FOCUSED`),
+    /// however it came about — a hotkey, cmd-tab, a click in another app, the
+    /// app raising a window of its own — and whatever the window's state.
+    /// Rift only did so for the focus changes it caused itself. This is the
+    /// rest: whenever the main window changes hands, warp to it, unless the
+    /// pointer is already in it (a click), a drag or workspace switch is in
+    /// progress, Mission Control is up, or the change is loginwindow replaying
+    /// activations after a wake.
+    fn follow_focus_with_mouse(&mut self, window: WindowId, outcome: &mut EventOutcome) {
+        if !self.mouse_follows_focus_allowed_for(window)
+            || self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input
+            || self.is_mission_control_active()
+            || !matches!(self.drag_manager.drag_state, DragState::Inactive)
+            || self.modifier_drag.is_some()
+        {
+            return;
+        }
+        if self.workspace_switch_manager.workspace_switch_state == WorkspaceSwitchState::Active {
+            self.workspace_switch_manager.pending_workspace_mouse_warp = Some(window);
+            return;
+        }
+        if let Some(center) = self.window_center_on_known_screen(window)
+            && !outcome.mouse_warps.contains(&center)
+        {
+            *outcome = std::mem::take(outcome).with_mouse_warp(center);
+        }
     }
 
     /// Commands and drops that are unambiguously about a particular window.
@@ -3641,6 +3697,8 @@ impl Reactor {
     }
 
     pub fn warp_mouse(&mut self, point: CGPoint) {
+        #[cfg(test)]
+        self.test_mouse_warps.push(point);
         let Some(event_tap_tx) = self.communication_manager.event_tap_tx.clone() else {
             return;
         };

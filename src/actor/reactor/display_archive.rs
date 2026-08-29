@@ -657,11 +657,19 @@ impl Reactor {
         // display is still showing the old space (the clamshell case above):
         // those workspaces are that display's now, and the snapshot is
         // restored into the new space's own workspaces instead.
+        // "In use" means listed as a desktop of any display, shown or not:
+        // remapping a desktop's workspaces away from under it leaves that
+        // desktop with no tree the next time it is shown.
         let old_space_in_use = self
             .space_state
             .screens
             .iter()
-            .any(|screen| screen.space == Some(old_space) && screen.display_uuid != uuid);
+            .any(|screen| screen.space == Some(old_space) && screen.display_uuid != uuid)
+            || self
+                .space_state
+                .display_space_ids
+                .iter()
+                .any(|(display, spaces)| display != uuid && spaces.contains(&old_space));
         if !old_space_in_use {
             self.layout_manager.layout_engine.remap_space(
                 &mut self.state.windows,
