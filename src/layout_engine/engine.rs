@@ -227,6 +227,57 @@ impl LayoutEngine {
         Some((ws_id, layout))
     }
 
+    /// Resizes a tiled window by a pixel delta, as produced by a modifier-drag.
+    ///
+    /// The tree resizes whatever is selected, but a drag names its own window,
+    /// so the selection is borrowed for the adjustment and put back afterwards
+    /// — resizing must not quietly move the user's selection somewhere else.
+    /// Deltas are converted to fractions of the workspace's size, which is the
+    /// unit the layout systems resize in.
+    pub fn resize_window_by_delta(
+        &mut self,
+        space: SpaceId,
+        wid: WindowId,
+        dx: f64,
+        dy: f64,
+    ) -> bool {
+        let Some((ws_id, layout)) = self.workspace_and_layout(space) else {
+            return false;
+        };
+        let Some(size) = self.workspace_layouts.active_size(space, ws_id) else {
+            return false;
+        };
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return false;
+        }
+
+        let previous = self.workspace_tree(ws_id).selected_window(layout);
+        if !self.workspace_tree_mut(ws_id).select_window(layout, wid) {
+            return false;
+        }
+        if dx != 0.0 {
+            self.workspace_tree_mut(ws_id).resize_selection_by(
+                layout,
+                dx / size.width,
+                ResizeOrientation::Horizontal,
+            );
+        }
+        if dy != 0.0 {
+            self.workspace_tree_mut(ws_id).resize_selection_by(
+                layout,
+                dy / size.height,
+                ResizeOrientation::Vertical,
+            );
+        }
+        if let Some(previous) = previous
+            && previous != wid
+        {
+            self.workspace_tree_mut(ws_id).select_window(layout, previous);
+        }
+        self.workspace_layouts.mark_last_saved(space, ws_id, layout);
+        true
+    }
+
     fn workspace_id_for_index(
         &mut self,
         space: SpaceId,

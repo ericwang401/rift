@@ -1527,8 +1527,14 @@ impl Reactor {
                 return Ok(system_workflow::handle_menu_closed(&mut self.menu_manager, pid)?);
             }
             Event::MouseModifierDrag { window, dx, dy, action } => {
-                self.handle_mouse_modifier_drag(window, dx, dy, action);
-                return Ok(EventOutcome::default());
+                let outcome = EventOutcome::default();
+                return Ok(if self.handle_mouse_modifier_drag(window, dx, dy, action) {
+                    // Resizing a tiled window moved split ratios, not a frame,
+                    // so the workspace has to be laid out again.
+                    outcome.with_arrange_passes(1)
+                } else {
+                    outcome
+                });
             }
             Event::MouseMoved(wsid) => {
                 let window = self.state.windows.tracked_window_id(wsid);
@@ -3349,24 +3355,38 @@ impl Reactor {
     /// Only floating windows move: a tiled window's frame is owned by its
     /// layout, which would overwrite anything written here on the next arrange
     /// pass, so dragging one would fight the tree rather than move the window.
+    /// Returns whether the layout changed and needs an arrange pass.
     fn handle_mouse_modifier_drag(
         &mut self,
         window_server_id: WindowServerId,
         dx: f64,
         dy: f64,
         action: crate::common::config::MouseAction,
-    ) {
+    ) -> bool {
         use crate::common::config::MouseAction;
 
         let Some(wid) = self.state.windows.tracked_window_id(window_server_id) else {
-            return;
+            return false;
         };
+
         if !self.layout_manager.layout_engine.is_window_floating(wid) {
-            trace!(?wid, "Ignoring modifier drag on a tiled window");
-            return;
+            // A tiled window's frame belongs to its layout, so writing one
+            // directly would just be overwritten by the next arrange. Resizing
+            // is still meaningful though: it is the split ratios around the
+            // window that should move, which is what yabai did here. Moving a
+            // tiled window has no such translation and is left alone.
+            if action != MouseAction::Resize {
+                trace!(?wid, "Ignoring modifier move on a tiled window");
+                return false;
+            }
+            let Some(space) = self.best_space_for_window_id(wid) else {
+                return false;
+            };
+            return self.layout_manager.layout_engine.resize_window_by_delta(space, wid, dx, dy);
         }
+
         let Some(window) = self.state.windows.window(wid) else {
-            return;
+            return false;
         };
 
         let mut frame = window.frame_monotonic;
@@ -3381,7 +3401,7 @@ impl Reactor {
                 frame.size.width = (frame.size.width + dx).max(MIN_MODIFIER_DRAG_SIZE);
                 frame.size.height = (frame.size.height + dy).max(MIN_MODIFIER_DRAG_SIZE);
             }
-            MouseAction::None => return,
+            MouseAction::None => return false,
         }
 
         let transaction = self.transaction_manager.generate_next_txid(window_server_id);
@@ -3392,6 +3412,8 @@ impl Reactor {
         {
             warn!(window = ?wid, %error, "failed to apply modifier drag");
         }
+        // A floating window's frame is written directly; nothing to arrange.
+        false
     }
 
     /// Moves the focused window to a macOS space by 1-based index.
