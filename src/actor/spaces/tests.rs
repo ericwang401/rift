@@ -918,6 +918,13 @@ fn topology_window_delta_treats_same_window_space_move_as_remove_then_add() {
 
     actor.state.visible_window_spaces.clear();
     actor.state.visible_window_spaces.insert(wsid, new_space);
+    // Both spaces are pinned: these ids are arbitrary, and the machine running
+    // the suite may well have a real space by the same number with windows on
+    // it, which would leak into the delta.
+    crate::sys::window_server::set_space_window_list_for_space_override(
+        old_space.get(),
+        Some(vec![]),
+    );
     crate::sys::window_server::set_space_window_list_for_space_override(
         new_space.get(),
         Some(vec![wsid.as_u32()]),
@@ -930,6 +937,7 @@ fn topology_window_delta_treats_same_window_space_move_as_remove_then_add() {
             make_screen_with(2, "display-right", 1000.0, 1000.0, Some(new_space)),
         ],
     );
+    crate::sys::window_server::set_space_window_list_for_space_override(old_space.get(), None);
     crate::sys::window_server::set_space_window_list_for_space_override(new_space.get(), None);
     actor.forward_screen_parameters(
         vec![

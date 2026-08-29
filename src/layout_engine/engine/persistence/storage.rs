@@ -190,6 +190,45 @@ impl LayoutEngine {
         window_store: &WindowStore,
         active_space: Option<SpaceId>,
     ) -> std::io::Result<()> {
+        self.prepare_persisted_state(window_store, active_space);
+        self.save(path)
+    }
+
+    /// The same coherent snapshot `save_current_layout` writes, but as an in-memory string, for
+    /// state that must outlive a topology change without touching the master file on disk.
+    pub fn snapshot_current_layout(
+        &mut self,
+        window_store: &WindowStore,
+        active_space: Option<SpaceId>,
+    ) -> anyhow::Result<String> {
+        self.prepare_persisted_state(window_store, active_space);
+        // Round-trip through the owned form so the live engine is left alone
+        // while the snapshot is made loadable.
+        let mut persisted = PersistedLayout::deserialize(&self.serialize_to_string())?;
+        persisted.prune_spaces_without_layout_state();
+        Ok(persisted.serialize())
+    }
+
+    /// A loadable snapshot that leaves the engine's own state alone: only the
+    /// window fingerprints are refreshed. `snapshot_current_layout` also
+    /// rewrites stored floating frames and tiling membership the way a save
+    /// does, which is right at a save and wrong for a snapshot taken on
+    /// speculation in the middle of ordinary operation.
+    pub fn snapshot_current_layout_lightly(
+        &mut self,
+        window_store: &WindowStore,
+    ) -> anyhow::Result<String> {
+        self.refresh_window_fingerprints(window_store);
+        let mut persisted = PersistedLayout::deserialize(&self.serialize_to_string())?;
+        persisted.prune_spaces_without_layout_state();
+        Ok(persisted.serialize())
+    }
+
+    fn prepare_persisted_state(
+        &mut self,
+        window_store: &WindowStore,
+        active_space: Option<SpaceId>,
+    ) {
         self.refresh_window_fingerprints(window_store);
         // Never write an origin hint that has no corresponding saved layout. A stale native-space
         // observation is worse than no hint because it makes a portable file look unambiguous.
@@ -229,7 +268,6 @@ impl LayoutEngine {
                 }
             }
         }
-        self.save(path)
     }
 
     /// Heal old snapshots that represent one window as both tiled and floating, or where a

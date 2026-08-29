@@ -547,7 +547,7 @@ impl LayoutEngine {
         _virtual_workspace_config: &VirtualWorkspaceSettings,
         layout_settings: &LayoutSettings,
     ) -> anyhow::Result<RestoreReport> {
-        let (mut snapshot, schema_version) = Self::load_with_schema_version(&path)?;
+        let (snapshot, schema_version) = Self::load_with_schema_version(&path)?;
         tracing::info!(
             path = %path.display(),
             schema_version,
@@ -555,14 +555,8 @@ impl LayoutEngine {
             active_space = ?request.active_space,
             "Loading persisted layout for restore"
         );
-        // The source topology is file data, not a live engine to be reconciled with the current
-        // workspace-count setting. Only refresh layout-system settings; the installed workspace
-        // inherits the already-hydrated target manager's runtime configuration.
-        snapshot.set_layout_settings(layout_settings);
-        self.refresh_window_fingerprints(window_store);
-        let live_windows = self.persistence.live_fingerprints();
-        let plan = RestorePlan::build(snapshot, self, window_store, request)?;
-        let report = plan.apply(self, window_store, live_windows);
+        let report =
+            self.restore_from_snapshot(snapshot, request, window_store, layout_settings)?;
         tracing::info!(
             path = %path.display(),
             schema_version,
@@ -574,6 +568,36 @@ impl LayoutEngine {
             "Persisted layout restore completed"
         );
         Ok(report)
+    }
+
+    /// Restore from a snapshot string produced by `snapshot_current_layout`, with the same
+    /// transaction semantics as a file restore.
+    pub fn restore_layout_from_snapshot(
+        &mut self,
+        snapshot: &str,
+        request: RestoreRequest,
+        window_store: &mut WindowStore,
+        layout_settings: &LayoutSettings,
+    ) -> anyhow::Result<RestoreReport> {
+        let snapshot = Self::deserialize_from_str(snapshot)?;
+        self.restore_from_snapshot(snapshot, request, window_store, layout_settings)
+    }
+
+    fn restore_from_snapshot(
+        &mut self,
+        mut snapshot: LayoutEngine,
+        request: RestoreRequest,
+        window_store: &mut WindowStore,
+        layout_settings: &LayoutSettings,
+    ) -> anyhow::Result<RestoreReport> {
+        // The source topology is file data, not a live engine to be reconciled with the current
+        // workspace-count setting. Only refresh layout-system settings; the installed workspace
+        // inherits the already-hydrated target manager's runtime configuration.
+        snapshot.set_layout_settings(layout_settings);
+        self.refresh_window_fingerprints(window_store);
+        let live_windows = self.persistence.live_fingerprints();
+        let plan = RestorePlan::build(snapshot, self, window_store, request)?;
+        Ok(plan.apply(self, window_store, live_windows))
     }
 
     /// Compatibility wrapper for callers that only need the matched-window count.

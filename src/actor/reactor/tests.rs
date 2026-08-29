@@ -5490,6 +5490,148 @@ fn split_preview_is_where_the_window_lands_not_half_of_the_target() {
     assert!(reactor.layout_manager.layout_engine.is_window_tiled(space, right));
 }
 
+mod fullscreen_slots {
+    use test_log::test;
+
+    use super::*;
+
+    fn bsp_reactor_with_three_tiled()
+    -> (Reactor, CGRect, SpaceId, [WindowId; 3], [WindowServerId; 3]) {
+        let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+            &crate::common::config::VirtualWorkspaceSettings::default(),
+            &crate::common::config::LayoutSettings {
+                mode: LayoutMode::Bsp,
+                ..crate::common::config::LayoutSettings::default()
+            },
+            None,
+        ));
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+        reactor.add_test_app(1);
+        let workspace = reactor.test_workspace(space, 0);
+        let mut wids = [WindowId::new(1, 1); 3];
+        let mut wsids = [WindowServerId::new(0); 3];
+        for i in 0..3 {
+            let wid = WindowId::new(1, i as u32 + 1);
+            let wsid = WindowServerId::new(100 + i as u32 + 1);
+            reactor.add_test_window(
+                wid,
+                wsid,
+                Some(space),
+                CGRect::new(CGPoint::new(10., 10.), CGSize::new(600., 400.)),
+            );
+            reactor.state.windows.window_mut(wid).unwrap().info.bundle_id =
+                Some("com.test.app".to_string());
+            assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+            reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+            wids[i] = wid;
+            wsids[i] = wsid;
+        }
+        (reactor, screen, space, wids, wsids)
+    }
+
+    fn fullscreen_space(space: SpaceId) -> SpaceId {
+        SpaceId::new(0x400000000 + space.get())
+    }
+
+    /// Where `a` sits relative to `b`: sign of the x and y offsets.
+    fn relation(layout: &[(WindowId, CGRect)], a: WindowId, b: WindowId) -> (i8, i8) {
+        let frame =
+            |w: WindowId| layout.iter().find(|(wid, _)| *wid == w).map(|(_, f)| *f).unwrap();
+        let (fa, fb) = (frame(a), frame(b));
+        (
+            (fa.origin.x - fb.origin.x).signum() as i8,
+            (fa.origin.y - fb.origin.y).signum() as i8,
+        )
+    }
+
+    #[test]
+    fn exit_puts_the_window_back_exactly_when_nothing_changed() {
+        let (mut reactor, screen, space, [w1, w2, w3], [_, wsid2, _]) =
+            bsp_reactor_with_three_tiled();
+        // Make the tree non-default: w3 moves next to w1, and a split is resized.
+        reactor.send_layout_event(LayoutEvent::WindowFocused(space, w3));
+        let _ = reactor.layout_manager.layout_engine.handle_command(
+            &mut reactor.state.windows,
+            Some(space),
+            &[space],
+            &crate::common::collections::HashMap::default(),
+            LayoutCommand::MoveNode(Direction::Left),
+        );
+        reactor.send_layout_event(LayoutEvent::WindowFocused(space, w2));
+        let _ = reactor.layout_manager.layout_engine.handle_command(
+            &mut reactor.state.windows,
+            Some(space),
+            &[space],
+            &crate::common::collections::HashMap::default(),
+            LayoutCommand::ResizeWindowGrow(crate::layout_engine::ResizeOrientation::Horizontal),
+        );
+        let before = test_layout(&mut reactor, space, screen);
+        assert_eq!(before.len(), 3);
+
+        window_server_appeared(
+            &mut reactor,
+            wsid2,
+            fullscreen_space(space),
+            SpaceEventKind::Fullscreen,
+        );
+        assert!(!has_window_in_layout(&mut reactor, space, screen, w2));
+        assert_eq!(test_layout(&mut reactor, space, screen).len(), 2);
+
+        window_server_appeared(&mut reactor, wsid2, space, SpaceEventKind::User);
+        assert_eq!(
+            test_layout(&mut reactor, space, screen),
+            before,
+            "structure, order and ratios must come back exactly"
+        );
+        let _ = (w1, w3);
+    }
+
+    #[test]
+    fn exit_re_anchors_beside_the_old_neighbour_when_the_tree_changed() {
+        let (mut reactor, screen, space, [w1, w2, w3], [_, wsid2, _]) =
+            bsp_reactor_with_three_tiled();
+        reactor.send_layout_event(LayoutEvent::WindowFocused(space, w3));
+        let _ = reactor.layout_manager.layout_engine.handle_command(
+            &mut reactor.state.windows,
+            Some(space),
+            &[space],
+            &crate::common::collections::HashMap::default(),
+            LayoutCommand::MoveNode(Direction::Left),
+        );
+        let before = test_layout(&mut reactor, space, screen);
+        let slot = reactor.layout_manager.layout_engine.slot_of(space, w2).expect("w2 has a slot");
+        let neighbour = slot.anchor;
+        let relation_before = relation(&before, w2, neighbour);
+
+        window_server_appeared(
+            &mut reactor,
+            wsid2,
+            fullscreen_space(space),
+            SpaceEventKind::Fullscreen,
+        );
+        // Meanwhile the user closes a window that is not the neighbour.
+        let closed = if neighbour == w1 { w3 } else { w1 };
+        reactor.handle_event(Event::WindowDestroyed(closed));
+        assert_eq!(test_layout(&mut reactor, space, screen).len(), 1);
+
+        window_server_appeared(&mut reactor, wsid2, space, SpaceEventKind::User);
+        let after = test_layout(&mut reactor, space, screen);
+        assert_eq!(
+            after.len(),
+            2,
+            "the closed window stays closed; the edit is kept"
+        );
+        assert!(after.iter().any(|(wid, _)| *wid == w2));
+        assert_eq!(
+            relation(&after, w2, neighbour),
+            relation_before,
+            "the window returns to the same side of its old neighbour"
+        );
+    }
+}
+
 #[test]
 fn a_drop_on_a_target_lands_in_the_targets_space_however_the_window_hangs_over() {
     // Two displays stacked vertically, each with its own space.
@@ -5539,16 +5681,51 @@ fn a_drop_on_a_target_lands_in_the_targets_space_however_the_window_hangs_over()
     reactor.handle_event(Event::MouseUp);
 
     assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
-    let engine = &reactor.layout_manager.layout_engine;
+    let check = |reactor: &Reactor, when: &str| {
+        let engine = &reactor.layout_manager.layout_engine;
+        assert!(
+            engine.is_window_tiled(space1, dragged),
+            "{when}: still tiled where it was dropped"
+        );
+        assert!(
+            !engine.is_window_tiled(space2, dragged),
+            "{when}: not moved to the display it hung over"
+        );
+        assert_eq!(
+            reactor.assigned_space_for_window_id(dragged),
+            Some(space1),
+            "{when}"
+        );
+    };
+    check(&reactor, "after the drop");
+
+    // A beat later the window server reports what macOS did at the moment of
+    // release: it handed the window to the lower display's space, and a live
+    // query agrees because the arrange has not moved the frame yet. That
+    // report used to win, tearing the window out of the tree it was just
+    // dropped into.
+    let dragged_wsid = WindowServerId::new(102);
+    crate::sys::window_server::set_window_spaces_override(dragged_wsid, Some(vec![space2.get()]));
+    reactor.handle_event(Event::WindowServerAppeared(
+        dragged_wsid,
+        space2,
+        SpaceEventKind::User,
+    ));
+    check(&reactor, "after the window server's stale report");
+
+    // Once the frame has landed the window server agrees, and the pin lets go.
+    crate::sys::window_server::set_window_spaces_override(dragged_wsid, Some(vec![space1.get()]));
+    reactor.handle_event(Event::WindowServerAppeared(
+        dragged_wsid,
+        space1,
+        SpaceEventKind::User,
+    ));
     assert!(
-        engine.is_window_tiled(space1, dragged),
-        "still tiled where it was dropped"
+        reactor.drag_manager.drop_pin.is_none(),
+        "pin released once the frame landed"
     );
-    assert!(
-        !engine.is_window_tiled(space2, dragged),
-        "not moved to the display it hung over"
-    );
-    assert_eq!(reactor.assigned_space_for_window_id(dragged), Some(space1));
+    check(&reactor, "after the frame landed");
+    crate::sys::window_server::set_window_spaces_override(dragged_wsid, None);
 }
 
 #[test]
@@ -5593,4 +5770,731 @@ fn a_window_that_refuses_its_size_is_given_at_least_that_size() {
         .relax_observed_min_size(right, CGSize::new(600., 900.));
     let (l2, r2) = widths(&mut reactor);
     assert!((l2 - r2).abs() < 1.0, "even again: {l2} vs {r2}");
+}
+
+// ---------------------------------------------------------------------------
+// Display archive: a display's layout survives the display going away.
+// ---------------------------------------------------------------------------
+
+mod display_archive {
+    use test_log::test;
+
+    use super::*;
+    use crate::actor::spaces::TopologyWindowDelta;
+    use crate::sys::scripting_addition::test_hooks as sa;
+    use crate::sys::skylight::DisplayReconfigFlags;
+    use crate::sys::window_server::{
+        set_space_window_list_for_space_override, set_window_spaces_override,
+    };
+
+    const DISPLAY2: &str = "test-display-1";
+
+    fn space1() -> SpaceId {
+        SpaceId::new(1)
+    }
+    fn space2() -> SpaceId {
+        SpaceId::new(2)
+    }
+    /// The space macOS hands the second display when it comes back.
+    fn space2_returned() -> SpaceId {
+        SpaceId::new(7)
+    }
+    /// A spare desktop of the second display that is never shown.
+    fn space2_extra() -> SpaceId {
+        SpaceId::new(9)
+    }
+    /// The fresh space macOS gives the first display once its own was destroyed.
+    fn space1_returned() -> SpaceId {
+        SpaceId::new(11)
+    }
+
+    fn screen1() -> CGRect {
+        CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.))
+    }
+
+    fn screen2() -> CGRect {
+        CGRect::new(CGPoint::new(1440., 0.), CGSize::new(2560., 1440.))
+    }
+
+    struct Fixture {
+        reactor: Reactor,
+        /// The window on the display that survives.
+        survivor: WindowId,
+        /// The windows on the display that departs, in tree order.
+        exiled: Vec<WindowId>,
+        exiled_wsids: Vec<WindowServerId>,
+        /// `test_layout` of the departing display before anything happened.
+        layout_before: Vec<(WindowId, CGRect)>,
+    }
+
+    /// Two displays; a browser alone on the first, three windows in a
+    /// non-default arrangement on the second.
+    fn fixture() -> Fixture {
+        let mut reactor = test_reactor();
+        // The second display also has a spare desktop, `space2_extra`, that is
+        // never shown: rift lists workspaces for it but has no layout state.
+        reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2())],
+            |state| {
+                state.display_space_ids.insert("test-display-0".to_string(), vec![space1()]);
+                state
+                    .display_space_ids
+                    .insert(DISPLAY2.to_string(), vec![space2(), space2_extra()]);
+                state.last_user_space_by_display.insert("test-display-0".to_string(), space1());
+                state.last_user_space_by_display.insert(DISPLAY2.to_string(), space2());
+            },
+        ));
+        reactor.add_test_app(1);
+        let _ = reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager_mut()
+            .list_workspaces(space2_extra());
+
+        let place = |reactor: &mut Reactor, idx: u32, space: SpaceId, frame: CGRect| {
+            let wid = WindowId::new(1, idx);
+            let wsid = WindowServerId::new(100 + idx);
+            reactor.add_test_window(wid, wsid, Some(space), frame);
+            // Real windows carry a bundle id, which is what lets a restore
+            // recognise a window after another tree has resized it.
+            reactor.state.windows.window_mut(wid).unwrap().info.bundle_id =
+                Some("com.test.app".to_string());
+            let workspace = reactor.test_workspace(space, 0);
+            assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+            reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+            (wid, wsid)
+        };
+        let (survivor, _) = place(
+            &mut reactor,
+            1,
+            space1(),
+            CGRect::new(CGPoint::new(10., 10.), CGSize::new(800., 600.)),
+        );
+        let mut exiled = Vec::new();
+        let mut exiled_wsids = Vec::new();
+        for idx in 2..=4 {
+            let (wid, wsid) = place(
+                &mut reactor,
+                idx,
+                space2(),
+                CGRect::new(CGPoint::new(1500., 10.), CGSize::new(800., 600.)),
+            );
+            exiled.push(wid);
+            exiled_wsids.push(wsid);
+        }
+        let default_layout = test_layout(&mut reactor, space2(), screen2());
+        reactor.send_layout_event(LayoutEvent::WindowFocused(space2(), exiled[2]));
+        // Straight to the engine: the fixture has no main window for the
+        // reactor to route a command through.
+        let _ = reactor.layout_manager.layout_engine.handle_command(
+            &mut reactor.state.windows,
+            Some(space2()),
+            &[space1(), space2()],
+            &crate::common::collections::HashMap::default(),
+            LayoutCommand::MoveNode(Direction::Left),
+        );
+        let layout_before = test_layout(&mut reactor, space2(), screen2());
+        assert_ne!(
+            default_layout, layout_before,
+            "fixture must build a non-default tree"
+        );
+        assert_eq!(layout_before.len(), 3);
+
+        Fixture {
+            reactor,
+            survivor,
+            exiled,
+            exiled_wsids,
+            layout_before,
+        }
+    }
+
+    fn set_window_spaces(wsids: &[WindowServerId], space: SpaceId) {
+        for wsid in wsids {
+            set_window_spaces_override(*wsid, Some(vec![space.get()]));
+        }
+    }
+
+    fn clear_overrides(wsids: &[WindowServerId]) {
+        for wsid in wsids {
+            set_window_spaces_override(*wsid, None);
+        }
+        for space in [space1(), space2(), space2_returned()] {
+            set_space_window_list_for_space_override(space.get(), None);
+        }
+    }
+
+    fn topology_event(
+        screens: Vec<CGRect>,
+        spaces: Vec<Option<SpaceId>>,
+        moved: Vec<(WindowServerId, SpaceId, SpaceId)>,
+        window_spaces: Vec<(WindowServerId, SpaceId)>,
+    ) -> Event {
+        space_state_event_with(screens, spaces, move |state| {
+            state.has_seen_display_set = true;
+            state.display_set_changed = true;
+            state.topology_changed = true;
+            state.allow_space_remap = true;
+            state.should_force_refresh_layout = true;
+            state.topology_window_delta = Some(TopologyWindowDelta {
+                epoch: 1,
+                flags: DisplayReconfigFlags::REMOVE | DisplayReconfigFlags::ADD,
+                appeared: moved.iter().map(|(wsid, _, to)| (*wsid, *to)).collect(),
+                disappeared: moved.iter().map(|(wsid, from, _)| (*wsid, *from)).collect(),
+            });
+            for (wsid, space) in window_spaces {
+                state.active_window_spaces.insert(wsid, space);
+            }
+        })
+    }
+
+    /// The second display goes away and macOS drops its windows on the first.
+    fn unplug(f: &mut Fixture) {
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        set_window_spaces(&f.exiled_wsids, space1());
+        set_space_window_list_for_space_override(
+            space1().get(),
+            Some(
+                std::iter::once(survivor_wsid)
+                    .chain(f.exiled_wsids.iter().copied())
+                    .map(|wsid| wsid.as_u32())
+                    .collect(),
+            ),
+        );
+        let moved = f.exiled_wsids.iter().map(|wsid| (*wsid, space2(), space1())).collect();
+        let window_spaces = std::iter::once((survivor_wsid, space1()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space1())))
+            .collect();
+        f.reactor.handle_event(topology_event(
+            vec![screen1()],
+            vec![Some(space1())],
+            moved,
+            window_spaces,
+        ));
+    }
+
+    /// The second display comes back with a new space. Its windows are still
+    /// on the first display until the scripting addition has moved them.
+    fn replug(f: &mut Fixture) {
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let window_spaces = std::iter::once((survivor_wsid, space1()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space1())))
+            .collect();
+        f.reactor.handle_event(topology_event(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2_returned())],
+            Vec::new(),
+            window_spaces,
+        ));
+    }
+
+    /// The window server reports the exiled windows on the returned display.
+    fn windows_land(f: &mut Fixture) {
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        set_window_spaces(&f.exiled_wsids, space2_returned());
+        set_space_window_list_for_space_override(
+            space1().get(),
+            Some(vec![survivor_wsid.as_u32()]),
+        );
+        set_space_window_list_for_space_override(
+            space2_returned().get(),
+            Some(f.exiled_wsids.iter().map(|wsid| wsid.as_u32()).collect()),
+        );
+        let moved =
+            f.exiled_wsids.iter().map(|wsid| (*wsid, space1(), space2_returned())).collect();
+        let window_spaces = std::iter::once((survivor_wsid, space1()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2_returned())))
+            .collect();
+        f.reactor.handle_event(topology_event(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2_returned())],
+            moved,
+            window_spaces,
+        ));
+    }
+
+    #[test]
+    fn unplugged_display_windows_float_over_the_survivor_without_reshaping_it() {
+        let mut f = fixture();
+        let survivor_layout = test_layout(&mut f.reactor, space1(), screen1());
+        assert_eq!(survivor_layout.len(), 1);
+
+        unplug(&mut f);
+
+        for wid in &f.exiled {
+            assert_eq!(f.reactor.assigned_space_for_window_id(*wid), Some(space1()));
+            assert!(
+                f.reactor.layout_manager.layout_engine.is_window_floating(*wid),
+                "{wid:?} should float on the surviving display"
+            );
+            assert!(!has_window_in_layout(&mut f.reactor, space1(), screen1(), *wid));
+            assert_eq!(f.reactor.state.windows.user_floating(*wid), Some(true));
+        }
+        assert_eq!(
+            test_layout(&mut f.reactor, space1(), screen1()),
+            survivor_layout,
+            "the surviving display's tree must be untouched"
+        );
+        assert!(f.reactor.display_archive.has(DISPLAY2));
+        clear_overrides(&f.exiled_wsids);
+    }
+
+    #[test]
+    fn returning_display_gets_its_windows_and_layout_back_on_its_new_space() {
+        let mut f = fixture();
+        sa::set_available(true);
+        unplug(&mut f);
+        assert!(sa::window_moves().is_empty(), "an ordinary unplug moves nothing");
+        replug(&mut f);
+
+        assert!(
+            f.reactor.display_archive.is_homing(DISPLAY2),
+            "windows are still on the survivor, so the restore must wait for them"
+        );
+        let expected_moves: Vec<(u32, u64)> = f
+            .exiled_wsids
+            .iter()
+            .map(|wsid| (wsid.as_u32(), space2_returned().get()))
+            .collect();
+        let mut moves = sa::window_moves();
+        moves.sort_unstable();
+        assert_eq!(moves, expected_moves, "every exiled window is sent home");
+        assert!(
+            !has_window_in_layout(&mut f.reactor, space2_returned(), screen2(), f.exiled[0]),
+            "nothing has landed yet"
+        );
+
+        windows_land(&mut f);
+
+        assert!(
+            f.reactor.display_archive.is_empty(),
+            "restore should have completed"
+        );
+        for wid in &f.exiled {
+            assert_eq!(
+                f.reactor.assigned_space_for_window_id(*wid),
+                Some(space2_returned())
+            );
+            assert!(!f.reactor.layout_manager.layout_engine.is_window_floating(*wid));
+            assert!(has_window_in_layout(
+                &mut f.reactor,
+                space2_returned(),
+                screen2(),
+                *wid
+            ));
+            assert!(!has_window_in_layout(&mut f.reactor, space1(), screen1(), *wid));
+            assert_eq!(
+                f.reactor.state.windows.user_floating(*wid),
+                Some(false),
+                "restored tiled windows are pinned tiled against a catch-all floating rule"
+            );
+        }
+        assert_eq!(
+            test_layout(&mut f.reactor, space2_returned(), screen2()),
+            f.layout_before,
+            "the tree must come back exactly as it was, on the new space id"
+        );
+        assert_eq!(test_layout(&mut f.reactor, space1(), screen1()).len(), 1);
+        assert_eq!(
+            f.reactor.layout_manager.layout_engine.last_space_for_display_uuid(DISPLAY2),
+            Some(space2_returned())
+        );
+        assert!(
+            !f.reactor
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager()
+                .initialized_spaces()
+                .contains(&space2()),
+            "the dead space's workspaces must be moved, not leaked"
+        );
+        clear_overrides(&f.exiled_wsids);
+        sa::set_available(false);
+    }
+
+    #[test]
+    fn display_returning_on_its_other_desktop_is_switched_back_to_the_layouts_desktop() {
+        let mut f = fixture();
+        sa::set_available(true);
+        unplug(&mut f);
+        // Back, but showing its spare desktop; the one the layout lived on is
+        // still there behind it.
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let window_spaces: Vec<_> = std::iter::once((survivor_wsid, space1()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space1())))
+            .collect();
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2_extra())],
+            move |state| {
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                state
+                    .display_space_ids
+                    .insert(DISPLAY2.to_string(), vec![space2_extra(), space2()]);
+                for (wsid, space) in window_spaces {
+                    state.active_window_spaces.insert(wsid, space);
+                }
+            },
+        ));
+        assert!(f.reactor.display_archive.is_homing(DISPLAY2));
+        let mut moves = sa::window_moves();
+        moves.sort_unstable();
+        let expected: Vec<(u32, u64)> =
+            f.exiled_wsids.iter().map(|wsid| (wsid.as_u32(), space2().get())).collect();
+        assert_eq!(
+            moves, expected,
+            "windows go to the desktop the layout was built on"
+        );
+        assert_eq!(
+            sa::space_focuses(),
+            vec![space2().get()],
+            "and the display is switched to it"
+        );
+        clear_overrides(&f.exiled_wsids);
+        sa::set_available(false);
+    }
+
+    #[test]
+    fn a_displaced_window_the_user_handles_is_adopted_by_the_display_it_is_on() {
+        let mut f = fixture();
+        sa::set_available(true);
+        unplug(&mut f);
+        let adopted = f.exiled[1];
+        let adopted_wsid = f.exiled_wsids[1];
+
+        // A deliberate swap with the survivor's window: intent about the
+        // displaced window, on the display it is now shown on.
+        f.reactor.handle_event(Event::Command(crate::model::reactor::Command::Layout(
+            LayoutCommand::SwapWindows(adopted.into(), f.survivor.into()),
+        )));
+
+        replug(&mut f);
+        let mut moves = sa::window_moves();
+        moves.sort_unstable();
+        let expected: Vec<(u32, u64)> = f
+            .exiled_wsids
+            .iter()
+            .filter(|wsid| **wsid != adopted_wsid)
+            .map(|wsid| (wsid.as_u32(), space2_returned().get()))
+            .collect();
+        assert_eq!(moves, expected, "the adopted window is not sent back");
+
+        // The others land.
+        let others: Vec<WindowServerId> =
+            f.exiled_wsids.iter().copied().filter(|wsid| *wsid != adopted_wsid).collect();
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        set_window_spaces(&others, space2_returned());
+        set_space_window_list_for_space_override(
+            space1().get(),
+            Some(vec![survivor_wsid.as_u32(), adopted_wsid.as_u32()]),
+        );
+        set_space_window_list_for_space_override(
+            space2_returned().get(),
+            Some(others.iter().map(|wsid| wsid.as_u32()).collect()),
+        );
+        f.reactor.handle_event(topology_event(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2_returned())],
+            others.iter().map(|wsid| (*wsid, space1(), space2_returned())).collect(),
+            std::iter::once((survivor_wsid, space1()))
+                .chain(std::iter::once((adopted_wsid, space1())))
+                .chain(others.iter().map(|wsid| (*wsid, space2_returned())))
+                .collect(),
+        ));
+
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(f.reactor.assigned_space_for_window_id(adopted), Some(space1()));
+        assert!(!has_window_in_layout(
+            &mut f.reactor,
+            space2_returned(),
+            screen2(),
+            adopted
+        ));
+        let restored = test_layout(&mut f.reactor, space2_returned(), screen2());
+        assert_eq!(
+            restored.len(),
+            2,
+            "the restored tree has a slot for each window that came home"
+        );
+        assert!(restored.iter().all(|(wid, _)| *wid != adopted));
+        clear_overrides(&f.exiled_wsids);
+        sa::set_available(false);
+    }
+
+    #[test]
+    fn tile_mode_clusters_the_departed_windows_into_the_survivor() {
+        let mut f = fixture();
+        f.reactor.config.settings.displaced_windows = crate::common::config::DisplacedWindows::Tile;
+
+        unplug(&mut f);
+
+        for wid in &f.exiled {
+            assert!(!f.reactor.layout_manager.layout_engine.is_window_floating(*wid));
+            assert!(has_window_in_layout(&mut f.reactor, space1(), screen1(), *wid));
+        }
+        assert_eq!(test_layout(&mut f.reactor, space1(), screen1()).len(), 4);
+        clear_overrides(&f.exiled_wsids);
+    }
+
+    #[test]
+    fn display_that_blinks_back_with_the_same_space_is_left_alone() {
+        let mut f = fixture();
+        // Off screen, but its windows never moved.
+        f.reactor.handle_event(topology_event(
+            vec![screen1()],
+            vec![Some(space1())],
+            Vec::new(),
+            vec![(f.reactor.test_window_server_id(f.survivor), space1())],
+        ));
+        assert!(f.reactor.display_archive.has(DISPLAY2));
+
+        f.reactor.handle_event(topology_event(
+            vec![screen1(), screen2()],
+            vec![Some(space1()), Some(space2())],
+            Vec::new(),
+            std::iter::once((f.reactor.test_window_server_id(f.survivor), space1()))
+                .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+                .collect(),
+        ));
+
+        assert!(f.reactor.display_archive.is_empty());
+        for wid in &f.exiled {
+            assert!(!f.reactor.layout_manager.layout_engine.is_window_floating(*wid));
+            assert_eq!(f.reactor.state.windows.user_floating(*wid), Some(false));
+        }
+        assert_eq!(test_layout(&mut f.reactor, space2(), screen2()), f.layout_before);
+    }
+
+    #[test]
+    fn main_display_space_taken_over_by_the_survivor_parks_windows_on_its_own_space() {
+        let mut f = fixture();
+        sa::set_available(true);
+        // The second display was the main one: macOS migrates its space onto
+        // the first display and parks the first display's own space behind it.
+        let mut screens = make_screen_snapshots(vec![screen1()], vec![Some(space2())]);
+        screens[0].display_uuid = "test-display-0".to_string();
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1()],
+            vec![Some(space2())],
+            move |state| {
+                state.screens = screens;
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                // The survivor inherits every desktop the departed display
+                // had, listed first, and has already been handed the
+                // taken-over one as its "last user space".
+                state.display_space_ids.insert(
+                    "test-display-0".to_string(),
+                    vec![space2(), space2_extra(), space1()],
+                );
+                state.last_user_space_by_display.insert("test-display-0".to_string(), space2());
+            },
+        ));
+
+        assert!(f.reactor.display_archive.has(DISPLAY2));
+        // The departed display's windows were sent to the survivor's own
+        // space, as floats, and the survivor was switched back to it.
+        let expected_moves: Vec<(u32, u64)> =
+            f.exiled_wsids.iter().map(|wsid| (wsid.as_u32(), space1().get())).collect();
+        let mut moves = sa::window_moves();
+        moves.sort_unstable();
+        assert_eq!(moves, expected_moves);
+        assert_eq!(sa::space_focuses(), vec![space1().get()]);
+        for wid in &f.exiled {
+            assert!(f.reactor.layout_manager.layout_engine.is_window_floating(*wid));
+            assert_eq!(f.reactor.state.windows.user_floating(*wid), Some(true));
+        }
+        sa::set_available(false);
+    }
+
+    #[test]
+    fn takeover_that_destroys_the_survivors_space_brings_its_windows_back_on_replug() {
+        let mut f = fixture();
+        sa::set_available(true);
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let survivor_layout = test_layout(&mut f.reactor, space1(), screen1());
+
+        // The window server moves the survivor's window into the main space
+        // *before* the display change is seen, and rift follows it.
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        assert_eq!(
+            f.reactor.assigned_space_for_window_id(f.survivor),
+            Some(space2())
+        );
+        assert_eq!(
+            test_layout(&mut f.reactor, space1(), screen1()).len(),
+            0,
+            "the survivor's tree has already been emptied by the time the display change arrives"
+        );
+
+        // The second (main) display departs; its space lands on the first
+        // display, whose own space macOS destroys, merging its window in.
+        let mut screens = make_screen_snapshots(vec![screen1()], vec![Some(space2())]);
+        screens[0].display_uuid = "test-display-0".to_string();
+        let merged: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1()],
+            vec![Some(space2())],
+            move |state| {
+                state.screens = screens;
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                state
+                    .display_space_ids
+                    .insert("test-display-0".to_string(), vec![space2(), space2_extra()]);
+                for (wsid, space) in merged {
+                    state.active_window_spaces.insert(wsid, space);
+                }
+            },
+        ));
+        assert!(f.reactor.display_archive.has(DISPLAY2));
+        assert!(
+            f.reactor.display_archive.has("test-display-0"),
+            "the survivor's destroyed space is archived too"
+        );
+        assert!(
+            sa::window_moves().is_empty(),
+            "nowhere to park, so nothing moves yet"
+        );
+        assert!(
+            !f.reactor.display_archive.is_homing("test-display-0"),
+            "the survivor waits for the other display"
+        );
+
+        // Replug: the main display takes its space back, and the first
+        // display gets a fresh one. Every window is still on the main space.
+        let all_on_main: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(space1_returned()), Some(space2())],
+            move |state| {
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                state
+                    .display_space_ids
+                    .insert("test-display-0".to_string(), vec![space1_returned()]);
+                state
+                    .display_space_ids
+                    .insert(DISPLAY2.to_string(), vec![space2(), space2_extra()]);
+                for (wsid, space) in all_on_main {
+                    state.active_window_spaces.insert(wsid, space);
+                }
+            },
+        ));
+        assert_eq!(
+            sa::window_moves(),
+            vec![(survivor_wsid.as_u32(), space1_returned().get())],
+            "only the survivor's own window is sent to its new space"
+        );
+        assert!(
+            !f.reactor.display_archive.has(DISPLAY2),
+            "the main display came back intact"
+        );
+
+        // It lands.
+        set_window_spaces(&[survivor_wsid], space1_returned());
+        f.reactor.handle_event(topology_event(
+            vec![screen1(), screen2()],
+            vec![Some(space1_returned()), Some(space2())],
+            vec![(survivor_wsid, space2(), space1_returned())],
+            std::iter::once((survivor_wsid, space1_returned()))
+                .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+                .collect(),
+        ));
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(
+            f.reactor.assigned_space_for_window_id(f.survivor),
+            Some(space1_returned())
+        );
+        assert!(has_window_in_layout(
+            &mut f.reactor,
+            space1_returned(),
+            screen1(),
+            f.survivor
+        ));
+        assert_eq!(
+            test_layout(&mut f.reactor, space1_returned(), screen1()),
+            survivor_layout
+        );
+        assert_eq!(test_layout(&mut f.reactor, space2(), screen2()), f.layout_before);
+        set_window_spaces_override(survivor_wsid, None);
+        clear_overrides(&f.exiled_wsids);
+        sa::set_available(false);
+    }
+
+    #[test]
+    fn takeover_without_the_scripting_addition_is_left_as_macos_made_it() {
+        let mut f = fixture();
+        sa::set_available(false);
+        let mut screens = make_screen_snapshots(vec![screen1()], vec![Some(space2())]);
+        screens[0].display_uuid = "test-display-0".to_string();
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1()],
+            vec![Some(space2())],
+            move |state| {
+                state.screens = screens;
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                // The survivor inherits every desktop the departed display
+                // had, listed first, and has already been handed the
+                // taken-over one as its "last user space".
+                state.display_space_ids.insert(
+                    "test-display-0".to_string(),
+                    vec![space2(), space2_extra(), space1()],
+                );
+                state.last_user_space_by_display.insert("test-display-0".to_string(), space2());
+            },
+        ));
+        assert!(f.reactor.display_archive.has(DISPLAY2));
+        assert!(sa::window_moves().is_empty());
+        for wid in &f.exiled {
+            assert!(!f.reactor.layout_manager.layout_engine.is_window_floating(*wid));
+            assert_eq!(f.reactor.state.windows.user_floating(*wid), None);
+        }
+        assert_eq!(test_layout(&mut f.reactor, space2(), screen1()).len(), 3);
+    }
+
+    #[test]
+    fn disabled_setting_keeps_the_old_behaviour() {
+        let mut f = fixture();
+        f.reactor.config.settings.restore_display_layouts = false;
+
+        unplug(&mut f);
+        assert!(f.reactor.display_archive.is_empty());
+        for wid in &f.exiled {
+            assert!(has_window_in_layout(&mut f.reactor, space1(), screen1(), *wid));
+        }
+
+        replug(&mut f);
+        windows_land(&mut f);
+        assert!(f.reactor.display_archive.is_empty());
+        for wid in &f.exiled {
+            assert_eq!(
+                f.reactor.assigned_space_for_window_id(*wid),
+                Some(space2_returned())
+            );
+        }
+        clear_overrides(&f.exiled_wsids);
+    }
 }

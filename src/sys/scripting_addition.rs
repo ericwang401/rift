@@ -56,7 +56,69 @@ fn socket_path() -> Option<String> {
 
 /// Whether the scripting addition is loaded and accepting connections.
 pub fn is_available() -> bool {
+    #[cfg(test)]
+    {
+        return test_hooks::available();
+    }
+    #[allow(unreachable_code)]
     socket_path().is_some_and(|path| UnixStream::connect(path).is_ok())
+}
+
+/// The test suite runs on developer machines that may well have the addition
+/// loaded, and a command sent to it there acts on the real Dock. Under test
+/// the socket is never touched: commands are recorded instead, and whether
+/// the addition "is available" is whatever the test says.
+#[cfg(test)]
+pub mod test_hooks {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static AVAILABLE: Cell<bool> = const { Cell::new(false) };
+        static SENT: RefCell<Vec<(u8, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn available() -> bool {
+        AVAILABLE.with(|available| available.get())
+    }
+
+    pub fn set_available(available: bool) {
+        AVAILABLE.with(|cell| cell.set(available));
+        SENT.with(|sent| sent.borrow_mut().clear());
+    }
+
+    pub(super) fn record(op: u8, args: &[u8]) -> bool {
+        if !available() {
+            return false;
+        }
+        SENT.with(|sent| sent.borrow_mut().push((op, args.to_vec())));
+        true
+    }
+
+    /// `(window server id, space)` of every window-to-space command sent, in order.
+    pub fn window_moves() -> Vec<(u32, u64)> {
+        SENT.with(|sent| {
+            sent.borrow()
+                .iter()
+                .filter(|(op, _)| *op == super::opcode::WINDOW_TO_SPACE)
+                .map(|(_, args)| {
+                    let space = u64::from_ne_bytes(args[0..8].try_into().unwrap());
+                    let window = u32::from_ne_bytes(args[8..12].try_into().unwrap());
+                    (window, space)
+                })
+                .collect()
+        })
+    }
+
+    /// Every space-focus command sent, in order.
+    pub fn space_focuses() -> Vec<u64> {
+        SENT.with(|sent| {
+            sent.borrow()
+                .iter()
+                .filter(|(op, _)| *op == super::opcode::SPACE_FOCUS)
+                .map(|(_, args)| u64::from_ne_bytes(args[0..8].try_into().unwrap()))
+                .collect()
+        })
+    }
 }
 
 /// Sends one command. Returns whether the addition accepted it.
@@ -64,6 +126,11 @@ pub fn is_available() -> bool {
 /// A missing socket is the normal case on a machine without the addition, and
 /// is logged at debug rather than warn so it does not read as a fault.
 fn send(op: u8, args: &[u8]) -> bool {
+    #[cfg(test)]
+    {
+        return test_hooks::record(op, args);
+    }
+    #[allow(unreachable_code)]
     let Some(path) = socket_path() else {
         return false;
     };

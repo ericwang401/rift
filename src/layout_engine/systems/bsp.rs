@@ -2404,6 +2404,57 @@ impl LayoutSystem for BspLayoutSystem {
         true
     }
 
+    fn slot_of(&self, layout: LayoutId, window: WindowId) -> Option<crate::layout_engine::Slot> {
+        if !self.layouts.contains_key(layout) {
+            return None;
+        }
+        let node = self.node_for_window(window)?;
+        let parent = node.parent(&self.tree.map)?;
+        let Some(NodeKind::Split { orientation, ratio }) = self.kind.get(parent).cloned() else {
+            return None;
+        };
+        let mut children = parent.children(&self.tree.map);
+        let first = children.next()?;
+        let second = children.next()?;
+        let (sibling, is_first) = if first == node {
+            (second, true)
+        } else {
+            (first, false)
+        };
+        let anchor =
+            sibling.traverse_preorder(&self.tree.map).find_map(|n| match self.kind.get(n) {
+                Some(NodeKind::Leaf { window: Some(w), .. }) => Some(*w),
+                _ => None,
+            })?;
+        let side = match (orientation, is_first) {
+            (Orientation::Horizontal, true) => Direction::Left,
+            (Orientation::Horizontal, false) => Direction::Right,
+            (Orientation::Vertical, true) => Direction::Up,
+            (Orientation::Vertical, false) => Direction::Down,
+        };
+        Some(crate::layout_engine::Slot { anchor, side, ratio })
+    }
+
+    fn restore_slot(
+        &mut self,
+        layout: LayoutId,
+        slot: crate::layout_engine::Slot,
+        window: WindowId,
+    ) -> bool {
+        if !self.insert_window_next_to(layout, slot.anchor, slot.side, window) {
+            return false;
+        }
+        // `split_leaf_in_direction` recreates the same child order the slot
+        // was recorded with, so the recorded first-child share applies as is.
+        if let Some(node) = self.node_for_window(window)
+            && let Some(parent) = node.parent(&self.tree.map)
+            && let Some(NodeKind::Split { ratio, .. }) = self.kind.get_mut(parent)
+        {
+            *ratio = slot.ratio.clamp(0.05, 0.95);
+        }
+        true
+    }
+
     /// Gives every window an equal share, yabai's `space --balance`.
     fn rebalance(&mut self, layout: LayoutId) {
         if let Some(state) = self.layouts.get(layout).copied() {

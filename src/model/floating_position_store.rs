@@ -20,6 +20,10 @@ pub struct FloatingPositionStore {
 }
 
 impl FloatingPositionStore {
+    pub(crate) fn remove_space(&mut self, space: SpaceId) {
+        self.positions.retain(|(candidate, _, _), _| *candidate != space);
+    }
+
     pub(crate) fn validate_persisted(&self, workspaces: &WorkspaceStore) -> Result<(), String> {
         for (&(space, workspace, window), frame) in &self.positions {
             let Some(workspace_info) = workspaces.workspaces.get(workspace) else {

@@ -534,6 +534,17 @@ impl WorkspaceStore {
         Ok(successor)
     }
 
+    /// Drop every workspace of `space`, as if the space had never been
+    /// initialized. For snapshots only: a live space's workspaces are
+    /// recreated by the next `list_workspaces`, but their window assignments
+    /// and names would be gone.
+    pub(crate) fn forget_space(&mut self, space: SpaceId) {
+        for workspace in self.workspaces_by_space.remove(&space).unwrap_or_default() {
+            self.workspaces.remove(workspace);
+        }
+        self.active_workspace_per_space.remove(&space);
+    }
+
     pub fn last_workspace(&self, space: SpaceId) -> Option<VirtualWorkspaceId> {
         self.active_workspace_per_space.get(&space)?.0
     }

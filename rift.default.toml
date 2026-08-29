@@ -46,6 +46,22 @@ auto_focus_blacklist = []
 #   mouse_follows_focus_blacklist = ["pl.maketheweb.cleanshotx"]
 mouse_follows_focus_blacklist = []
 
+# Remember a display's layout when it disconnects — unplugging, sleep, closing
+# the lid — and put it back when the same display returns. macOS gives a
+# returning display a brand-new space, so without this the old layout is
+# orphaned and its windows stay piled on whichever display survived. While the
+# display is away its windows live on the surviving display (tiled ones as one
+# cluster in that tree, floating ones stay floating); when it comes back they
+# are moved home through the scripting addition and the saved tree is restored.
+restore_display_layouts = true
+
+# Where a disconnected display's windows go in the meantime:
+# - "float"  they float over the surviving display, whose layout is left as it
+#            was. A layout that lost its screen does not get to reshape one that
+#            did not. Alt+Shift+T tiles one on demand.
+# - "tile"   they join the surviving display's tree as one cluster.
+displaced_windows = "float"
+
 # Modifier-drag: hold a modifier and drag anywhere in a window to move or resize
 # it, rather than aiming for its title bar or its edge.
 # - modifier: the modifier that claims the drag ("Alt", "Ctrl + Alt", ...).

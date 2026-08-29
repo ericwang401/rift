@@ -5,7 +5,9 @@
 //! changes by sending requests out to the other actors in the system.
 
 mod animation;
+mod display_archive;
 mod events;
+mod fullscreen_slots;
 mod main_window;
 mod managers;
 mod query;
@@ -316,6 +318,10 @@ pub enum Event {
     ),
     #[serde(skip)]
     SpaceCreated(SpaceId),
+    /// A returned display's windows were given until now to arrive on its
+    /// new space. See `display_archive`.
+    #[serde(skip)]
+    DisplayHomingDeadline(String),
     #[serde(skip)]
     SpaceDestroyed(SpaceId),
     WindowMinimized(WindowId),
@@ -454,6 +460,8 @@ pub struct Reactor {
     refresh_quarantine_manager: managers::RefreshQuarantineManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
     active_spaces: HashSet<SpaceId>,
+    display_archive: display_archive::DisplayArchive,
+    fullscreen_slots: fullscreen_slots::FullscreenSlots,
     pub animation_tx: Option<AnimationSender>,
 }
 
@@ -528,6 +536,7 @@ impl Reactor {
                     config.settings.window_snapping,
                 ),
                 skip_layout_for_window: None,
+                drop_pin: None,
             },
             workspace_switch_manager: managers::WorkspaceSwitchManager {
                 workspace_switch_state: WorkspaceSwitchState::Inactive,
@@ -580,6 +589,8 @@ impl Reactor {
                 pending_space_change: None,
             },
             active_spaces: HashSet::default(),
+            display_archive: Default::default(),
+            fullscreen_slots: Default::default(),
             animation_tx: None,
         };
         reactor
@@ -1160,6 +1171,10 @@ impl Reactor {
                 {
                     outcome = outcome.with_focused_window_broadcast(focused_window);
                 }
+                if let Some(homing) = self.advance_display_homing() {
+                    outcome.absorb(homing);
+                }
+                self.release_drop_pin_if_landed();
                 self.apply_event_outcome(outcome);
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
@@ -1224,8 +1239,12 @@ impl Reactor {
                 self.request_refresh_when_spaces_actor_stabilizes();
                 return Ok(EventOutcome::default());
             }
+            Event::DisplayHomingDeadline(uuid) => {
+                return Ok(self.handle_display_homing_deadline(&uuid));
+            }
             _ => {}
         }
+        self.note_explicit_window_intent(&event);
 
         let should_update_notifications = Self::should_update_notifications(&event);
         let duplicate_global_activation = matches!(
@@ -1643,6 +1662,20 @@ impl Reactor {
                 // on the wrong one.
                 let target_space =
                     pending_swap.and_then(|(_, target)| self.best_space_for_window_id(target));
+                // And that statement has to outlive the drop by a beat: the
+                // window server's own report that the window moved to the
+                // display it hung over arrives after this, while the arrange
+                // is still moving it back. See `managers::DropPin`.
+                if let (Some((dragged, _)), Some(space)) = (pending_swap, target_space)
+                    && let Some(wsid) =
+                        self.state.windows.window(dragged).and_then(|window| window.info.sys_id)
+                {
+                    self.drag_manager.drop_pin = Some(managers::DropPin {
+                        window: wsid,
+                        space,
+                        until: std::time::Instant::now() + managers::DropPin::HOLD,
+                    });
+                }
                 let swap_space = target_space
                     .or_else(|| {
                         pending_swap.and_then(|(dragged, _)| {
@@ -2839,6 +2872,7 @@ impl Reactor {
         if display_set_changed {
             let active_displays: Vec<String> =
                 screens.iter().map(|screen| screen.display_uuid.clone()).collect();
+            self.archive_departed_displays(&active_displays, &screens, &display_space_ids);
             self.layout_manager.layout_engine.prune_display_state(&active_displays);
         }
         self.space_state.menu_bar_space = menu_bar_space;
@@ -2883,6 +2917,7 @@ impl Reactor {
                 .layout_engine
                 .update_space_display(space, Some(display_uuid.to_string()));
         }
+        outcome.absorb(self.begin_display_homing());
         let current_screens = self.screens_for_current_spaces();
         self.space_activation_policy
             .on_spaces_updated(activation_config, &current_screens);
@@ -2904,6 +2939,7 @@ impl Reactor {
         }
         let active_windows = self.authoritative_active_space_windows();
         self.finalize_space_change(&spaces, active_windows, releases_lifecycle_refresh_quarantine);
+        self.settle_displaced_windows();
         self.try_apply_pending_space_change();
         if should_force_refresh_layout {
             outcome = outcome.with_force_window_refresh().with_arrange_passes(1);
@@ -3120,6 +3156,69 @@ impl Reactor {
         })
     }
 
+    /// Commands and drops that are unambiguously about a particular window.
+    /// See `display_archive::adopt_displaced_window`.
+    fn note_explicit_window_intent(&mut self, event: &Event) {
+        use layout::LayoutCommand as L;
+        let mut windows: Vec<WindowId> = Vec::new();
+        match event {
+            Event::Command(Command::Layout(command)) => {
+                let targets_focused = matches!(
+                    command,
+                    L::MoveNode(_)
+                        | L::JoinWindow(_)
+                        | L::ConsumeOrExpelWindow(_)
+                        | L::UnjoinWindows
+                        | L::ToggleWindowFloating
+                        | L::ToggleWindowFloatingWithOptions(_)
+                        | L::ToggleFullscreen
+                        | L::ToggleFullscreenWithinGaps
+                        | L::ResizeWindowGrow(_)
+                        | L::ResizeWindowShrink(_)
+                        | L::ResizeWindowBy { .. }
+                        | L::CenterSelection
+                        | L::MoveWindowToWorkspace { .. }
+                        | L::PromoteToMaster
+                );
+                if targets_focused && let Some(wid) = self.main_window() {
+                    windows.push(wid);
+                }
+                if let L::SwapWindows(a, b) = command {
+                    windows.push(WindowId::new(a.pid, a.idx));
+                    windows.push(WindowId::new(b.pid, b.idx));
+                }
+            }
+            Event::MouseUp => {
+                if let Some((dragged, _)) = self.get_pending_drag_swap() {
+                    windows.push(dragged);
+                }
+            }
+            Event::MouseModifierDragBegin { window, .. } => {
+                if let Some(wid) = self.state.windows.tracked_window_id(*window) {
+                    windows.push(wid);
+                }
+            }
+            _ => {}
+        }
+        for wid in windows {
+            self.adopt_displaced_window(wid);
+        }
+    }
+
+    /// The pin is released as soon as the window server agrees with it, or
+    /// when the hold runs out — whichever comes first — so it never outlives
+    /// the frame write it was covering.
+    fn release_drop_pin_if_landed(&mut self) {
+        let Some(pin) = self.drag_manager.drop_pin else {
+            return;
+        };
+        if std::time::Instant::now() >= pin.until
+            || window_server::window_space(pin.window) == Some(pin.space)
+        {
+            self.drag_manager.drop_pin = None;
+        }
+    }
+
     #[cfg(test)]
     fn ensure_active_drag(&mut self, wid: WindowId, frame: &CGRect) {
         let needs_new_session =
@@ -3284,8 +3383,9 @@ impl Reactor {
         *outcome = std::mem::take(outcome).with_app_request(owner.pid, Request::GetVisibleWindows);
         Some(if self.assigned_space_for_window_id(owner) == Some(space) {
             self.is_space_active(space)
-                && self.restore_window_to_active_layout_if_visible(owner, space)
+                && self.restore_window_to_layout_after_fullscreen(owner, space)
         } else {
+            self.fullscreen_slots.forget(owner);
             self.reassign_window_to_authoritative_space(owner, space)
         })
     }
@@ -3460,6 +3560,12 @@ impl Reactor {
         wsid: WindowServerId,
         observation: Option<SpaceId>,
     ) -> Option<SpaceId> {
+        if let Some(pin) = self.drag_manager.drop_pin
+            && pin.window == wsid
+            && std::time::Instant::now() < pin.until
+        {
+            return Some(pin.space);
+        }
         let pending = self.pending_target_space_for_window_server_id(wsid);
         let live = window_server::window_space(wsid);
         let prior = self.state.windows.window_server_space(wsid);
@@ -3839,6 +3945,14 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        if matches!(event, LayoutEvent::WindowRemovedPreserveFloating(_)) {
+            self.capture_pre_churn_layout();
+        }
+        self.note_fullscreen_slot_lifecycle(&event);
+        let seal_slot_for = match &event {
+            LayoutEvent::WindowRemovedPreserveFloating(window) => Some(*window),
+            _ => None,
+        };
         let focus_changed = matches!(
             &event,
             LayoutEvent::WindowFocused(_, window)
@@ -3856,6 +3970,9 @@ impl Reactor {
         let event_clone = event.clone();
         let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
+        if let Some(window) = seal_slot_for {
+            self.seal_fullscreen_slot(window);
+        }
         let mut response = layout_outcome.response;
         let (placements, resizes, workspace_focus) = layout_outcome.app_rules.into_parts();
         self.apply_app_rule_placements(placements);

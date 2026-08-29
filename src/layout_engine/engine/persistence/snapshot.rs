@@ -59,6 +59,44 @@ impl PersistedLayout {
         .expect("persisted layout serialization must support all engine layout state")
     }
 
+    /// Serialize an owned snapshot, the same way a live engine is.
+    pub(super) fn serialize(&self) -> String {
+        ron::ser::to_string(&PersistedLayoutRef {
+            schema_version: self.schema_version,
+            workspace_layouts: &self.workspace_layouts,
+            floating: &self.floating,
+            floating_positions: &self.floating_positions,
+            virtual_workspace_manager: &self.virtual_workspace_manager,
+            space_display_map: &self.space_display_map,
+            display_last_space: &self.display_last_space,
+            persistence: &self.persistence,
+        })
+        .expect("persisted layout serialization must support all engine layout state")
+    }
+
+    /// Drop spaces that have workspaces but no layout state. A space rift has
+    /// listed but never shown (an inactive desktop on some display) is in
+    /// that state, and the loader rejects a file that contains one — which
+    /// made every snapshot taken on a machine with a spare desktop useless.
+    pub(super) fn prune_spaces_without_layout_state(&mut self) {
+        let unexposed: Vec<SpaceId> = self
+            .virtual_workspace_manager
+            .initialized_spaces()
+            .into_iter()
+            .filter(|space| {
+                self.virtual_workspace_manager.existing_workspaces(*space).iter().any(
+                    |(workspace, _)| !self.workspace_layouts.contains_workspace(*space, *workspace),
+                )
+            })
+            .collect();
+        for space in unexposed {
+            self.virtual_workspace_manager.forget_space(space);
+            self.floating_positions.remove_space(space);
+            self.space_display_map.remove(&space);
+            self.display_last_space.retain(|_, candidate| *candidate != space);
+        }
+    }
+
     pub(super) fn into_engine(self) -> LayoutEngine {
         LayoutEngine {
             workspace_layouts: self.workspace_layouts,

@@ -418,6 +418,18 @@ impl<'de> Deserialize<'de> for Config {
 unsafe impl Send for Config {}
 unsafe impl Sync for Config {}
 
+/// What happens to a display's windows while that display is disconnected.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplacedWindows {
+    /// They float on the surviving display, leaving its layout as it was. A
+    /// layout that lost its screen does not get to reshape one that did not.
+    #[default]
+    Float,
+    /// They are tiled into the surviving display's tree as one cluster.
+    Tile,
+}
+
 /// How rift changes the active macOS space.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
@@ -553,6 +565,17 @@ pub struct Settings {
     /// How to change the active macOS space. See `SpaceSwitchMethod`.
     #[serde(default)]
     pub space_switch_method: SpaceSwitchMethod,
+    /// Remember a display's layout when it disconnects (unplug, sleep, lid
+    /// close) and put it back when the same display returns, moving its
+    /// windows home through the scripting addition. macOS hands a returning
+    /// display a brand-new space, so without this the old layout is orphaned
+    /// and every window is left piled on whichever display survived.
+    #[serde(default = "yes")]
+    pub restore_display_layouts: bool,
+    /// Where a disconnected display's windows go in the meantime. See
+    /// `DisplacedWindows`.
+    #[serde(default)]
+    pub displaced_windows: DisplacedWindows,
     /// Modifier-drag: hold a modifier and drag anywhere in a window to move or
     /// resize it, instead of aiming for its title bar or edges.
     #[serde(default)]

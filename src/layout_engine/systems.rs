@@ -87,6 +87,16 @@ impl WindowLayoutConstraints {
     }
 }
 
+/// A window's place in a tree relative to a neighbour. See `LayoutSystem::slot_of`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slot {
+    pub anchor: WindowId,
+    /// The side of `anchor` the window is on.
+    pub side: Direction,
+    /// The parent split's ratio, i.e. its first child's share.
+    pub ratio: f32,
+}
+
 #[enum_dispatch]
 pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn create_layout(&mut self) -> LayoutId;
@@ -192,6 +202,21 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     /// preview only promises a split the layout is able to make.
     fn can_insert_next_to(&self) -> bool {
         false
+    }
+
+    /// Where `window` sits: a neighbouring window, the side of that
+    /// neighbour the window is on, and the share of their parent split it
+    /// has — enough for `restore_slot` to put it back after it has been
+    /// away. Tree layouts only.
+    fn slot_of(&self, _layout: LayoutId, _window: WindowId) -> Option<Slot> {
+        None
+    }
+
+    /// Put `window` back where `slot_of` found it, next to the same
+    /// neighbour on the same side with the same share. Reports failure if
+    /// the neighbour is no longer in this layout.
+    fn restore_slot(&mut self, layout: LayoutId, slot: Slot, window: WindowId) -> bool {
+        self.insert_window_next_to(layout, slot.anchor, slot.side, window)
     }
 
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction);

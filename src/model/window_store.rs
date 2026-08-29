@@ -864,6 +864,20 @@ impl WindowStore {
         self.windows.entry(window_id).or_default().user_floating = Some(floating);
     }
 
+    /// Put back a choice previously read with `user_floating`, including no
+    /// choice at all. `set_user_floating` cannot express `None`.
+    pub fn restore_user_floating(&mut self, window_id: WindowId, floating: Option<bool>) {
+        match floating {
+            Some(floating) => self.set_user_floating(window_id, floating),
+            None => {
+                if let Some(record) = self.windows.get_mut(&window_id) {
+                    record.user_floating = None;
+                }
+                self.prune_window_record(window_id);
+            }
+        }
+    }
+
     /// The user's own choice for this window, if they have made one.
     pub fn user_floating(&self, window_id: WindowId) -> Option<bool> {
         self.windows.get(&window_id).and_then(|record| record.user_floating)

@@ -38,6 +38,31 @@ pub struct DragManager {
     /// Whether the drop overlay is on screen. It belongs to a pending drop and
     /// is taken down as soon as there is none, whichever way the drag ended.
     pub drop_overlay_shown: bool,
+    /// The space a just-dropped window belongs to, held until its frame has
+    /// landed there. See `DropPin`.
+    pub drop_pin: Option<DropPin>,
+}
+
+/// A window dropped on a target hanging over a display seam has, as far as the
+/// window server is concerned, already moved to the display it hangs over: the
+/// report of that arrives a beat after the drop, while the arrange that pulls
+/// the window back onto the target's display is still in flight. Taken at
+/// face value, that report tore the window out of the tree it was just
+/// dropped into and tiled it on the other display; the arranges of the two
+/// displays then fought, and the wrong one won. The pin says which space the
+/// window is in until the frame write has landed, so a native-space report
+/// that disagrees is treated as the stale observation it is.
+#[derive(Debug, Clone, Copy)]
+pub struct DropPin {
+    pub window: crate::sys::window_server::WindowServerId,
+    pub space: SpaceId,
+    pub until: std::time::Instant,
+}
+
+impl DropPin {
+    /// How long a frame write is given to land before the window server is
+    /// believed again.
+    pub const HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
 }
 
 impl DragManager {

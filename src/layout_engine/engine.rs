@@ -13,7 +13,7 @@ use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{LayoutMode, LayoutSettings, WorkspaceSelector};
 use crate::layout_engine::LayoutSystem;
 use crate::layout_engine::floating::FloatingFullscreenKind;
-use crate::layout_engine::systems::WindowLayoutConstraints;
+use crate::layout_engine::systems::{Slot, WindowLayoutConstraints};
 use crate::model::app_rules::{AppRuleOutcome, AppRuleResize, AppRuleWorkspaceFocus};
 use crate::model::broadcast::{BroadcastEvent, BroadcastSender, protocol_workspace_id};
 use crate::model::virtual_workspace::{VirtualWorkspace, VirtualWorkspaceId, WorkspaceStore};
@@ -1342,6 +1342,81 @@ impl LayoutEngine {
             if *space == old_space {
                 *space = new_space;
             }
+        }
+    }
+
+    /// Displays that were known to this engine but are absent from
+    /// `active_display_uuids`, with the space each last showed. This is what
+    /// `prune_display_state` is about to forget, so callers that want to keep
+    /// a departed display's layout must ask before pruning.
+    pub fn departed_displays(&self, active_display_uuids: &[String]) -> Vec<(String, SpaceId)> {
+        let active: HashSet<&str> = active_display_uuids.iter().map(|s| s.as_str()).collect();
+        let mut departed: Vec<_> = self
+            .display_last_space
+            .iter()
+            .filter(|(uuid, _)| !active.contains(uuid.as_str()))
+            .map(|(uuid, space)| (uuid.clone(), *space))
+            .collect();
+        departed.sort();
+        departed
+    }
+
+    /// Every tiled window on `space`, in tree order, across all of the space's
+    /// workspaces; floating windows follow. The order is what a graft of these
+    /// windows into another tree should reproduce.
+    pub fn windows_on_space_in_layout_order(&self, space: SpaceId) -> Vec<WindowId> {
+        let mut seen = HashSet::default();
+        let mut ordered = Vec::new();
+        for (workspace, _) in self.virtual_workspace_manager.existing_workspaces(space) {
+            let Some(layout) = self.workspace_layouts.active(space, workspace) else {
+                continue;
+            };
+            for wid in self.workspace_tree(workspace).all_windows_in_layout(layout) {
+                if seen.insert(wid) {
+                    ordered.push(wid);
+                }
+            }
+        }
+        for wid in self.floating.active_flat(space) {
+            if seen.insert(wid) {
+                ordered.push(wid);
+            }
+        }
+        ordered
+    }
+
+    /// Re-insert `windows` into the active layout of `space` as one cluster:
+    /// the first lands next to the current selection and each following one
+    /// next to its predecessor, so the group occupies a single region of the
+    /// tree instead of being scattered wherever each window happened to be
+    /// appended. Windows not currently tiled in that layout are skipped, and
+    /// the selection is put back where it was.
+    pub fn cluster_windows_after_selection(&mut self, space: SpaceId, windows: &[WindowId]) {
+        let Some((workspace, layout)) = self.workspace_and_layout(space) else {
+            return;
+        };
+        let members: Vec<WindowId> = windows
+            .iter()
+            .copied()
+            .filter(|wid| self.workspace_tree(workspace).contains_window(layout, *wid))
+            .collect();
+        if members.len() < 2 {
+            return;
+        }
+        let tree = self.workspace_tree_mut(workspace);
+        let selected = tree.selected_window(layout).filter(|wid| !members.contains(wid));
+        for wid in &members {
+            tree.remove_window(*wid);
+        }
+        if let Some(anchor) = selected {
+            tree.select_window(layout, anchor);
+        }
+        for wid in &members {
+            tree.add_window_after_selection(layout, *wid);
+            tree.select_window(layout, *wid);
+        }
+        if let Some(anchor) = selected {
+            tree.select_window(layout, anchor);
         }
     }
 
@@ -3204,6 +3279,19 @@ impl LayoutEngine {
         self.virtual_workspace_manager.get_stats(window_store)
     }
 
+    /// Flag a window as floating without touching its tree membership. The
+    /// next `WindowAdded` for it then projects it as a float instead of a
+    /// tile. Used for windows displaced off a departed display, whose place
+    /// in a tree belongs to a layout that no longer has a screen.
+    pub fn mark_window_floating(&mut self, window_id: WindowId) {
+        self.floating.add_floating(window_id);
+    }
+
+    /// Undo `mark_window_floating` for a window that never left its tree.
+    pub fn unmark_window_floating(&mut self, window_id: WindowId) {
+        self.floating.remove_floating(window_id);
+    }
+
     pub fn is_window_floating(&self, window_id: WindowId) -> bool {
         self.floating.is_floating(window_id)
     }
@@ -3228,6 +3316,32 @@ impl LayoutEngine {
             self.workspace_layouts.mark_last_saved(space, ws_id, layout);
         }
         inserted
+    }
+
+    /// `window`'s place in the active layout of `space`, if the layout is a
+    /// tree. See `LayoutSystem::slot_of`.
+    pub fn slot_of(&self, space: SpaceId, window: WindowId) -> Option<Slot> {
+        let (ws_id, layout) = self.workspace_and_layout(space)?;
+        self.workspace_tree(ws_id).slot_of(layout, window)
+    }
+
+    /// Put `window` back into the active layout of `space` at `slot`.
+    pub fn restore_slot(&mut self, space: SpaceId, slot: Slot, window: WindowId) -> bool {
+        let Some((ws_id, layout)) = self.workspace_and_layout(space) else {
+            return false;
+        };
+        let restored = self.workspace_tree_mut(ws_id).restore_slot(layout, slot, window);
+        if restored {
+            self.workspace_layouts.mark_last_saved(space, ws_id, layout);
+        }
+        restored
+    }
+
+    /// A textual rendering of the active layout on `space` that changes iff
+    /// the tree does: structure, order and ratios, not selection.
+    pub fn tree_digest(&self, space: SpaceId) -> Option<String> {
+        let (ws_id, layout) = self.workspace_and_layout(space)?;
+        Some(self.workspace_tree(ws_id).draw_tree(layout))
     }
 
     /// Whether the active layout on `space` can split a window for a drop on
