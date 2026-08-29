@@ -430,7 +430,97 @@ impl fmt::Display for KeyCode {
             Space => "Space",
             Enter => "Enter",
             Escape => "Escape",
-            _ => "Other",
+            // Every variant has an arm on purpose, and there is deliberately
+            // no catch-all: a binding is stored as this string and parsed back
+            // when the keyboard layout changes, so a variant rendering as a
+            // placeholder would stop parsing and its binding would vanish
+            // without a word. Without the fallback, adding a key code without
+            // a name here fails to compile.
+            IntlBackslash => "IntlBackslash",
+            Equal => "Equal",
+            Minus => "Minus",
+            BracketRight => "BracketRight",
+            KeyO => "O",
+            KeyU => "U",
+            BracketLeft => "BracketLeft",
+            KeyI => "I",
+            KeyP => "P",
+            KeyL => "L",
+            KeyJ => "J",
+            Quote => "Quote",
+            KeyK => "K",
+            Semicolon => "Semicolon",
+            Backslash => "Backslash",
+            Comma => "Comma",
+            Slash => "Slash",
+            KeyN => "N",
+            KeyM => "M",
+            Period => "Period",
+            Backquote => "Backquote",
+            Backspace => "Backspace",
+            NumpadEnter => "NumpadEnter",
+            NumpadSubtract => "NumpadSubtract",
+            MetaRight => "MetaRight",
+            MetaLeft => "MetaLeft",
+            ShiftLeft => "ShiftLeft",
+            CapsLock => "CapsLock",
+            AltLeft => "AltLeft",
+            ControlLeft => "ControlLeft",
+            ShiftRight => "ShiftRight",
+            AltRight => "AltRight",
+            ControlRight => "ControlRight",
+            Fn => "Fn",
+            F17 => "F17",
+            NumpadDecimal => "NumpadDecimal",
+            NumpadMultiply => "NumpadMultiply",
+            NumpadAdd => "NumpadAdd",
+            NumLock => "NumLock",
+            AudioVolumeUp => "VolumeUp",
+            AudioVolumeDown => "VolumeDown",
+            AudioVolumeMute => "Mute",
+            NumpadDivide => "NumpadDivide",
+            F18 => "F18",
+            F19 => "F19",
+            NumpadEqual => "NumpadEqual",
+            Numpad0 => "Numpad0",
+            Numpad1 => "Numpad1",
+            Numpad2 => "Numpad2",
+            Numpad3 => "Numpad3",
+            Numpad4 => "Numpad4",
+            Numpad5 => "Numpad5",
+            Numpad6 => "Numpad6",
+            Numpad7 => "Numpad7",
+            F20 => "F20",
+            Numpad8 => "Numpad8",
+            Numpad9 => "Numpad9",
+            IntlYen => "IntlYen",
+            IntlRo => "IntlRo",
+            NumpadComma => "NumpadComma",
+            F5 => "F5",
+            F6 => "F6",
+            F7 => "F7",
+            F3 => "F3",
+            F8 => "F8",
+            F9 => "F9",
+            Lang2 => "Lang2",
+            F11 => "F11",
+            Lang1 => "Lang1",
+            F13 => "F13",
+            F16 => "F16",
+            F14 => "F14",
+            F10 => "F10",
+            ContextMenu => "ContextMenu",
+            F12 => "F12",
+            F15 => "F15",
+            Insert => "Insert",
+            Home => "Home",
+            PageUp => "PageUp",
+            Delete => "Delete",
+            F4 => "F4",
+            End => "End",
+            F2 => "F2",
+            PageDown => "PageDown",
+            F1 => "F1",
         };
         write!(f, "{}", s)
     }
@@ -458,6 +548,136 @@ const F_KEYS: [KeyCode; 20] = [
     KeyCode::F19,
     KeyCode::F20,
 ];
+
+impl KeyCode {
+    /// Every key code, for exhaustive checks.
+    ///
+    /// Kept next to the enum so a new variant added without a `Display` arm is
+    /// caught by `every_key_code_survives_a_display_round_trip` rather than by
+    /// a user whose binding stopped working.
+    pub const ALL: &'static [KeyCode] = &[
+        KeyCode::KeyA,
+        KeyCode::KeyS,
+        KeyCode::KeyD,
+        KeyCode::KeyF,
+        KeyCode::KeyH,
+        KeyCode::KeyG,
+        KeyCode::KeyZ,
+        KeyCode::KeyX,
+        KeyCode::KeyC,
+        KeyCode::KeyV,
+        KeyCode::IntlBackslash,
+        KeyCode::KeyB,
+        KeyCode::KeyQ,
+        KeyCode::KeyW,
+        KeyCode::KeyE,
+        KeyCode::KeyR,
+        KeyCode::KeyY,
+        KeyCode::KeyT,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit6,
+        KeyCode::Digit5,
+        KeyCode::Equal,
+        KeyCode::Digit9,
+        KeyCode::Digit7,
+        KeyCode::Minus,
+        KeyCode::Digit8,
+        KeyCode::Digit0,
+        KeyCode::BracketRight,
+        KeyCode::KeyO,
+        KeyCode::KeyU,
+        KeyCode::BracketLeft,
+        KeyCode::KeyI,
+        KeyCode::KeyP,
+        KeyCode::Enter,
+        KeyCode::KeyL,
+        KeyCode::KeyJ,
+        KeyCode::Quote,
+        KeyCode::KeyK,
+        KeyCode::Semicolon,
+        KeyCode::Backslash,
+        KeyCode::Comma,
+        KeyCode::Slash,
+        KeyCode::KeyN,
+        KeyCode::KeyM,
+        KeyCode::Period,
+        KeyCode::Tab,
+        KeyCode::Space,
+        KeyCode::Backquote,
+        KeyCode::Backspace,
+        KeyCode::NumpadEnter,
+        KeyCode::NumpadSubtract,
+        KeyCode::Escape,
+        KeyCode::MetaRight,
+        KeyCode::MetaLeft,
+        KeyCode::ShiftLeft,
+        KeyCode::CapsLock,
+        KeyCode::AltLeft,
+        KeyCode::ControlLeft,
+        KeyCode::ShiftRight,
+        KeyCode::AltRight,
+        KeyCode::ControlRight,
+        KeyCode::Fn,
+        KeyCode::F17,
+        KeyCode::NumpadDecimal,
+        KeyCode::NumpadMultiply,
+        KeyCode::NumpadAdd,
+        KeyCode::NumLock,
+        KeyCode::AudioVolumeUp,
+        KeyCode::AudioVolumeDown,
+        KeyCode::AudioVolumeMute,
+        KeyCode::NumpadDivide,
+        KeyCode::F18,
+        KeyCode::F19,
+        KeyCode::NumpadEqual,
+        KeyCode::Numpad0,
+        KeyCode::Numpad1,
+        KeyCode::Numpad2,
+        KeyCode::Numpad3,
+        KeyCode::Numpad4,
+        KeyCode::Numpad5,
+        KeyCode::Numpad6,
+        KeyCode::Numpad7,
+        KeyCode::F20,
+        KeyCode::Numpad8,
+        KeyCode::Numpad9,
+        KeyCode::IntlYen,
+        KeyCode::IntlRo,
+        KeyCode::NumpadComma,
+        KeyCode::F5,
+        KeyCode::F6,
+        KeyCode::F7,
+        KeyCode::F3,
+        KeyCode::F8,
+        KeyCode::F9,
+        KeyCode::Lang2,
+        KeyCode::F11,
+        KeyCode::Lang1,
+        KeyCode::F13,
+        KeyCode::F16,
+        KeyCode::F14,
+        KeyCode::F10,
+        KeyCode::ContextMenu,
+        KeyCode::F12,
+        KeyCode::F15,
+        KeyCode::Insert,
+        KeyCode::Home,
+        KeyCode::PageUp,
+        KeyCode::Delete,
+        KeyCode::F4,
+        KeyCode::End,
+        KeyCode::F2,
+        KeyCode::PageDown,
+        KeyCode::F1,
+        KeyCode::ArrowLeft,
+        KeyCode::ArrowRight,
+        KeyCode::ArrowDown,
+        KeyCode::ArrowUp,
+    ];
+}
 
 impl FromStr for KeyCode {
     type Err = anyhow::Error;
@@ -502,6 +722,22 @@ impl FromStr for KeyCode {
             // key labelled Delete is backspace, so accept both spellings for it.
             "backspace" | "backwarddelete" => KeyCode::Backspace,
             "capslock" => KeyCode::CapsLock,
+            // The modifier keys are reachable as the key half of a hotkey when
+            // a modifiers-only spec is resolved to one, so they have to parse
+            // back from what Display writes.
+            "shiftleft" => KeyCode::ShiftLeft,
+            "shiftright" => KeyCode::ShiftRight,
+            "controlleft" => KeyCode::ControlLeft,
+            "controlright" => KeyCode::ControlRight,
+            "altleft" => KeyCode::AltLeft,
+            "altright" => KeyCode::AltRight,
+            "metaleft" => KeyCode::MetaLeft,
+            "metaright" => KeyCode::MetaRight,
+            "intlbackslash" => KeyCode::IntlBackslash,
+            "intlyen" => KeyCode::IntlYen,
+            "intlro" => KeyCode::IntlRo,
+            "lang1" => KeyCode::Lang1,
+            "lang2" => KeyCode::Lang2,
             "contextmenu" | "menu" => KeyCode::ContextMenu,
 
             "volumeup" | "audiovolumeup" => KeyCode::AudioVolumeUp,
@@ -1128,6 +1364,47 @@ fn fallback_keycode_from_char(ch: &str) -> Option<KeyCode> {
 }
 
 mod tests {
+
+    /// Every KeyCode must survive Display -> FromStr.
+    ///
+    /// A binding is stored as this string and re-parsed whenever the keyboard
+    /// layout changes; a variant that renders as a placeholder stops parsing
+    /// and its binding is dropped without the user being told. Nine letters
+    /// (I J K L M N O P U) rendered as "Other", which silently disabled every
+    /// binding using them.
+    #[test]
+    fn every_key_code_survives_a_display_round_trip() {
+        let mut broken = Vec::new();
+        for &key in KeyCode::ALL {
+            let rendered = key.to_string();
+            match KeyCode::from_str(&rendered) {
+                Ok(parsed) if parsed == key => {}
+                Ok(parsed) => broken.push(format!("{key:?} -> {rendered:?} -> {parsed:?}")),
+                Err(_) => broken.push(format!("{key:?} -> {rendered:?} -> parse error")),
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "key codes that do not round-trip: {broken:#?}"
+        );
+    }
+
+    #[test]
+    fn letter_hotkeys_round_trip_through_their_spec_string() {
+        // How a binding actually reaches the event tap: parsed from the config,
+        // rendered to a spec string, parsed again.
+        for spec in [
+            "Alt + N",
+            "Alt + P",
+            "Alt + Shift + J",
+            "Ctrl + Alt + Backspace",
+        ] {
+            let hotkey = Hotkey::from_str(spec).expect("config spec should parse");
+            let reparsed =
+                Hotkey::from_str(&hotkey.to_string()).expect("spec string should parse back");
+            assert_eq!(hotkey, reparsed, "{spec} did not survive the round trip");
+        }
+    }
 
     #[test]
     fn parser_names_the_keys_that_have_no_character() {
