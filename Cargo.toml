@@ -76,6 +76,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 	"NSMenu",
 	"NSMenuItem",
 	"NSOpenPanel",
+	"NSAnimationContext",
+	"NSGlassEffectView",
 	"NSPanel",
 	"NSStringDrawing",
 	"NSResponder",

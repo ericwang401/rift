@@ -328,6 +328,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         config.clone(),
         drop_overlay_tx.clone(),
         drop_overlay_rx,
+        mtm,
     );
 
     let mission_control =

@@ -600,12 +600,9 @@ pub struct DropOverlaySettings {
     /// Corner rounding, in points.
     #[serde(default = "default_drop_overlay_corner_radius")]
     pub corner_radius: f64,
-    /// Border thickness, in points.
-    #[serde(default = "default_drop_overlay_border_width")]
-    pub border_width: f64,
-    /// Blur radius of the backing. Zero draws it unblurred.
-    #[serde(default = "default_drop_overlay_blur")]
-    pub blur_radius: i32,
+    /// Use the clearer of the two Liquid Glass styles.
+    #[serde(default = "no")]
+    pub clear_style: bool,
     /// How far the region travels toward a new target each frame, 0..1.
     /// Higher is snappier; 1.0 removes the motion and snaps instead.
     #[serde(default = "default_drop_overlay_follow_rate")]
@@ -630,8 +627,7 @@ impl Default for DropOverlaySettings {
         Self {
             enabled: false,
             corner_radius: default_drop_overlay_corner_radius(),
-            border_width: default_drop_overlay_border_width(),
-            blur_radius: default_drop_overlay_blur(),
+            clear_style: false,
             follow_rate: default_drop_overlay_follow_rate(),
         }
     }

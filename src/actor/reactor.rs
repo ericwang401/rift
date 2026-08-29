@@ -4475,11 +4475,18 @@ impl Reactor {
     /// when the pointer is in its middle, and the half it would occupy after
     /// the split when the pointer is near an edge — so what is drawn is a
     /// promise about what will happen, not a hint.
-    fn preview_drop_region(&self, target: WindowId) {
+    fn preview_drop_region(&self, dragged: WindowId, target: WindowId) {
         let Some(tx) = &self.communication_manager.drop_overlay_tx else {
             return;
         };
         if !self.config.settings.ui.drop_overlay.enabled {
+            return;
+        }
+        // Only the tree can swap or split, so a floating window on either end
+        // of the drag has nothing to preview: the drop will not rearrange
+        // anything.
+        let engine = &self.layout_manager.layout_engine;
+        if engine.is_window_floating(dragged) || engine.is_window_floating(target) {
             return;
         }
         let Some(frame) = self.state.windows.window(target).map(|w| w.frame_monotonic) else {
@@ -4590,7 +4597,7 @@ impl Reactor {
                 );
             }
 
-            self.preview_drop_region(target_wid);
+            self.preview_drop_region(wid, target_wid);
 
             if let Some(session) = self.take_active_drag_session() {
                 self.drag_manager.drag_state =

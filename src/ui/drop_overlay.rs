@@ -1,27 +1,34 @@
 //! The region a dragged window would land in, drawn over the screen.
 //!
-//! yabai draws this by creating a SkyLight window per tree node and stroking a
-//! flat rectangle into it with CGContext, then destroying the window when the
-//! target changes — so the feedback blinks from place to place and has hard
+//! yabai draws this feedback by creating a window-server window per tree node
+//! and stroking a flat rectangle into it with CGContext, then destroying the
+//! window when the target changes, so it blinks from place to place with hard
 //! square edges (`insert_feedback_show` in its view.c).
 //!
-//! This keeps one window per display and moves a single rounded layer inside
-//! it, over a blurred backing the window server composites for us. Because the
-//! layer is rendered as a snapshot rather than by Core Animation, motion is not
-//! free: the caller advances `step` on a timer and the layer eases toward its
-//! target, which is what makes the region glide between drop zones instead of
-//! jumping.
+//! This uses an `NSGlassEffectView` in a borderless panel instead, which is the
+//! system's Liquid Glass material. It samples and refracts what is behind it
+//! live, which the window-server path cannot do at all: that renders a layer
+//! tree with `renderInContext`, and a snapshot of a material defined by its
+//! backdrop is just a still picture of one moment.
+//!
+//! Moving it is a plain `setFrame` on a real view, which the compositor
+//! handles, rather than re-rendering a screen-sized layer tree every frame —
+//! that snapshot, not the timer, is what made the earlier version stutter. The
+//! caller advances `step` on a timer and the region eases toward its target, so
+//! it glides between drop zones instead of jumping.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2_app_kit::NSStatusWindowLevel;
+use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{
+    NSBackingStoreType, NSColor, NSGlassEffectView, NSGlassEffectViewStyle, NSPanel, NSScreen,
+    NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_quartz_core::CALayer;
 use tracing::warn;
 
-use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
-use crate::ui::common::{render_layer_to_cgs_window, with_disabled_actions};
+use crate::sys::screen::CoordinateConverter;
 use crate::ui::stack_line::Color;
 
 /// How close the drawn region has to get to its target before the animation is
@@ -30,12 +37,10 @@ const SETTLE_EPSILON: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DropOverlayConfig {
-    pub fill: Color,
-    pub border: Color,
-    pub border_width: f64,
+    pub tint: Color,
     pub corner_radius: f64,
-    /// Blur radius for the backing. Zero leaves it unblurred.
-    pub blur_radius: i32,
+    /// Whether to use the clearer of the two glass styles.
+    pub clear_style: bool,
     /// Fraction of the remaining distance covered per frame, before easing.
     /// Higher is snappier; 1.0 removes the animation entirely.
     pub follow_rate: f64,
@@ -44,88 +49,104 @@ pub struct DropOverlayConfig {
 impl Default for DropOverlayConfig {
     fn default() -> Self {
         Self {
-            fill: Color::new(0.0, 0.48, 1.0, 0.20),
-            border: Color::new(0.0, 0.55, 1.0, 0.90),
-            border_width: 2.0,
-            corner_radius: 10.0,
-            blur_radius: 24,
+            tint: Color::new(0.0, 0.48, 1.0, 0.28),
+            corner_radius: 12.0,
+            clear_style: false,
             follow_rate: 0.35,
         }
     }
 }
 
 pub struct DropOverlayWindow {
+    /// The display this covers, in the y-down space window frames use.
     screen: CGRect,
     config: DropOverlayConfig,
-    cgs_window: CgsWindow,
-    root_layer: Retained<CALayer>,
-    highlight: Retained<CALayer>,
-    /// Where the highlight is drawn now, and where it is heading, both in
-    /// window-local coordinates.
+    panel: Retained<NSPanel>,
+    glass: Retained<NSGlassEffectView>,
+    /// Where the region is drawn now and where it is heading, both in
+    /// panel-local coordinates.
     drawn: RefCell<Option<CGRect>>,
     target: RefCell<Option<CGRect>>,
+    visible: Cell<bool>,
 }
 
 impl DropOverlayWindow {
-    pub fn new(screen: CGRect, config: DropOverlayConfig) -> Result<Self, CgsWindowError> {
-        let root_layer = CALayer::layer();
-        root_layer.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), screen.size));
+    pub fn new(screen: CGRect, config: DropOverlayConfig, mtm: MainThreadMarker) -> Option<Self> {
+        // Panels live in Cocoa coordinates, which run y-up from the bottom of
+        // the main display; window frames run y-down from its top.
+        let converter = main_screen_converter(mtm)?;
+        let panel_frame = converter.convert_rect(screen)?;
 
-        let highlight = CALayer::layer();
-        let cgs_window = CgsWindow::new(screen)?;
-        cgs_window.set_opacity(false)?;
-        cgs_window.set_alpha(0.0)?;
-        // Above ordinary windows: this describes where a window is going, so it
-        // has to be legible over the ones already there.
-        cgs_window.set_level(NSStatusWindowLevel as i32)?;
-        // Bit 3 disables the system drop shadow, which would otherwise outline
-        // a translucent overlay with a hard rectangle.
-        cgs_window.set_tags(1 << 3)?;
-        if config.blur_radius > 0 {
-            if let Err(error) = cgs_window.set_blur(config.blur_radius, None) {
-                warn!(?error, "drop overlay could not enable background blur");
-            }
-        }
+        let panel = unsafe {
+            NSPanel::initWithContentRect_styleMask_backing_defer(
+                NSPanel::alloc(mtm),
+                panel_frame,
+                // Borderless so there is no chrome, non-activating so showing
+                // it never takes focus from the window being dragged.
+                NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        panel.setOpaque(false);
+        unsafe { panel.setBackgroundColor(Some(&NSColor::clearColor())) };
+        panel.setHasShadow(false);
+        panel.setLevel(NSStatusWindowLevel as isize);
+        panel.setIgnoresMouseEvents(true);
+        // Follow the user everywhere and never take part in window cycling:
+        // this is feedback about a drag in progress, not a window.
+        panel.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
 
-        let overlay = Self {
+        let content = unsafe {
+            NSView::initWithFrame(
+                NSView::alloc(mtm),
+                CGRect::new(CGPoint::new(0.0, 0.0), panel_frame.size),
+            )
+        };
+        let glass = unsafe {
+            NSGlassEffectView::initWithFrame(
+                NSGlassEffectView::alloc(mtm),
+                CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0)),
+            )
+        };
+        glass.setCornerRadius(config.corner_radius);
+        glass.setTintColor(Some(&config.tint.to_nscolor()));
+        glass.setStyle(if config.clear_style {
+            NSGlassEffectViewStyle::Clear
+        } else {
+            NSGlassEffectViewStyle::Regular
+        });
+        unsafe { content.addSubview(&glass) };
+        panel.setContentView(Some(&content));
+
+        Some(Self {
             screen,
             config,
-            cgs_window,
-            root_layer,
-            highlight,
+            panel,
+            glass,
             drawn: RefCell::new(None),
             target: RefCell::new(None),
-        };
-        overlay.style_highlight();
-        overlay.root_layer.addSublayer(&overlay.highlight);
-        Ok(overlay)
+            visible: Cell::new(false),
+        })
     }
 
     pub fn screen(&self) -> CGRect {
         self.screen
     }
 
-    fn style_highlight(&self) {
-        with_disabled_actions(|| {
-            self.highlight.setCornerRadius(self.config.corner_radius);
-            self.highlight.setBorderWidth(self.config.border_width);
-            self.highlight
-                .setBackgroundColor(Some(&self.config.fill.to_nscolor().CGColor()));
-            self.highlight.setBorderColor(Some(&self.config.border.to_nscolor().CGColor()));
-        });
-    }
-
-    /// Points the overlay at a region, in global screen coordinates.
+    /// Points the overlay at a region, in the same y-down space as window
+    /// frames.
     ///
     /// The first region appears where it is asked for; later ones are eased
     /// toward, so moving between drop zones reads as one region moving rather
     /// than two regions blinking.
     pub fn aim_at(&self, region: CGRect) {
-        // Window frames run y-down from the top of the display; layers run
-        // y-up from the bottom. ui::common::WindowLayoutMetrics::rect_for does
-        // the same flip when it places window thumbnails, and without it the
-        // region is mirrored about the middle of the screen — which reads as
-        // the overlay hovering in the centre instead of sitting on a window.
+        // Panel-local coordinates run y-up from the panel's bottom-left.
         let local = CGRect::new(
             CGPoint::new(
                 region.origin.x - self.screen.origin.x,
@@ -144,10 +165,7 @@ impl DropOverlayWindow {
     /// Advances the animation one frame. Returns whether more frames are
     /// needed, so the caller can stop its timer once the region has settled.
     pub fn step(&self) -> bool {
-        let Some(target) = *self.target.borrow() else {
-            return false;
-        };
-        let Some(drawn) = *self.drawn.borrow() else {
+        let (Some(target), Some(drawn)) = (*self.target.borrow(), *self.drawn.borrow()) else {
             return false;
         };
         if rects_close(drawn, target) {
@@ -155,8 +173,7 @@ impl DropOverlayWindow {
             self.present();
             return false;
         }
-        let next = approach(drawn, target, self.config.follow_rate);
-        *self.drawn.borrow_mut() = Some(next);
+        *self.drawn.borrow_mut() = Some(approach(drawn, target, self.config.follow_rate));
         self.present();
         true
     }
@@ -164,11 +181,8 @@ impl DropOverlayWindow {
     pub fn hide(&self) {
         *self.target.borrow_mut() = None;
         *self.drawn.borrow_mut() = None;
-        if let Err(error) = self.cgs_window.set_alpha(0.0) {
-            warn!(?error, "drop overlay could not hide");
-        }
-        if let Err(error) = self.cgs_window.order_out() {
-            warn!(?error, "drop overlay could not order out");
+        if self.visible.replace(false) {
+            self.panel.orderOut(None);
         }
     }
 
@@ -176,15 +190,30 @@ impl DropOverlayWindow {
         let Some(frame) = *self.drawn.borrow() else {
             return;
         };
-        with_disabled_actions(|| self.highlight.setFrame(frame));
-        render_layer_to_cgs_window(self.cgs_window.id(), self.screen.size, &self.root_layer);
-        if let Err(error) = self.cgs_window.set_alpha(1.0) {
-            warn!(?error, "drop overlay could not show");
-        }
-        if let Err(error) = self.cgs_window.order_above(None) {
-            warn!(?error, "drop overlay could not order above");
+        self.glass.setFrame(frame);
+        if !self.visible.replace(true) {
+            // orderFrontRegardless rather than orderFront: the panel has to
+            // appear without this process becoming active, since the user is
+            // in the middle of dragging another application's window.
+            self.panel.orderFrontRegardless();
         }
     }
+}
+
+impl Drop for DropOverlayWindow {
+    fn drop(&mut self) {
+        self.panel.orderOut(None);
+    }
+}
+
+fn main_screen_converter(mtm: MainThreadMarker) -> Option<CoordinateConverter> {
+    let screens = NSScreen::screens(mtm);
+    let main = screens.iter().next()?;
+    let converter = CoordinateConverter::from_screen(&main);
+    if converter.is_none() {
+        warn!("drop overlay could not resolve the main screen height");
+    }
+    converter
 }
 
 /// Moves `from` a fraction of the way toward `to`, eased so the region slows as
@@ -235,7 +264,6 @@ mod tests {
         }
         assert!(rects_close(current, to), "never arrived: {current:?}");
 
-        // A single step covers ground without overshooting past the target.
         let one = approach(from, to, 0.35);
         assert!(one.origin.x > from.origin.x && one.origin.x < to.origin.x);
         assert!(one.size.width > from.size.width && one.size.width < to.size.width);

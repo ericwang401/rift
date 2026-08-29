@@ -8,6 +8,7 @@
 
 use dispatchr::queue;
 use dispatchr::time::Time;
+use objc2::MainThreadMarker;
 use objc2_core_foundation::CGRect;
 use tracing::{debug, instrument, warn};
 
@@ -43,6 +44,7 @@ pub type Receiver = actor::Receiver<Event>;
 pub struct DropOverlay {
     rx: Receiver,
     tx: Sender,
+    mtm: MainThreadMarker,
     config: Config,
     window: Option<DropOverlayWindow>,
     /// Whether a frame is already scheduled, so a burst of drag updates does
@@ -51,10 +53,11 @@ pub struct DropOverlay {
 }
 
 impl DropOverlay {
-    pub fn new(config: Config, tx: Sender, rx: Receiver) -> Self {
+    pub fn new(config: Config, tx: Sender, rx: Receiver, mtm: MainThreadMarker) -> Self {
         Self {
             rx,
             tx,
+            mtm,
             config,
             window: None,
             tick_scheduled: false,
@@ -88,8 +91,7 @@ impl DropOverlay {
         let defaults = DropOverlayConfig::default();
         DropOverlayConfig {
             corner_radius: settings.corner_radius,
-            border_width: settings.border_width,
-            blur_radius: settings.blur_radius,
+            clear_style: settings.clear_style,
             follow_rate: settings.follow_rate,
             ..defaults
         }
@@ -128,10 +130,10 @@ impl DropOverlay {
                     if let Some(existing) = self.window.take() {
                         existing.hide();
                     }
-                    match DropOverlayWindow::new(screen, self.settings()) {
-                        Ok(window) => self.window = Some(window),
-                        Err(error) => {
-                            warn!(?error, "could not create the drop overlay window");
+                    match DropOverlayWindow::new(screen, self.settings(), self.mtm) {
+                        Some(window) => self.window = Some(window),
+                        None => {
+                            warn!("could not create the drop overlay window");
                             return false;
                         }
                     }
