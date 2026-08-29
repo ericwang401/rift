@@ -336,6 +336,16 @@ fn layout_commands_follow_active_display_space_across_active_displays() {
         Some(target_a)
     );
 
+    // NextWindow steps through a stack and does nothing outside one, so the
+    // space this command is meant to land on has to be stacked for it to say
+    // anything about routing.
+    reactor.handle_test_workspace_command(
+        left_space,
+        &LayoutCommand::SetWorkspaceLayout {
+            workspace: None,
+            mode: rift_protocol::LayoutMode::Stack,
+        },
+    );
     reactor.handle_test_layout_command(LayoutCommand::NextWindow);
 
     assert_eq!(

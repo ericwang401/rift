@@ -1944,20 +1944,23 @@ impl LayoutEngine {
                 // windows are not part of it, and an earlier attempt here that
                 // fell back to them cycled through windows that were never in
                 // the layout at all. Nothing to cycle means nothing happens.
-                let windows = if is_floating {
-                    Vec::new()
-                } else {
-                    // Every window in the layout, not just the visible ones: a
-                    // stack shows one window at a time, so asking for the
-                    // visible set returns that single window and there is
-                    // nothing to cycle through — which is precisely the case
-                    // this command exists for.
-                    self.filter_active_workspace_windows(
-                        window_store,
-                        space,
-                        self.workspace_tree(workspace_id).all_windows_in_layout(layout),
-                    )
-                };
+                // This is `--focus stack.next`: it steps through a stack and
+                // is meaningless anywhere else. A bsp tree has no stacks at
+                // all, so there it correctly does nothing.
+                if is_floating
+                    || !self.workspace_tree(workspace_id).parent_of_selection_is_stacked(layout)
+                {
+                    return EventResponse::default();
+                }
+                // Every window in the layout, not just the visible ones: a
+                // stack shows one window at a time, so the visible set is that
+                // single window and there would be nothing to step through —
+                // precisely the case this command exists for.
+                let windows = self.filter_active_workspace_windows(
+                    window_store,
+                    space,
+                    self.workspace_tree(workspace_id).all_windows_in_layout(layout),
+                );
                 if windows.is_empty() {
                     return EventResponse::default();
                 }
