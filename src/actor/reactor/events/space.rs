@@ -84,11 +84,6 @@ pub struct WindowServerDestroyedObservations {
     pub active_spaces: HashSet<SpaceId>,
     pub mission_control_active: bool,
     pub ordered_in: Option<bool>,
-    /// Whether the window server can still describe this window at all.
-    ///
-    /// `ordered_in` is `None` when the query itself failed, which is what a
-    /// destroyed window does, so it cannot tell "gone" from "could not ask".
-    pub exists: bool,
     pub assigned_space: Option<SpaceId>,
     pub last_known_user_space: Option<SpaceId>,
 }
@@ -122,7 +117,6 @@ pub fn handle_window_server_destroyed(
         active_spaces,
         mission_control_active,
         ordered_in,
-        exists,
         assigned_space,
         last_known_user_space,
     } = observations;
@@ -185,14 +179,7 @@ pub fn handle_window_server_destroyed(
         }
 
         if let Some(wid) = state.windows.tracked_window_id(wsid) {
-            // `ordered_in` is only authoritative when it answered. It comes
-            // back as None when SLSWindowIsOrderedIn failed, and it fails for
-            // exactly the case that matters here — a window id that no longer
-            // exists — so treating None as "still around" leaves a closed
-            // window's leaf in the tree, holding space open until something
-            // else happens to sweep it. If the window server cannot describe
-            // the window either, it is gone.
-            if matches!(ordered_in, Some(false)) || !exists {
+            if matches!(ordered_in, Some(false)) {
                 // since the connection has dropped it wont be shown in space_windows_list
                 // so ordered in can be authorative because it doesnt consider
                 // ghost windows that sometimes remain
