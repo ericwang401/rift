@@ -166,6 +166,72 @@ pub enum SpaceEventKind {
 /// to nothing (or invert it) before the user lets go.
 const MIN_MODIFIER_DRAG_SIZE: f64 = 100.0;
 
+/// Which edges of a window a modifier resize moves.
+///
+/// Chosen from where the press landed, like grabbing a corner: the halves the
+/// cursor is in are the ones that follow it.
+#[derive(Clone, Copy, Debug, Default)]
+struct ResizeEdges {
+    left: bool,
+    top: bool,
+}
+
+impl ResizeEdges {
+    fn from_press(frame: CGRect, at: CGPoint) -> Self {
+        Self {
+            left: at.x < frame.mid().x,
+            top: at.y < frame.mid().y,
+        }
+    }
+
+    /// The frame after dragging `dx`/`dy` from where the press landed.
+    ///
+    /// A left-edge drag moves the origin and takes the width the other way, so
+    /// the opposite edge stays put; a right-edge drag only changes the width.
+    fn apply(self, frame: CGRect, dx: f64, dy: f64) -> CGRect {
+        let mut out = frame;
+        if self.left {
+            out.origin.x = frame.origin.x + dx;
+            out.size.width = frame.size.width - dx;
+        } else {
+            out.size.width = frame.size.width + dx;
+        }
+        if self.top {
+            out.origin.y = frame.origin.y + dy;
+            out.size.height = frame.size.height - dy;
+        } else {
+            out.size.height = frame.size.height + dy;
+        }
+        // Never let a fast drag invert the window through zero. Clamping the
+        // size alone would let a left drag keep walking the origin, so the
+        // origin is pinned to the edge that is not moving.
+        if out.size.width < MIN_MODIFIER_DRAG_SIZE {
+            out.size.width = MIN_MODIFIER_DRAG_SIZE;
+            if self.left {
+                out.origin.x = frame.origin.x + frame.size.width - MIN_MODIFIER_DRAG_SIZE;
+            }
+        }
+        if out.size.height < MIN_MODIFIER_DRAG_SIZE {
+            out.size.height = MIN_MODIFIER_DRAG_SIZE;
+            if self.top {
+                out.origin.y = frame.origin.y + frame.size.height - MIN_MODIFIER_DRAG_SIZE;
+            }
+        }
+        out
+    }
+}
+
+/// An in-flight modifier drag, as the reactor sees it.
+#[derive(Clone, Copy)]
+struct ModifierDragState {
+    window: WindowId,
+    action: crate::common::config::MouseAction,
+    /// The window's frame when the drag began; every update is applied to this
+    /// rather than to the previous frame, so nothing drifts.
+    origin_frame: CGRect,
+    edges: ResizeEdges,
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Event {
@@ -256,15 +322,26 @@ pub enum Event {
     /// FIXME: This can be interleaved incorrectly with the MouseState in app
     /// actor events.
     MouseUp,
-    /// A modifier-held drag over `window`, in window-server coordinates.
+    /// A modifier-held drag has started over `window`, at `at` in window-server
+    /// coordinates.
     ///
-    /// The event tap resolves the window and swallows the drag so the
-    /// application never sees it; the reactor owns what the gesture means.
-    MouseModifierDrag {
+    /// The tap swallows the whole gesture so the application never sees it. The
+    /// press is reported separately from the movement because which edges a
+    /// resize moves is decided by where in the window it began — the same rule
+    /// as dragging a window's corner — and that has to be captured before the
+    /// window starts changing shape.
+    #[serde(skip)]
+    MouseModifierDragBegin {
         window: WindowServerId,
+        at: CGPoint,
+        action: crate::common::config::MouseAction,
+    },
+    /// Movement during a modifier drag, measured from where the drag began
+    /// rather than from the previous event, so the window cannot drift away
+    /// from the cursor over a long drag.
+    MouseModifierDrag {
         dx: f64,
         dy: f64,
-        action: crate::common::config::MouseAction,
     },
     /// Sent by the event tap only when the cursor enters a different window.
     /// Window resolution and transition deduplication stay on the input
@@ -337,6 +414,8 @@ pub struct Reactor {
     communication_manager: managers::CommunicationManager,
     notification_manager: managers::NotificationManager,
     transaction_manager: transaction_manager::TransactionManager,
+    /// The modifier drag in flight, if any. See `ModifierDragState`.
+    modifier_drag: Option<ModifierDragState>,
     menu_manager: managers::MenuManager,
     mission_control_manager: managers::MissionControlManager,
     refocus_manager: managers::RefocusManager,
@@ -438,6 +517,7 @@ impl Reactor {
                 _window_notify_tx: window_notify_tx,
             },
             transaction_manager: transaction_manager::TransactionManager::new(window_tx_store),
+            modifier_drag: None,
             menu_manager: managers::MenuManager {
                 menu_state: MenuState::Closed,
                 menu_tx: None,
@@ -1526,9 +1606,13 @@ impl Reactor {
             Event::MenuClosed(pid) => {
                 return Ok(system_workflow::handle_menu_closed(&mut self.menu_manager, pid)?);
             }
-            Event::MouseModifierDrag { window, dx, dy, action } => {
+            Event::MouseModifierDragBegin { window, at, action } => {
+                self.begin_mouse_modifier_drag(window, at, action);
+                return Ok(EventOutcome::default());
+            }
+            Event::MouseModifierDrag { dx, dy } => {
                 let outcome = EventOutcome::default();
-                return Ok(match self.handle_mouse_modifier_drag(window, dx, dy, action) {
+                return Ok(match self.handle_mouse_modifier_drag(dx, dy) {
                     Some(event) => outcome.with_layout_event(event).with_arrange_passes(1),
                     None => outcome,
                 });
@@ -3347,49 +3431,71 @@ impl Reactor {
     ///
     /// Global setting first, then the per-app opt-out. The window keeps focus
     /// either way; only the cursor warp is suppressed.
-    /// Applies a modifier-held drag to the window under the cursor.
+    /// Records what a modifier drag started on.
     ///
-    /// Only floating windows move: a tiled window's frame is owned by its
-    /// layout, which would overwrite anything written here on the next arrange
-    /// pass, so dragging one would fight the tree rather than move the window.
-    /// Returns whether the layout changed and needs an arrange pass.
-    fn handle_mouse_modifier_drag(
+    /// Which edges a resize moves is decided here, from where in the window the
+    /// press landed, exactly as dragging a corner would: press in the left half
+    /// and the left edge follows the cursor, press in the bottom-right and both
+    /// the right and bottom edges do. Deciding this per movement instead is
+    /// what made the window travel the wrong way — growing from the origin
+    /// always moves the right and bottom edges, whichever way the cursor went.
+    fn begin_mouse_modifier_drag(
         &mut self,
         window_server_id: WindowServerId,
-        dx: f64,
-        dy: f64,
+        at: CGPoint,
         action: crate::common::config::MouseAction,
-    ) -> Option<LayoutEvent> {
+    ) {
+        self.modifier_drag = None;
+        let Some(wid) = self.state.windows.tracked_window_id(window_server_id) else {
+            return;
+        };
+        let Some(window) = self.state.windows.window(wid) else {
+            return;
+        };
+        let frame = window.frame_monotonic;
+        self.modifier_drag = Some(ModifierDragState {
+            window: wid,
+            action,
+            origin_frame: frame,
+            edges: ResizeEdges::from_press(frame, at),
+        });
+    }
+
+    /// Applies movement during a modifier drag.
+    ///
+    /// `dx`/`dy` are measured from where the drag began and applied to the
+    /// frame captured then, so the window tracks the cursor exactly however
+    /// long the drag runs. Returns a layout event when the change has to go
+    /// through the layout engine, which is the case for tiled windows.
+    fn handle_mouse_modifier_drag(&mut self, dx: f64, dy: f64) -> Option<LayoutEvent> {
         use crate::common::config::MouseAction;
 
-        let Some(wid) = self.state.windows.tracked_window_id(window_server_id) else {
-            return None;
+        let drag = self.modifier_drag?;
+        let wid = drag.window;
+        let old_frame = self.state.windows.window(wid)?.frame_monotonic;
+
+        let target = match drag.action {
+            MouseAction::Move => {
+                let mut frame = drag.origin_frame;
+                frame.origin.x += dx;
+                frame.origin.y += dy;
+                frame
+            }
+            MouseAction::Resize => drag.edges.apply(drag.origin_frame, dx, dy),
+            MouseAction::None => return None,
         };
 
         if !self.layout_manager.layout_engine.is_window_floating(wid) {
-            // A tiled window's frame belongs to its layout, so writing one
-            // directly would just be overwritten by the next arrange. What
-            // should move is the boundary between the window and its sibling.
-            // Moving a tiled window has no such translation and is left alone.
-            if action != MouseAction::Resize {
-                trace!(?wid, "Ignoring modifier move on a tiled window");
+            // A tiled window's frame belongs to its layout, so writing one is
+            // pointless: the next arrange overwrites it. Moving one has no
+            // meaning either — drag-to-swap already covers that — but a resize
+            // does, so report it as the resize it is and let the ordinary
+            // resize path fold it in. That is the path a drag of the window's
+            // own edge takes, and it already knows each container's pixel size
+            // and gaps.
+            if drag.action != MouseAction::Resize {
                 return None;
             }
-            let Some(window) = self.state.windows.window(wid) else {
-                return None;
-            };
-            // Report the drag as the resize it is and let the ordinary resize
-            // path fold it into the tree, the same path a drag of the window's
-            // edge goes through. That code knows each container's real pixel
-            // size and gaps, which is what makes the moved boundary track the
-            // cursor. Deriving a ratio delta out here got both the sign and the
-            // scale wrong: the tree's own resize grows the selection rather
-            // than moving the boundary, so a window on the far side of a split
-            // travelled backwards, and it halves whatever amount it is given.
-            let old_frame = window.frame_monotonic;
-            let mut new_frame = old_frame;
-            new_frame.size.width = (old_frame.size.width + dx).max(MIN_MODIFIER_DRAG_SIZE);
-            new_frame.size.height = (old_frame.size.height + dy).max(MIN_MODIFIER_DRAG_SIZE);
             let screens = self
                 .space_state
                 .screens
@@ -3401,35 +3507,23 @@ impl Reactor {
             return Some(LayoutEvent::WindowResized {
                 wid,
                 old_frame,
-                new_frame,
+                new_frame: target,
                 screens,
             });
         }
 
-        let Some(window) = self.state.windows.window(wid) else {
-            return None;
+        let window_server_id = self.state.windows.window(wid).and_then(|w| w.info.sys_id);
+        let transaction = match window_server_id {
+            Some(window_server_id) => {
+                let transaction = self.transaction_manager.generate_next_txid(window_server_id);
+                self.transaction_manager.store_txid(window_server_id, transaction, target);
+                transaction
+            }
+            None => TransactionId::default(),
         };
-
-        let mut frame = window.frame_monotonic;
-        match action {
-            MouseAction::Move => {
-                frame.origin.x += dx;
-                frame.origin.y += dy;
-            }
-            MouseAction::Resize => {
-                // Keep the origin fixed and grow toward the cursor, and never
-                // let a window invert through zero.
-                frame.size.width = (frame.size.width + dx).max(MIN_MODIFIER_DRAG_SIZE);
-                frame.size.height = (frame.size.height + dy).max(MIN_MODIFIER_DRAG_SIZE);
-            }
-            MouseAction::None => return None,
-        }
-
-        let transaction = self.transaction_manager.generate_next_txid(window_server_id);
-        self.transaction_manager.store_txid(window_server_id, transaction, frame);
         if let Some(app) = self.app_manager.apps.get(&wid.pid)
             && let Err(error) =
-                app.handle.send(Request::SetWindowFrame(wid, frame, transaction, true))
+                app.handle.send(Request::SetWindowFrame(wid, target, transaction, true))
         {
             warn!(window = ?wid, %error, "failed to apply modifier drag");
         }

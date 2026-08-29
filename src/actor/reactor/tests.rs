@@ -1208,6 +1208,42 @@ fn external_resize_requests_one_arrange_pass() {
     assert!(outcome.arrange.is_resize);
 }
 
+/// A modifier resize moves the edges the press landed nearest, so the window
+/// follows the cursor. Growing from the origin instead moves the right and
+/// bottom edges whichever way the cursor goes, which reads as the window
+/// resizing backwards.
+#[test]
+fn modifier_resize_moves_the_edges_the_press_landed_on() {
+    use crate::actor::reactor::ResizeEdges;
+
+    let frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(400., 400.));
+
+    // Pressing the right half and dragging right widens the window in place.
+    let right = ResizeEdges::from_press(frame, CGPoint::new(450., 300.));
+    let grown = right.apply(frame, 50., 0.);
+    assert_eq!(grown.origin.x, 100., "the left edge stays put");
+    assert_eq!(grown.size.width, 450.);
+
+    // Pressing the left half and dragging left also widens it, by moving the
+    // left edge out — the opposite sign on the same gesture.
+    let left = ResizeEdges::from_press(frame, CGPoint::new(150., 300.));
+    let grown = left.apply(frame, -50., 0.);
+    assert_eq!(grown.origin.x, 50., "the left edge follows the cursor");
+    assert_eq!(grown.size.width, 450.);
+    assert_eq!(grown.max().x, 500., "the right edge stays put");
+
+    // Top-left press moves both the left and top edges.
+    let corner = ResizeEdges::from_press(frame, CGPoint::new(120., 120.));
+    let grown = corner.apply(frame, -10., -20.);
+    assert_eq!((grown.origin.x, grown.origin.y), (90., 80.));
+    assert_eq!((grown.size.width, grown.size.height), (410., 420.));
+
+    // A fast drag past the far edge stops rather than inverting the window.
+    let collapsed = left.apply(frame, 10_000., 0.);
+    assert!(collapsed.size.width > 0.);
+    assert_eq!(collapsed.max().x, 500., "the fixed edge is still fixed");
+}
+
 /// Self-fullscreen is a *transition* into or out of covering the screen, and
 /// only the transitions are kept out of the layout. Anything else is an
 /// ordinary resize, including resizing a window that already fills its screen.

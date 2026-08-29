@@ -122,10 +122,10 @@ struct ModifierDrag {
     button: MouseButton,
     action: MouseAction,
     window: WindowServerId,
+    /// Where the press landed. Movement is reported against this rather than
+    /// against the previous event, so a long drag cannot drift.
+    origin: CGPoint,
     last: CGPoint,
-    /// Movement not yet handed to the reactor. See `MODIFIER_DRAG_INTERVAL`.
-    pending_dx: f64,
-    pending_dy: f64,
     last_sent: Instant,
 }
 
@@ -136,7 +136,9 @@ struct ModifierDrag {
 /// makes the drag crawl. Movement in between is accumulated rather than
 /// dropped, so the window still tracks the cursor exactly — it just arrives in
 /// fewer, larger steps.
-const MODIFIER_DRAG_INTERVAL: Duration = Duration::from_millis(16);
+/// Matches the interval yabai uses for the same gesture. Each update lays out
+/// the whole workspace, so a higher rate buys nothing but load.
+const MODIFIER_DRAG_INTERVAL: Duration = Duration::from_millis(68);
 
 #[derive(Clone, Copy, Default)]
 struct MouseWindow {
@@ -702,13 +704,13 @@ impl EventTap {
         let window =
             mouse_window_hint(event).or_else(crate::sys::window_server::window_under_cursor)?;
         debug!(?button, ?action, ?window, "Beginning modifier drag");
+        _ = self.events_tx.send(Event::MouseModifierDragBegin { window, at: loc, action });
         Some(ModifierDrag {
             button,
             action,
             window,
+            origin: loc,
             last: loc,
-            pending_dx: 0.0,
-            pending_dy: 0.0,
             last_sent: Instant::now(),
         })
     }
@@ -723,8 +725,6 @@ impl EventTap {
             return false;
         }
         let loc = CGEvent::location(Some(event));
-        drag.pending_dx += loc.x - drag.last.x;
-        drag.pending_dy += loc.y - drag.last.y;
         drag.last = loc;
         if drag.last_sent.elapsed() >= MODIFIER_DRAG_INTERVAL {
             self.flush_modifier_drag(&mut drag);
@@ -733,19 +733,14 @@ impl EventTap {
         true
     }
 
-    /// Hands accumulated movement to the reactor and resets the accumulator.
+    /// Reports the drag's total movement so far to the reactor.
     fn flush_modifier_drag(&self, drag: &mut ModifierDrag) {
-        if drag.pending_dx == 0.0 && drag.pending_dy == 0.0 {
+        let dx = drag.last.x - drag.origin.x;
+        let dy = drag.last.y - drag.origin.y;
+        if dx == 0.0 && dy == 0.0 {
             return;
         }
-        _ = self.events_tx.send(Event::MouseModifierDrag {
-            window: drag.window,
-            dx: drag.pending_dx,
-            dy: drag.pending_dy,
-            action: drag.action,
-        });
-        drag.pending_dx = 0.0;
-        drag.pending_dy = 0.0;
+        _ = self.events_tx.send(Event::MouseModifierDrag { dx, dy });
         drag.last_sent = Instant::now();
     }
 
