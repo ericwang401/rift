@@ -1782,10 +1782,7 @@ impl Reactor {
                 return Ok(EventOutcome::default());
             }
             Event::Command(Command::Reactor(ReactorCommand::CreateSpace)) => {
-                let active = crate::sys::space_switch::active_space();
-                if !crate::sys::scripting_addition::create_space(active.get()) {
-                    warn!("Creating a space needs yabai's scripting addition");
-                }
+                self.create_space_after_active();
                 return Ok(EventOutcome::default());
             }
             Event::Command(Command::Reactor(ReactorCommand::DestroySpace)) => {
@@ -3556,6 +3553,43 @@ impl Reactor {
         // A floating window's frame is written directly; the layout is not
         // involved.
         None
+    }
+
+    /// Creates a space immediately to the right of the active one and switches
+    /// to it.
+    ///
+    /// The addition can only append a space to the end of its display, so the
+    /// new one is then reordered to sit after the active space — which is what
+    /// a `space --create` followed by a loop of `space --move prev` was doing,
+    /// in one step rather than one per space in between.
+    fn create_space_after_active(&mut self) {
+        use crate::sys::{scripting_addition, space_switch};
+
+        let active = space_switch::active_space();
+        let before = space_switch::spaces_on_active_display().unwrap_or_default();
+
+        if !scripting_addition::create_space(active.get()) {
+            warn!("Creating a space needs yabai's scripting addition");
+            return;
+        }
+
+        let Some(created) = space_switch::spaces_on_active_display()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|space| !before.contains(space))
+        else {
+            warn!("Created a space but could not find it on the display");
+            return;
+        };
+
+        // Already in the right place when the active space was the last one.
+        if before.last() == Some(&active) {
+            scripting_addition::focus_space(created.get());
+            return;
+        }
+        if !scripting_addition::move_space_after_space(created.get(), active.get(), true) {
+            warn!(?created, "Created the space but could not move it into place");
+        }
     }
 
     /// Moves the focused window to a macOS space by 1-based index.

@@ -773,6 +773,22 @@ impl LayoutEngine {
             return EventResponse::default();
         };
 
+        // `is_floating` describes the focused window, so a floating window
+        // normally makes directional focus walk the other floating windows.
+        // yabai kept directional focus to the tiling tree and reached floating
+        // windows another way, which is what this setting restores.
+        let is_floating = is_floating && !self.layout_settings.directional_focus_skips_floating;
+
+        // yabai resolves a direction with
+        // window_manager_find_closest_managed_window_in_direction, which starts
+        // by looking the focused window up in the managed set and returns
+        // nothing when it is not there. So with a floating window focused,
+        // directional focus does nothing at all — it does not step into the
+        // tiling tree, and it does not walk the other floating windows either.
+        if is_floating && self.layout_settings.directional_focus_skips_floating {
+            return EventResponse::default();
+        }
+
         if is_floating {
             let floating_windows = self.active_floating_windows_in_workspace(window_store, space);
             debug!(
@@ -879,6 +895,9 @@ impl LayoutEngine {
         } else {
             if let Some(prev_wid) = previous_selection {
                 let _ = self.workspace_tree_mut(ws_id).select_window(layout, prev_wid);
+            }
+            if !self.layout_settings.move_across_displays {
+                return EventResponse::default();
             }
             if let Some(new_space) = self.next_space_for_direction(
                 space,
@@ -1920,21 +1939,22 @@ impl LayoutEngine {
             }
             LayoutCommand::NextWindow | LayoutCommand::PrevWindow => {
                 let forward = matches!(command, LayoutCommand::NextWindow);
-                let tiled = || {
+                // yabai's binding for this was `--focus stack.next`, which walks
+                // the managed windows of the focused window's stack. Floating
+                // windows are not part of it, and an earlier attempt here that
+                // fell back to them cycled through windows that were never in
+                // the layout at all. Nothing to cycle means nothing happens.
+                let windows = if is_floating {
+                    Vec::new()
+                } else {
                     self.filter_active_workspace_windows(
                         window_store,
                         space,
                         self.workspace_tree(workspace_id).visible_windows_in_layout(layout),
                     )
                 };
-                let floating = || self.active_floating_windows_in_workspace(window_store, space);
-                // `is_floating` describes the focused window, and there may not
-                // be one — on a workspace whose windows all float, that picks
-                // the empty tiled list and cycling does nothing at all. Fall
-                // back to whichever list actually has windows in it.
-                let mut windows = if is_floating { floating() } else { tiled() };
                 if windows.is_empty() {
-                    windows = if is_floating { tiled() } else { floating() };
+                    return EventResponse::default();
                 }
                 if let Some(idx) = windows.iter().position(|&w| Some(w) == self.focused_window) {
                     let next = if forward {
@@ -1995,6 +2015,9 @@ impl LayoutEngine {
             LayoutCommand::MoveNode(direction) => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 if !self.workspace_tree_mut(workspace_id).move_selection(layout, direction) {
+                    if !self.layout_settings.move_across_displays {
+                        return EventResponse::default();
+                    }
                     if let Some(new_space) = self.next_space_for_direction(
                         space,
                         direction,

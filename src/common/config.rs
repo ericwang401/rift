@@ -856,6 +856,22 @@ pub struct LayoutSettings {
     /// Layout mode: "traditional", "bsp", "stack", "master_stack", or "scrolling"
     #[serde(default)]
     pub mode: LayoutMode,
+    /// Whether directional focus may land on a floating window.
+    ///
+    /// Off by default, matching upstream: when the focused window floats,
+    /// left/right/up/down move between floating windows. Set true for yabai's
+    /// behaviour, where directional focus only ever walks the tiling tree and
+    /// floating windows are reached another way.
+    #[serde(default = "no")]
+    pub directional_focus_skips_floating: bool,
+    /// Whether directional focus and movement continue onto the neighbouring
+    /// display when they reach the edge of the tree.
+    ///
+    /// On by default, matching upstream. yabai resolved a direction inside a
+    /// single view, so focusing or swapping simply stopped at the edge and a
+    /// window changed display only when told to; set false for that.
+    #[serde(default = "yes")]
+    pub move_across_displays: bool,
     /// Traditional layout configuration
     #[serde(default)]
     pub traditional: TraditionalLayoutSettings,

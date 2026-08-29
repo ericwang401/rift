@@ -305,7 +305,7 @@ pub fn active_space() -> SpaceId {
 }
 
 /// The ordered spaces of the display holding the active space.
-fn spaces_on_active_display() -> Option<Vec<SpaceId>> {
+pub fn spaces_on_active_display() -> Option<Vec<SpaceId>> {
     let active = active_space();
     crate::sys::screen::managed_display_space_ids()
         .into_values()

@@ -42,6 +42,7 @@ use tracing::{debug, warn};
 mod opcode {
     pub const SPACE_FOCUS: u8 = 0x02;
     pub const SPACE_CREATE: u8 = 0x03;
+    pub const SPACE_MOVE: u8 = 0x05;
     pub const SPACE_DESTROY: u8 = 0x04;
     pub const WINDOW_TO_SPACE: u8 = 0x13;
 }
@@ -127,6 +128,20 @@ pub fn focus_space(space: u64) -> bool {
 /// Creates a space on the display holding `space`.
 pub fn create_space(space: u64) -> bool {
     send(opcode::SPACE_CREATE, &space.to_ne_bytes())
+}
+
+/// Reorders `space` to sit immediately after `after` on the same display,
+/// optionally focusing it.
+///
+/// The third argument is a slot yabai uses when moving a space between
+/// displays and leaves zeroed otherwise.
+pub fn move_space_after_space(space: u64, after: u64, focus: bool) -> bool {
+    let mut args = Vec::with_capacity(25);
+    args.extend_from_slice(&space.to_ne_bytes());
+    args.extend_from_slice(&after.to_ne_bytes());
+    args.extend_from_slice(&0u64.to_ne_bytes());
+    args.push(u8::from(focus));
+    send(opcode::SPACE_MOVE, &args)
 }
 
 /// Destroys a space by id.
