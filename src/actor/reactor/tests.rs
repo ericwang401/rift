@@ -1208,6 +1208,49 @@ fn external_resize_requests_one_arrange_pass() {
     assert!(outcome.arrange.is_resize);
 }
 
+/// Self-fullscreen is a *transition* into or out of covering the screen, and
+/// only the transitions are kept out of the layout. Anything else is an
+/// ordinary resize, including resizing a window that already fills its screen.
+#[test]
+fn only_transitions_across_full_screen_are_kept_out_of_the_layout() {
+    let (mut reactor, wid, _wsid, _space1, _space2, frame) = reactor_with_window_on_space1();
+    let resize = |reactor: &mut Reactor, to: CGRect| {
+        reactor
+            .dispatch_workflow(Event::WindowFrameChanged(
+                wid,
+                to,
+                None,
+                Requested(false),
+                Some(MouseState::Up),
+            ))
+            .unwrap()
+    };
+    let scaled = |factor: f64| {
+        CGRect::new(
+            frame.origin,
+            CGSize::new(frame.size.width * factor, frame.size.height * factor),
+        )
+    };
+
+    // The fixture's window starts filling the screen, so shrinking it is the
+    // "leaving" transition: the stored layout is re-asserted rather than
+    // rebuilt from the restored frame.
+    let outcome = resize(&mut reactor, scaled(0.5));
+    assert!(!outcome.arrange.is_resize, "leaving full screen is not a resize");
+
+    // Neither frame covers, so this is just a resize.
+    let outcome = resize(&mut reactor, scaled(0.75));
+    assert!(outcome.arrange.is_resize, "an ordinary resize is still a resize");
+
+    // Growing back over the whole screen is the "entering" transition, which
+    // must not rewrite the split ratios around the window.
+    let outcome = resize(&mut reactor, frame);
+    assert!(
+        !outcome.arrange.is_resize,
+        "self-fullscreen must not be folded into the layout"
+    );
+}
+
 #[test]
 fn crossing_native_spaces_reconciles_membership_with_one_arrange_pass() {
     let (mut reactor, wid, wsid, _space1, space2, frame, screen2) =

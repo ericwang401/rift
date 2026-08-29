@@ -401,9 +401,16 @@ pub fn handle_window_frame_changed(
                         && frame.size.height >= screen_frame.size.height - 2.0
                 })
             };
-            if covers(&new_frame) {
-                // Entering self-fullscreen: keep layout state pristine.
-            } else if covers(&old_frame) {
+            // Only a *transition* into or out of covering the screen is a
+            // self-fullscreen event. Testing the new frame alone would swallow
+            // every resize of a window that already filled its screen — a
+            // window sized to the full screen is perfectly ordinary — and the
+            // layout would stop tracking it.
+            let entering = covers(&new_frame) && !covers(&old_frame);
+            let leaving = covers(&old_frame) && !covers(&new_frame);
+            if entering {
+                // Keep layout state pristine while it covers the screen.
+            } else if leaving {
                 // Leaving self-fullscreen: snap the window back into its
                 // slot instead of deriving new ratios from the restored frame.
                 outcome = outcome.with_arrange_passes(1);
