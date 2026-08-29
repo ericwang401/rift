@@ -587,6 +587,54 @@ pub struct UiSettings {
     pub stack_line: StackLineSettings,
     #[serde(default)]
     pub mission_control: MissionControlSettings,
+    #[serde(default)]
+    pub drop_overlay: DropOverlaySettings,
+}
+
+/// The region shown while dragging a window, marking where it would land.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DropOverlaySettings {
+    #[serde(default = "no")]
+    pub enabled: bool,
+    /// Corner rounding, in points.
+    #[serde(default = "default_drop_overlay_corner_radius")]
+    pub corner_radius: f64,
+    /// Border thickness, in points.
+    #[serde(default = "default_drop_overlay_border_width")]
+    pub border_width: f64,
+    /// Blur radius of the backing. Zero draws it unblurred.
+    #[serde(default = "default_drop_overlay_blur")]
+    pub blur_radius: i32,
+    /// How far the region travels toward a new target each frame, 0..1.
+    /// Higher is snappier; 1.0 removes the motion and snaps instead.
+    #[serde(default = "default_drop_overlay_follow_rate")]
+    pub follow_rate: f64,
+}
+
+fn default_drop_overlay_corner_radius() -> f64 {
+    10.0
+}
+fn default_drop_overlay_border_width() -> f64 {
+    2.0
+}
+fn default_drop_overlay_blur() -> i32 {
+    24
+}
+fn default_drop_overlay_follow_rate() -> f64 {
+    0.35
+}
+
+impl Default for DropOverlaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            corner_radius: default_drop_overlay_corner_radius(),
+            border_width: default_drop_overlay_border_width(),
+            blur_radius: default_drop_overlay_blur(),
+            follow_rate: default_drop_overlay_follow_rate(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]

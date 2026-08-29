@@ -195,6 +195,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (event_tap_tx, event_tap_rx) = rift_wm::actor::channel();
     let (menu_tx, menu_rx) = rift_wm::actor::channel();
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
+    let (drop_overlay_tx, drop_overlay_rx) = rift_wm::actor::channel();
     let (wnd_tx, wnd_rx) = rift_wm::actor::channel();
     let window_tx_store = WindowTxStore::new();
     let (gesture_tap_tx, gesture_tap_rx) = rift_wm::actor::channel();
@@ -206,6 +207,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         broadcast_tx.clone(),
         menu_tx.clone(),
         stack_line_tx.clone(),
+        drop_overlay_tx.clone(),
         Some((wnd_tx.clone(), window_tx_store.clone())),
         Some(gesture_tap_tx.clone()),
         opt.one,
@@ -322,6 +324,9 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         stack_line_hit_rects,
     );
 
+    let drop_overlay =
+        rift_wm::actor::drop_overlay::DropOverlay::new(config.clone(), drop_overlay_rx);
+
     let mission_control =
         MissionControlActor::new(config.clone(), mc_rx, mc_tx.clone(), reactor.clone(), mtm);
     let mission_control_native = NativeMissionControl::new(events_tx.clone(), mc_native_rx);
@@ -360,6 +365,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             supervise("gesture_tap", gesture_tap.run()),
             supervise("menu", menu.run()),
             supervise("stack_line", stack_line.run()),
+            supervise("drop_overlay", drop_overlay.run()),
             supervise("window_notify", wn_actor.run()),
             supervise("mc_native", mission_control_native.run()),
             supervise("mission_control", mission_control.run()),

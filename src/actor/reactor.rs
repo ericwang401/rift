@@ -166,6 +166,24 @@ pub enum SpaceEventKind {
 /// to nothing (or invert it) before the user lets go.
 const MIN_MODIFIER_DRAG_SIZE: f64 = 100.0;
 
+/// The half of `frame` a window dropped on that side would occupy.
+fn half_of(frame: CGRect, direction: Direction) -> CGRect {
+    let half_w = frame.size.width / 2.0;
+    let half_h = frame.size.height / 2.0;
+    match direction {
+        Direction::Left => CGRect::new(frame.origin, CGSize::new(half_w, frame.size.height)),
+        Direction::Right => CGRect::new(
+            CGPoint::new(frame.origin.x + half_w, frame.origin.y),
+            CGSize::new(half_w, frame.size.height),
+        ),
+        Direction::Up => CGRect::new(frame.origin, CGSize::new(frame.size.width, half_h)),
+        Direction::Down => CGRect::new(
+            CGPoint::new(frame.origin.x, frame.origin.y + half_h),
+            CGSize::new(frame.size.width, half_h),
+        ),
+    }
+}
+
 /// Which edges of a window a modifier resize moves.
 ///
 /// Chosen from where the press landed, like grabbing a corner: the halves the
@@ -440,6 +458,7 @@ impl Reactor {
         broadcast_tx: BroadcastSender,
         menu_tx: menu_bar::Sender,
         stack_line_tx: stack_line::Sender,
+        drop_overlay_tx: crate::actor::drop_overlay::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         gesture_tap_tx: Option<gesture_tap::Sender>,
         one_space: bool,
@@ -457,6 +476,7 @@ impl Reactor {
         reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
+        reactor.communication_manager.drop_overlay_tx = Some(drop_overlay_tx);
         reactor.communication_manager.gesture_tap_tx = gesture_tap_tx;
         reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
         let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
@@ -512,6 +532,7 @@ impl Reactor {
                 event_tap_tx: None,
                 gesture_tap_tx: None,
                 stack_line_tx: None,
+                drop_overlay_tx: None,
                 raise_manager_tx,
                 event_broadcaster: broadcast_tx,
                 wm_sender: None,
@@ -1594,6 +1615,7 @@ impl Reactor {
                     let cursor = window_server::current_cursor_location().ok()?;
                     Some(crate::actor::drag_swap::DragManager::drop_action(frame, cursor))
                 });
+                self.hide_drop_region();
                 let focused = self.window_id_under_cursor().and_then(|window| {
                     self.best_space_for_window_id(window).map(|space| (space, window))
                 });
@@ -2270,6 +2292,9 @@ impl Reactor {
                 && let Err(error) = tx.try_send(stack_line::Event::ConfigUpdated(config.clone()))
             {
                 warn!(%error, "failed to update stack line config");
+            }
+            if let Some(tx) = &self.communication_manager.drop_overlay_tx {
+                tx.send(crate::actor::drop_overlay::Event::ConfigUpdated(config.clone()));
             }
             if let Some(tx) = &self.menu_manager.menu_tx
                 && let Err(error) = tx.try_send(menu_bar::Event::ConfigUpdated(config.clone()))
@@ -4444,6 +4469,48 @@ impl Reactor {
             .collect()
     }
 
+    /// Shows where the drop would put the dragged window.
+    ///
+    /// The region is the same one the drop itself will use: the whole target
+    /// when the pointer is in its middle, and the half it would occupy after
+    /// the split when the pointer is near an edge — so what is drawn is a
+    /// promise about what will happen, not a hint.
+    fn preview_drop_region(&self, target: WindowId) {
+        let Some(tx) = &self.communication_manager.drop_overlay_tx else {
+            return;
+        };
+        if !self.config.settings.ui.drop_overlay.enabled {
+            return;
+        }
+        let Some(frame) = self.state.windows.window(target).map(|w| w.frame_monotonic) else {
+            return;
+        };
+        let Ok(cursor) = window_server::current_cursor_location() else {
+            return;
+        };
+        let Some(screen) = self
+            .space_state
+            .screens
+            .iter()
+            .find(|screen| screen.frame.contains(cursor))
+            .map(|screen| screen.frame)
+        else {
+            return;
+        };
+
+        let region = match crate::actor::drag_swap::DragManager::drop_action(frame, cursor) {
+            crate::actor::drag_swap::DropAction::Swap => frame,
+            crate::actor::drag_swap::DropAction::Insert(direction) => half_of(frame, direction),
+        };
+        tx.send(crate::actor::drop_overlay::Event::Aim { screen, region });
+    }
+
+    fn hide_drop_region(&self) {
+        if let Some(tx) = &self.communication_manager.drop_overlay_tx {
+            tx.send(crate::actor::drop_overlay::Event::Hide);
+        }
+    }
+
     fn maybe_swap_on_drag(&mut self, wid: WindowId, new_frame: CGRect) {
         if !self.is_in_drag() {
             trace!(?wid, "Skipping swap: not in drag (mouse up received)");
@@ -4496,6 +4563,7 @@ impl Reactor {
                 "Resetting drag swap tracking after space change"
             );
             self.drag_manager.drag_swap_manager.reset();
+            self.hide_drop_region();
             return;
         }
 
@@ -4522,6 +4590,8 @@ impl Reactor {
                 );
             }
 
+            self.preview_drop_region(target_wid);
+
             if let Some(session) = self.take_active_drag_session() {
                 self.drag_manager.drag_state =
                     DragState::PendingSwap { session, target: target_wid };
@@ -4539,6 +4609,8 @@ impl Reactor {
             self.drag_manager.skip_layout_for_window = Some(wid);
             return;
         }
+
+        self.hide_drop_region();
 
         if let Some((pending_wid, pending_target)) = previous_pending
             && pending_wid == wid

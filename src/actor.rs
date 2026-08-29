@@ -6,6 +6,7 @@ pub mod app;
 pub mod config;
 pub mod config_watcher;
 pub mod drag_swap;
+pub mod drop_overlay;
 pub mod event_tap;
 pub mod gesture_tap;
 pub mod menu_bar;
