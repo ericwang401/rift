@@ -253,9 +253,25 @@ impl WindowNotify {
                             SpaceId::new(space_id),
                         ));
                     }
+                    CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
+                    | CGSEventType::Known(KnownCGSEvent::WindowHidden) => {
+                        focus_wake.notify();
+                        // Closing the window of an app that stays running
+                        // orders it out instead of destroying it, so no
+                        // destroy event follows and the layout would keep
+                        // holding its slot.
+                        if let Some(window_id) = evt.window_id {
+                            let visible = matches!(
+                                evt.event_type,
+                                CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
+                            );
+                            events_tx.send(reactor::Event::WindowServerVisibilityChanged(
+                                WindowServerId::new(window_id),
+                                visible,
+                            ));
+                        }
+                    }
                     CGSEventType::Known(KnownCGSEvent::WindowReordered)
-                    | CGSEventType::Known(KnownCGSEvent::WindowUnhidden)
-                    | CGSEventType::Known(KnownCGSEvent::WindowHidden)
                     | CGSEventType::Known(
                         KnownCGSEvent::WindowManagerSpaceFrontConnectionChanged,
                     )

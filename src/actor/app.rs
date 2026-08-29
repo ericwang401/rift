@@ -338,6 +338,13 @@ pub enum Request {
     /// focused/main window and the quiet marker before notifying the reactor.
     ApplicationGloballyActivated(pid_t),
     WindowMaybeDestroyed(WindowId),
+    /// Check whether one window's accessibility element is still valid.
+    ///
+    /// Unlike `WindowMaybeDestroyed`, which refreshes through
+    /// `kAXWindowsAttribute` and is therefore space-filtered, this asks the
+    /// element itself. An element only goes invalid when the window is really
+    /// gone, so the answer does not change with which space is on screen.
+    VerifyWindowAlive(WindowId),
     CloseWindow(Option<WindowServerId>),
 
     SetWindowFrame(WindowId, CGRect, TransactionId, bool),
@@ -763,6 +770,21 @@ impl State {
                 CFRunLoop::current().unwrap().stop();
                 self.send_event(Event::ApplicationThreadTerminated(self.pid));
                 return Ok(true);
+            }
+            Request::VerifyWindowAlive(wid) => {
+                if wid.pid != self.pid {
+                    return Ok(false);
+                }
+                let Some(window) = self.windows.get(&wid) else {
+                    return Ok(false);
+                };
+                if matches!(window.elem.role(), Err(AxError::Ax(AXError::InvalidUIElement))) {
+                    self.remove_tracked_window(
+                        wid,
+                        "Window element is invalid after being ordered out",
+                    );
+                }
+                return Ok(false);
             }
             Request::WindowMaybeDestroyed(wid) => {
                 if wid.pid != self.pid {

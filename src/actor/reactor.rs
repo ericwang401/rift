@@ -336,6 +336,12 @@ pub enum Event {
         at: CGPoint,
         action: crate::common::config::MouseAction,
     },
+    /// The window server ordered a window in or out.
+    ///
+    /// Closing the window of an app that keeps running orders the window out
+    /// rather than destroying it, so no destroy notification ever arrives and
+    /// the window keeps its place in the layout.
+    WindowServerVisibilityChanged(WindowServerId, bool),
     /// Movement during a modifier drag, measured from where the drag began
     /// rather than from the previous event, so the window cannot drift away
     /// from the cursor over a long drag.
@@ -1605,6 +1611,26 @@ impl Reactor {
             }
             Event::MenuClosed(pid) => {
                 return Ok(system_workflow::handle_menu_closed(&mut self.menu_manager, pid)?);
+            }
+            Event::WindowServerVisibilityChanged(wsid, visible) => {
+                let mut outcome = EventOutcome::no_change();
+                if let Some(wid) = self.state.windows.tracked_window_id(wsid) {
+                    if visible {
+                        self.state.windows.mark_window_visible(wsid);
+                    } else {
+                        self.state.windows.mark_window_hidden(wsid);
+                        // Being ordered out is not proof of anything on its own:
+                        // it is also what every window on a space does when you
+                        // switch away from it. Ask the app whether the window's
+                        // accessibility element is still valid, which only a
+                        // genuinely destroyed window fails. If it is gone the
+                        // app emits WindowDestroyed and the ordinary teardown
+                        // runs, so nothing here has to guess.
+                        outcome =
+                            outcome.with_app_request(wid.pid, Request::VerifyWindowAlive(wid));
+                    }
+                }
+                return Ok(outcome);
             }
             Event::MouseModifierDragBegin { window, at, action } => {
                 self.begin_mouse_modifier_drag(window, at, action);
