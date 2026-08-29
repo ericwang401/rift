@@ -3639,6 +3639,17 @@ impl Reactor {
         if !self.config.settings.mouse_follows_focus {
             return false;
         }
+        // yabai skips the warp when the pointer already sits inside the window
+        // being focused (window_manager_center_mouse). Focusing something you
+        // are already hovering should not move your hand, and it matters most
+        // when stepping through a stack: every window there has the same frame,
+        // so each step would otherwise yank the cursor back to the middle.
+        if let Some(window) = self.state.windows.window(wid)
+            && let Ok(cursor) = window_server::current_cursor_location()
+            && window.frame_monotonic.contains(cursor)
+        {
+            return false;
+        }
         if self.config.settings.mouse_follows_focus_blacklist.is_empty() {
             return true;
         }
