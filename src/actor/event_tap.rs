@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use objc2_core_foundation::{CGPoint, CGRect};
@@ -122,7 +123,20 @@ struct ModifierDrag {
     action: MouseAction,
     window: WindowServerId,
     last: CGPoint,
+    /// Movement not yet handed to the reactor. See `MODIFIER_DRAG_INTERVAL`.
+    pending_dx: f64,
+    pending_dy: f64,
+    last_sent: Instant,
 }
+
+/// Minimum gap between modifier-drag updates sent to the reactor.
+///
+/// The tap sees drag events at the pointer's full report rate, and resizing a
+/// tiled window lays out the whole workspace, so forwarding every one of them
+/// makes the drag crawl. Movement in between is accumulated rather than
+/// dropped, so the window still tracks the cursor exactly — it just arrives in
+/// fewer, larger steps.
+const MODIFIER_DRAG_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Default)]
 struct MouseWindow {
@@ -693,6 +707,9 @@ impl EventTap {
             action,
             window,
             last: loc,
+            pending_dx: 0.0,
+            pending_dy: 0.0,
+            last_sent: Instant::now(),
         })
     }
 
@@ -706,29 +723,43 @@ impl EventTap {
             return false;
         }
         let loc = CGEvent::location(Some(event));
-        let dx = loc.x - drag.last.x;
-        let dy = loc.y - drag.last.y;
+        drag.pending_dx += loc.x - drag.last.x;
+        drag.pending_dy += loc.y - drag.last.y;
         drag.last = loc;
-        self.modifier_drag.set(Some(drag));
-        if dx != 0.0 || dy != 0.0 {
-            _ = self.events_tx.send(Event::MouseModifierDrag {
-                window: drag.window,
-                dx,
-                dy,
-                action: drag.action,
-            });
+        if drag.last_sent.elapsed() >= MODIFIER_DRAG_INTERVAL {
+            self.flush_modifier_drag(&mut drag);
         }
+        self.modifier_drag.set(Some(drag));
         true
+    }
+
+    /// Hands accumulated movement to the reactor and resets the accumulator.
+    fn flush_modifier_drag(&self, drag: &mut ModifierDrag) {
+        if drag.pending_dx == 0.0 && drag.pending_dy == 0.0 {
+            return;
+        }
+        _ = self.events_tx.send(Event::MouseModifierDrag {
+            window: drag.window,
+            dx: drag.pending_dx,
+            dy: drag.pending_dy,
+            action: drag.action,
+        });
+        drag.pending_dx = 0.0;
+        drag.pending_dy = 0.0;
+        drag.last_sent = Instant::now();
     }
 
     /// Ends an in-flight drag. Returns whether this release closed one.
     fn end_modifier_drag(&self, event_type: CGEventType) -> bool {
-        let Some(drag) = self.modifier_drag.get() else {
+        let Some(mut drag) = self.modifier_drag.get() else {
             return false;
         };
         if mouse_button(event_type) != Some(drag.button) {
             return false;
         }
+        // Whatever accumulated since the last update still has to land, or the
+        // window stops short of where the drag ended.
+        self.flush_modifier_drag(&mut drag);
         trace!("Ending modifier drag");
         self.modifier_drag.set(None);
         true

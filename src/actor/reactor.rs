@@ -1528,12 +1528,9 @@ impl Reactor {
             }
             Event::MouseModifierDrag { window, dx, dy, action } => {
                 let outcome = EventOutcome::default();
-                return Ok(if self.handle_mouse_modifier_drag(window, dx, dy, action) {
-                    // Resizing a tiled window moved split ratios, not a frame,
-                    // so the workspace has to be laid out again.
-                    outcome.with_arrange_passes(1)
-                } else {
-                    outcome
+                return Ok(match self.handle_mouse_modifier_drag(window, dx, dy, action) {
+                    Some(event) => outcome.with_layout_event(event).with_arrange_passes(1),
+                    None => outcome,
                 });
             }
             Event::MouseMoved(wsid) => {
@@ -3362,31 +3359,55 @@ impl Reactor {
         dx: f64,
         dy: f64,
         action: crate::common::config::MouseAction,
-    ) -> bool {
+    ) -> Option<LayoutEvent> {
         use crate::common::config::MouseAction;
 
         let Some(wid) = self.state.windows.tracked_window_id(window_server_id) else {
-            return false;
+            return None;
         };
 
         if !self.layout_manager.layout_engine.is_window_floating(wid) {
             // A tiled window's frame belongs to its layout, so writing one
-            // directly would just be overwritten by the next arrange. Resizing
-            // is still meaningful though: it is the split ratios around the
-            // window that should move, which is what yabai did here. Moving a
-            // tiled window has no such translation and is left alone.
+            // directly would just be overwritten by the next arrange. What
+            // should move is the boundary between the window and its sibling.
+            // Moving a tiled window has no such translation and is left alone.
             if action != MouseAction::Resize {
                 trace!(?wid, "Ignoring modifier move on a tiled window");
-                return false;
+                return None;
             }
-            let Some(space) = self.best_space_for_window_id(wid) else {
-                return false;
+            let Some(window) = self.state.windows.window(wid) else {
+                return None;
             };
-            return self.layout_manager.layout_engine.resize_window_by_delta(space, wid, dx, dy);
+            // Report the drag as the resize it is and let the ordinary resize
+            // path fold it into the tree, the same path a drag of the window's
+            // edge goes through. That code knows each container's real pixel
+            // size and gaps, which is what makes the moved boundary track the
+            // cursor. Deriving a ratio delta out here got both the sign and the
+            // scale wrong: the tree's own resize grows the selection rather
+            // than moving the boundary, so a window on the far side of a split
+            // travelled backwards, and it halves whatever amount it is given.
+            let old_frame = window.frame_monotonic;
+            let mut new_frame = old_frame;
+            new_frame.size.width = (old_frame.size.width + dx).max(MIN_MODIFIER_DRAG_SIZE);
+            new_frame.size.height = (old_frame.size.height + dy).max(MIN_MODIFIER_DRAG_SIZE);
+            let screens = self
+                .space_state
+                .screens
+                .iter()
+                .filter_map(|screen| {
+                    Some((screen.space?, screen.frame, screen.display_uuid_owned()))
+                })
+                .collect();
+            return Some(LayoutEvent::WindowResized {
+                wid,
+                old_frame,
+                new_frame,
+                screens,
+            });
         }
 
         let Some(window) = self.state.windows.window(wid) else {
-            return false;
+            return None;
         };
 
         let mut frame = window.frame_monotonic;
@@ -3401,7 +3422,7 @@ impl Reactor {
                 frame.size.width = (frame.size.width + dx).max(MIN_MODIFIER_DRAG_SIZE);
                 frame.size.height = (frame.size.height + dy).max(MIN_MODIFIER_DRAG_SIZE);
             }
-            MouseAction::None => return false,
+            MouseAction::None => return None,
         }
 
         let transaction = self.transaction_manager.generate_next_txid(window_server_id);
@@ -3412,8 +3433,9 @@ impl Reactor {
         {
             warn!(window = ?wid, %error, "failed to apply modifier drag");
         }
-        // A floating window's frame is written directly; nothing to arrange.
-        false
+        // A floating window's frame is written directly; the layout is not
+        // involved.
+        None
     }
 
     /// Moves the focused window to a macOS space by 1-based index.
