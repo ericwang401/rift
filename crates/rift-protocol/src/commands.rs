@@ -44,6 +44,8 @@ pub enum LayoutCommand {
     ConsumeOrExpelWindow(Direction),
     ToggleStack,
     ToggleOrientation,
+    /// Reset every split in the active workspace to an even share.
+    Balance,
     Rotate(RotateDegrees),
     Mirror(MirrorAxis),
     UnjoinWindows,

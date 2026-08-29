@@ -1947,10 +1947,15 @@ impl LayoutEngine {
                 let windows = if is_floating {
                     Vec::new()
                 } else {
+                    // Every window in the layout, not just the visible ones: a
+                    // stack shows one window at a time, so asking for the
+                    // visible set returns that single window and there is
+                    // nothing to cycle through — which is precisely the case
+                    // this command exists for.
                     self.filter_active_workspace_windows(
                         window_store,
                         space,
-                        self.workspace_tree(workspace_id).visible_windows_in_layout(layout),
+                        self.workspace_tree(workspace_id).all_windows_in_layout(layout),
                     )
                 };
                 if windows.is_empty() {
@@ -2106,6 +2111,14 @@ impl LayoutEngine {
                 let default_orientation: crate::common::config::StackDefaultOrientation =
                     self.layout_settings.stack.default_orientation;
                 self.toggle_stack_for_workspace(workspace_id, layout, default_orientation)
+            }
+            LayoutCommand::Balance => {
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                self.workspace_tree_mut(workspace_id).rebalance(layout);
+                EventResponse {
+                    changed: true,
+                    ..EventResponse::default()
+                }
             }
             LayoutCommand::UnjoinWindows => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);

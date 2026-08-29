@@ -869,6 +869,38 @@ mod tests {
     }
 
     #[test]
+    fn balance_resets_every_split_to_an_even_share() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        for id in 1..=4 {
+            system.add_window_after_selection(layout, w(id));
+        }
+
+        // Skew a couple of splits away from even.
+        system.resize_selection_by(layout, 0.3, ResizeOrientation::Horizontal);
+        system.resize_selection_by(layout, 0.25, ResizeOrientation::Vertical);
+        let skewed = system
+            .draw_tree(layout)
+            .lines()
+            .filter(|line| line.contains("Split") && !line.contains("0.50"))
+            .count();
+        assert!(skewed > 0, "expected the resizes to skew at least one split");
+
+        system.rebalance(layout);
+
+        let uneven: Vec<String> = system
+            .draw_tree(layout)
+            .lines()
+            .filter(|line| line.contains("Split") && !line.contains("0.50"))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            uneven.is_empty(),
+            "splits left uneven after balancing: {uneven:?}"
+        );
+    }
+
+    #[test]
     fn mirror_reverses_only_the_matching_axis() {
         use rift_protocol::MirrorAxis;
 
@@ -1983,7 +2015,17 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    fn rebalance(&mut self, _layout: LayoutId) {}
+    /// Resets every split to an even share, yabai's `space --balance`.
+    ///
+    /// A bsp tree carries its proportions on the splits rather than on the
+    /// leaves, so an even tree is one whose splits are all half and half.
+    fn rebalance(&mut self, layout: LayoutId) {
+        for node in self.nodes_in_layout(layout) {
+            if let Some(NodeKind::Split { ratio, .. }) = self.kind.get_mut(node) {
+                *ratio = 0.5;
+            }
+        }
+    }
 
     fn toggle_tile_orientation(&mut self, layout: LayoutId) {
         let sel_snapshot = self.selection_of_layout(layout);

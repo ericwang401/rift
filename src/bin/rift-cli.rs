@@ -334,6 +334,8 @@ enum LayoutCommands {
     ToggleOrientation,
     /// Unjoin previously joined windows
     Unjoin,
+    /// Reset every split in the active workspace to an even share
+    Balance,
     /// Focus the next window in the active workspace
     NextWindow,
     /// Focus the previous window in the active workspace
@@ -947,6 +949,7 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
         LayoutCommands::Unjoin => {
             Ok(CliCommand::Reactor(reactor::Command::Layout(LC::UnjoinWindows)))
         }
+        LayoutCommands::Balance => Ok(CliCommand::Reactor(reactor::Command::Layout(LC::Balance))),
         LayoutCommands::NextWindow => {
             Ok(CliCommand::Reactor(reactor::Command::Layout(LC::NextWindow)))
         }
