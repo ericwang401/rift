@@ -35,6 +35,9 @@ pub struct DragManager {
     pub drag_state: super::DragState,
     pub drag_swap_manager: DragSwapManager,
     pub skip_layout_for_window: Option<WindowId>,
+    /// Whether the drop overlay is on screen. It belongs to a pending drop and
+    /// is taken down as soon as there is none, whichever way the drag ended.
+    pub drop_overlay_shown: bool,
 }
 
 impl DragManager {

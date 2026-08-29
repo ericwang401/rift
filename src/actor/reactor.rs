@@ -371,6 +371,14 @@ pub enum Event {
     /// Window resolution and transition deduplication stay on the input
     /// thread; the reactor only applies the model-dependent focus/raise work.
     MouseMoved(WindowServerId),
+    /// Sent by the event tap while a mouse button is held and the pointer
+    /// moves. A window being dragged reports its frame at whatever cadence
+    /// its app chooses; the pointer is what decides where a drop lands, so
+    /// the drop target is re-evaluated on every sample of it.
+    MouseDragged {
+        x: f64,
+        y: f64,
+    },
     /// Forwarded by the spaces actor after wake has been observed.
     ///
     /// The spaces actor is the authority for sleep/lock/display lifecycle.
@@ -515,6 +523,7 @@ impl Reactor {
             main_window_tracker: MainWindowTracker::default(),
             drag_manager: managers::DragManager {
                 drag_state: DragState::Inactive,
+                drop_overlay_shown: false,
                 drag_swap_manager: crate::actor::drag_swap::DragManager::new(
                     config.settings.window_snapping,
                 ),
@@ -1034,7 +1043,10 @@ impl Reactor {
 
     fn log_event(&self, event: &Event) {
         match event {
-            Event::WindowFrameChanged(..) | Event::MouseUp | Event::MouseMoved(..) => {
+            Event::WindowFrameChanged(..)
+            | Event::MouseUp
+            | Event::MouseMoved(..)
+            | Event::MouseDragged { .. } => {
                 trace!(?event, "Event")
             }
             _ => debug!(?event, "Event"),
@@ -1151,6 +1163,17 @@ impl Reactor {
                 self.apply_event_outcome(outcome);
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
+        }
+        // The overlay is a statement about a pending drop, so it lives exactly
+        // as long as one does. Every way a drag can end other than a drop —
+        // a participant destroyed, Mission Control opening, the window
+        // crossing to another space, a lost session — resets the drag state
+        // somewhere in a workflow, and none of them know about the overlay.
+        // Reconciling here means none of them can strand it on screen.
+        if self.drag_manager.drop_overlay_shown
+            && !matches!(self.drag_manager.drag_state, DragState::PendingSwap { .. })
+        {
+            self.hide_drop_region();
         }
     }
 
@@ -1457,21 +1480,46 @@ impl Reactor {
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 let mission_control_active = self.is_mission_control_active();
                 let mut effective_mouse_state = mouse_state;
-                if matches!(
-                    window_workflow::classify_window_frame_change(
-                        &mut self.state,
-                        &self.transaction_manager,
-                        &mut self.drag_manager,
-                        wid,
-                        new_frame,
-                        last_seen,
-                        requested.0,
-                        &mut effective_mouse_state,
-                        mission_control_active,
-                    ),
-                    window_workflow::FrameChangeDisposition::Handled
+                // Whatever else this report means, the window is this size
+                // now, so no recorded minimum may claim it cannot be.
+                self.layout_manager.layout_engine.relax_observed_min_size(wid, new_frame.size);
+                let disposition = window_workflow::classify_window_frame_change(
+                    &mut self.state,
+                    &self.transaction_manager,
+                    &mut self.drag_manager,
+                    wid,
+                    new_frame,
+                    last_seen,
+                    requested.0,
+                    &mut effective_mouse_state,
+                    mission_control_active,
+                );
+                if !matches!(
+                    disposition,
+                    window_workflow::FrameChangeDisposition::NeedsGeometryAnalysis
                 ) {
                     let mut outcome = EventOutcome::no_change();
+                    // A window that would not shrink to its slot is sitting
+                    // over its neighbour. Remember the size it insisted on
+                    // and lay out again, so the slot grows to fit it and the
+                    // neighbour gives way instead.
+                    if let window_workflow::FrameChangeDisposition::HandledRefusedSize {
+                        requested,
+                        observed,
+                    } = disposition
+                        && self
+                            .layout_manager
+                            .layout_engine
+                            .note_observed_min_size(wid, requested, observed)
+                    {
+                        debug!(
+                            ?wid,
+                            ?requested,
+                            ?observed,
+                            "window refused its size; treating it as a minimum"
+                        );
+                        outcome = outcome.with_arrange_passes(1);
+                    }
                     outcome.dispatch_mouse_up = effective_mouse_state
                         == Some(crate::sys::event::MouseState::Up)
                         && matches!(
@@ -1582,10 +1630,28 @@ impl Reactor {
             Event::MouseUp => {
                 let pending_swap = self.get_pending_drag_swap();
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(true);
-                let swap_space = pending_swap
-                    .and_then(|(dragged, _)| {
-                        self.state.windows.window(dragged).and_then(|window| {
-                            self.best_space_for_window(&window.frame_monotonic, window.info.sys_id)
+                // A drop on a target is a statement about that target's
+                // space, whatever the dragged window's own frame says. Near
+                // the edge of a display the frame hangs over onto the next
+                // one, and the window server may already have handed the
+                // window to that display's space; resolving the drop from
+                // the dragged window then tried the insert in a tree the
+                // target is not in, fell back to a no-op swap, and moved the
+                // window to the other display — while the arrange for the
+                // display it was dropped on pulled it back. That is the
+                // flicker between displays that ended with the window tiled
+                // on the wrong one.
+                let target_space =
+                    pending_swap.and_then(|(_, target)| self.best_space_for_window_id(target));
+                let swap_space = target_space
+                    .or_else(|| {
+                        pending_swap.and_then(|(dragged, _)| {
+                            self.state.windows.window(dragged).and_then(|window| {
+                                self.best_space_for_window(
+                                    &window.frame_monotonic,
+                                    window.info.sys_id,
+                                )
+                            })
                         })
                     })
                     .or_else(|| {
@@ -1601,26 +1667,22 @@ impl Reactor {
                     }
                     DragState::Inactive => None,
                 };
-                let final_space = session.as_ref().and_then(|session| {
-                    session
-                        .settled_space
-                        .or_else(|| self.best_space_for_frame(&session.last_frame))
-                        .or_else(|| self.best_space_for_window_id(session.window))
+                let final_space = target_space.or_else(|| {
+                    session.as_ref().and_then(|session| {
+                        session
+                            .settled_space
+                            .or_else(|| self.best_space_for_frame(&session.last_frame))
+                            .or_else(|| self.best_space_for_window_id(session.window))
+                    })
                 });
                 // Where the pointer sits inside the target decides whether the
                 // drop swaps or splits, so it has to be read before the drag
                 // state is torn down.
+                // The same resolution the preview used, so the drop does what
+                // the overlay showed.
                 let drop_action = pending_swap.and_then(|(dragged, target)| {
-                    // Same requirement as the preview: only the tree can swap
-                    // or split, so a floating window on either end has no drop
-                    // action at all.
-                    let engine = &self.layout_manager.layout_engine;
-                    if engine.is_window_floating(dragged) || engine.is_window_floating(target) {
-                        return None;
-                    }
-                    let frame = self.state.windows.window(target)?.frame_monotonic;
                     let cursor = window_server::current_cursor_location().ok()?;
-                    Some(crate::actor::drag_swap::DragManager::drop_action(frame, cursor))
+                    self.drop_action_for(dragged, target, cursor)
                 });
                 self.hide_drop_region();
                 let focused = self.window_id_under_cursor().and_then(|window| {
@@ -1680,6 +1742,18 @@ impl Reactor {
                     Some(event) => outcome.with_layout_event(event).with_arrange_passes(1),
                     None => outcome,
                 });
+            }
+            Event::MouseDragged { x, y } => {
+                let session = match &self.drag_manager.drag_state {
+                    DragState::Active { session } | DragState::PendingSwap { session, .. } => {
+                        Some((session.window, session.last_frame))
+                    }
+                    DragState::Inactive => None,
+                };
+                if let Some((wid, frame)) = session {
+                    self.evaluate_drop_target(wid, frame, Some(CGPoint::new(x, y)));
+                }
+                return Ok(EventOutcome::no_change());
             }
             Event::MouseMoved(wsid) => {
                 let window = self.state.windows.tracked_window_id(wsid);
@@ -4461,13 +4535,18 @@ impl Reactor {
                     return None;
                 }
                 let other_space = self.best_space_for_window_state(other_state)?;
+                // Only a window in the layout can be swapped with or split.
+                // Membership in the tree is the test, not workspace
+                // assignment: a window with no assignment at all counts as
+                // being in the active workspace, which let unmanaged popups,
+                // minimized windows and windows never admitted to the layout
+                // be offered as drop targets, and dropping on those did
+                // nothing.
+                let engine = &self.layout_manager.layout_engine;
                 if other_space != space
-                    || !self.layout_manager.layout_engine.is_window_in_active_workspace(
-                        &self.state.windows,
-                        space,
-                        other_wid,
-                    )
-                    || self.layout_manager.layout_engine.is_window_floating(other_wid)
+                    || !other_state.is_admitted()
+                    || engine.is_window_floating(other_wid)
+                    || !engine.is_window_tiled(space, other_wid)
                 {
                     return None;
                 }
@@ -4482,54 +4561,148 @@ impl Reactor {
     /// when the pointer is in its middle, and the half it would occupy after
     /// the split when the pointer is near an edge — so what is drawn is a
     /// promise about what will happen, not a hint.
-    fn preview_drop_region(&self, dragged: WindowId, target: WindowId) {
+    fn preview_drop_region(&mut self, dragged: WindowId, target: WindowId, cursor: CGPoint) {
         // Anything that leaves nothing to promise hides the overlay rather
         // than merely declining to update it, or a region drawn a moment ago
         // stays on screen for the rest of the drag.
-        let Some((screen, region)) = self.drop_preview_region(dragged, target) else {
+        let Some((screen, region)) = self.drop_preview_region(dragged, target, cursor) else {
             self.hide_drop_region();
             return;
         };
         if let Some(tx) = &self.communication_manager.drop_overlay_tx {
             tx.send(crate::actor::drop_overlay::Event::Aim { screen, region });
         }
+        self.drag_manager.drop_overlay_shown = true;
     }
 
-    /// The screen and region a drop would land in, or `None` when the drop
-    /// would not rearrange anything.
-    fn drop_preview_region(&self, dragged: WindowId, target: WindowId) -> Option<(CGRect, CGRect)> {
-        if !self.config.settings.ui.drop_overlay.enabled {
-            return None;
-        }
-        // Only the tree can swap or split, so a floating window on either end
-        // of the drag has nothing to preview.
+    /// What dropping `dragged` on `target` will do with the cursor at
+    /// `cursor`, or `None` when the drop would not rearrange anything.
+    ///
+    /// This is the one place that decides, and both the preview and the drop
+    /// itself ask it, so what the overlay draws is what the drop does. Only
+    /// windows in the layout can be swapped or split, and an edge drop only
+    /// splits where the layout can express one: everywhere else it falls back
+    /// to a swap, and the preview shows the swap rather than a half that will
+    /// never happen.
+    fn drop_action_for(
+        &self,
+        dragged: WindowId,
+        target: WindowId,
+        cursor: CGPoint,
+    ) -> Option<crate::actor::drag_swap::DropAction> {
+        use crate::actor::drag_swap::DropAction;
         let engine = &self.layout_manager.layout_engine;
         if engine.is_window_floating(dragged) || engine.is_window_floating(target) {
             return None;
         }
-        let frame = self.state.windows.window(target).map(|w| w.frame_monotonic)?;
-        let cursor = window_server::current_cursor_location().ok()?;
+        let space = self.best_space_for_window_id(target)?;
+        if !engine.is_window_tiled(space, dragged) || !engine.is_window_tiled(space, target) {
+            return None;
+        }
+        let frame = self.state.windows.window(target)?.frame_monotonic;
+        Some(
+            match crate::actor::drag_swap::DragManager::drop_action(frame, cursor) {
+                DropAction::Insert(_) if !engine.can_insert_next_to(space) => DropAction::Swap,
+                action => action,
+            },
+        )
+    }
+
+    /// The screen and region a drop would land in, or `None` when the drop
+    /// would not rearrange anything.
+    fn drop_preview_region(
+        &self,
+        dragged: WindowId,
+        target: WindowId,
+        cursor: CGPoint,
+    ) -> Option<(CGRect, CGRect)> {
+        if !self.config.settings.ui.drop_overlay.enabled {
+            return None;
+        }
+        let action = self.drop_action_for(dragged, target, cursor)?;
+        let frame = self.state.windows.window(target)?.frame_monotonic;
+        // The region belongs to the target's display, not the cursor's. The
+        // two differ whenever the pointer crosses a display edge while the
+        // window it drags still overlaps a target on the first one, and
+        // drawing in the wrong display's window put the region wherever that
+        // display's origin happened to shift it.
         let screen = self
-            .space_state
-            .screens
-            .iter()
-            .find(|screen| screen.frame.contains(cursor))
+            .screen_for_point(frame.mid())
+            .or_else(|| self.screen_for_point(cursor))
             .map(|screen| screen.frame)?;
 
-        let region = match crate::actor::drag_swap::DragManager::drop_action(frame, cursor) {
+        let region = match action {
+            // A swap hands the dragged window exactly the target's place.
             crate::actor::drag_swap::DropAction::Swap => frame,
-            crate::actor::drag_swap::DropAction::Insert(direction) => half_of(frame, direction),
+            // A split reshapes the tree, so ask the layout where the window
+            // ends up; the target's half is only a guess for when it cannot
+            // say.
+            crate::actor::drag_swap::DropAction::Insert(direction) => self
+                .preview_insert_frame(target, direction, dragged)
+                .unwrap_or_else(|| half_of(frame, direction)),
         };
         Some((screen, region))
     }
 
-    fn hide_drop_region(&self) {
+    /// The frame `window` would be given after being inserted on the
+    /// `direction` side of `target`, laid out the way the real arrange pass
+    /// would do it: same screen, gaps and stack-line allowance.
+    fn preview_insert_frame(
+        &self,
+        target: WindowId,
+        direction: Direction,
+        window: WindowId,
+    ) -> Option<CGRect> {
+        let space = self.best_space_for_window_id(target)?;
+        let screen = self.space_state.screen_by_space(space)?;
+        let gaps = self
+            .config
+            .settings
+            .layout
+            .gaps
+            .effective_for_display(screen.display_uuid_owned().as_deref());
+        let stack_line = &self.config.settings.ui.stack_line;
+        self.layout_manager.layout_engine.preview_insert_next_to(
+            space,
+            target,
+            direction,
+            window,
+            screen.frame,
+            &gaps,
+            stack_line.thickness(),
+            stack_line.horiz_placement,
+            stack_line.vert_placement,
+        )
+    }
+
+    fn hide_drop_region(&mut self) {
+        if !std::mem::replace(&mut self.drag_manager.drop_overlay_shown, false) {
+            return;
+        }
         if let Some(tx) = &self.communication_manager.drop_overlay_tx {
             tx.send(crate::actor::drop_overlay::Event::Hide);
         }
     }
 
     fn maybe_swap_on_drag(&mut self, wid: WindowId, new_frame: CGRect) {
+        let cursor = window_server::current_cursor_location().ok();
+        self.evaluate_drop_target(wid, new_frame, cursor);
+    }
+
+    /// Decides what a drop of `wid` would do right now and shows it.
+    ///
+    /// The target is the tiled window under the pointer, as in yabai
+    /// (`window_manager_find_window_at_point`). It used to be chosen by how
+    /// much the dragged window's frame overlapped a candidate, while the drop
+    /// zone inside that target was chosen by the pointer — and the two
+    /// disagreed constantly. To reach the left edge of a full-width window the
+    /// pointer, on the title bar, has to carry the dragged window most of the
+    /// way off screen, at which point its overlap fell below the threshold and
+    /// there was no target at all. Which zones were reachable depended on the
+    /// window sizes, which is why the overlay seemed to come and go at random.
+    /// The pointer alone decides both, and the overlap scorer is only a
+    /// fallback for when the pointer cannot be read.
+    fn evaluate_drop_target(&mut self, wid: WindowId, new_frame: CGRect, cursor: Option<CGPoint>) {
         if !self.is_in_drag() {
             trace!(?wid, "Skipping swap: not in drag (mouse up received)");
             return;
@@ -4593,14 +4766,32 @@ impl Reactor {
             return;
         }
 
-        let candidates = self.collect_drag_swap_candidates(wid, space);
+        // A window that is not in the layout has no place to trade or split
+        // from, so nothing is a target for it; an empty candidate list clears
+        // any target it was given earlier.
+        let candidates = if self.layout_manager.layout_engine.is_window_tiled(space, wid) {
+            self.collect_drag_swap_candidates(wid, space)
+        } else {
+            Vec::new()
+        };
 
         let previous_pending = self.get_pending_drag_swap();
-        let new_candidate =
-            self.drag_manager.drag_swap_manager.on_frame_change(wid, new_frame, &candidates);
-        let active_target = self.drag_manager.drag_swap_manager.last_target();
+        let active_target = match cursor {
+            Some(cursor) => {
+                let under_cursor = candidates
+                    .iter()
+                    .find(|(_, frame)| frame.contains(cursor))
+                    .map(|(target, _)| *target);
+                self.drag_manager.drag_swap_manager.set_target(wid, new_frame, under_cursor);
+                under_cursor
+            }
+            None => {
+                self.drag_manager.drag_swap_manager.on_frame_change(wid, new_frame, &candidates);
+                self.drag_manager.drag_swap_manager.last_target()
+            }
+        };
         if let Some(target_wid) = active_target {
-            if new_candidate.is_some() || previous_pending != Some((wid, target_wid)) {
+            if previous_pending != Some((wid, target_wid)) {
                 trace!(
                     ?wid,
                     ?target_wid,
@@ -4608,7 +4799,10 @@ impl Reactor {
                 );
             }
 
-            self.preview_drop_region(wid, target_wid);
+            match cursor {
+                Some(cursor) => self.preview_drop_region(wid, target_wid, cursor),
+                None => self.hide_drop_region(),
+            }
 
             if let Some(session) = self.take_active_drag_session() {
                 self.drag_manager.drag_state =

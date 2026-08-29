@@ -97,15 +97,7 @@ impl DragManager {
         new_frame: CGRect,
         candidates: &[(WindowId, CGRect)],
     ) -> Option<WindowId> {
-        if self.dragged_window.is_none() {
-            self.dragged_window = Some(wid);
-            self.drag_origin_frame = Some(new_frame);
-            self.active_candidate = None;
-        } else if self.dragged_window != Some(wid) {
-            self.dragged_window = Some(wid);
-            self.drag_origin_frame = Some(new_frame);
-            self.active_candidate = None;
-        }
+        self.note_dragged(wid, new_frame);
 
         let dragged_area = new_frame.size.width * new_frame.size.height;
         if dragged_area <= 0.0 {
@@ -195,6 +187,24 @@ impl DragManager {
 
         self.active_candidate = None;
         None
+    }
+
+    /// Records the target outright, for a caller that has already decided
+    /// which window the pointer is over. No scoring or hysteresis: the pointer
+    /// is either inside a window or it is not.
+    pub fn set_target(&mut self, wid: WindowId, frame: CGRect, target: Option<WindowId>) {
+        self.note_dragged(wid, frame);
+        self.active_candidate = target.map(|window| ActiveCandidate { window });
+    }
+
+    /// Starts tracking `wid` if it is not the window already being dragged,
+    /// remembering where the drag began.
+    fn note_dragged(&mut self, wid: WindowId, frame: CGRect) {
+        if self.dragged_window != Some(wid) {
+            self.dragged_window = Some(wid);
+            self.drag_origin_frame = Some(frame);
+            self.active_candidate = None;
+        }
     }
 
     pub fn reset(&mut self) {

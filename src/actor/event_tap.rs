@@ -666,6 +666,12 @@ impl EventTap {
             CGEventType::RightMouseUp | CGEventType::LeftMouseUp => {
                 _ = self.events_tx.send(Event::MouseUp);
             }
+            // Thinned like plain mouse moves: a drop target only needs to
+            // follow the pointer at the rate the overlay can be redrawn.
+            CGEventType::LeftMouseDragged if self.admit_mouse_move(event) => {
+                let loc = CGEvent::location(Some(event));
+                _ = self.events_tx.send(Event::MouseDragged { x: loc.x, y: loc.y });
+            }
             _ => (),
         }
 

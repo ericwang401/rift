@@ -5201,3 +5201,396 @@ fn floating_window_toggles_to_fullscreen_within_gaps() {
         "expected {expected:?}, got {laid_out:?}"
     );
 }
+
+/// Two tiled windows side by side on one space, in the given layout mode.
+/// Returns the reactor, the two windows, the space and the second window's frame.
+fn reactor_with_two_tiled_windows(
+    mode: LayoutMode,
+) -> (Reactor, WindowId, WindowId, SpaceId, CGRect) {
+    let settings = crate::common::config::LayoutSettings {
+        mode,
+        ..crate::common::config::LayoutSettings::default()
+    };
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &settings,
+        None,
+    ));
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    reactor.add_test_app(1);
+    let workspace = reactor.test_workspace(space, 0);
+
+    let left = WindowId::new(1, 1);
+    let right = WindowId::new(1, 2);
+    let left_frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(720., 900.));
+    let right_frame = CGRect::new(CGPoint::new(720., 0.), CGSize::new(720., 900.));
+    for (wid, wsid, frame) in [(left, 101, left_frame), (right, 102, right_frame)] {
+        reactor.add_test_window(wid, WindowServerId::new(wsid), Some(space), frame);
+        assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+        assert!(reactor.layout_manager.layout_engine.is_window_tiled(space, wid));
+    }
+    (reactor, left, right, space, right_frame)
+}
+
+#[test]
+fn drag_swap_candidates_are_only_windows_in_the_layout() {
+    let (mut reactor, dragged, tiled, space, frame) =
+        reactor_with_two_tiled_windows(LayoutMode::Bsp);
+
+    // Tracked on the space but never given a workspace or a place in the
+    // layout, the way an app's popups and utility windows are. A window
+    // without an assignment counts as being in the active workspace, which
+    // used to be enough to make it a drop target.
+    let unassigned = WindowId::new(1, 3);
+    reactor.add_test_window(unassigned, WindowServerId::new(103), Some(space), frame);
+    assert!(
+        reactor.layout_manager.layout_engine.is_window_in_active_workspace(
+            &reactor.state.windows,
+            space,
+            unassigned
+        )
+    );
+
+    // Never admitted to the layout at all.
+    let unmanaged = WindowId::new(1, 4);
+    reactor.add_test_window_with_manageability(
+        unmanaged,
+        WindowServerId::new(104),
+        Some(space),
+        frame,
+        false,
+    );
+
+    let candidates: Vec<_> = reactor
+        .collect_drag_swap_candidates(dragged, space)
+        .into_iter()
+        .map(|(wid, _)| wid)
+        .collect();
+    assert_eq!(candidates, vec![tiled]);
+}
+
+#[test]
+fn drop_action_only_promises_a_split_the_layout_can_make() {
+    use crate::actor::drag_swap::DropAction;
+
+    // A point well inside the target's left edge triangle.
+    let (reactor, dragged, target, _space, frame) = reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let near_left_edge = CGPoint::new(frame.origin.x + 10., frame.mid().y);
+    assert_eq!(
+        reactor.drop_action_for(dragged, target, near_left_edge),
+        Some(DropAction::Insert(Direction::Left))
+    );
+    assert_eq!(
+        reactor.drop_action_for(dragged, target, frame.mid()),
+        Some(DropAction::Swap)
+    );
+
+    // The traditional layout cannot split a window, so the drop there swaps
+    // and the preview has to say so rather than draw a half.
+    let (reactor, dragged, target, _space, frame) =
+        reactor_with_two_tiled_windows(LayoutMode::Traditional);
+    let near_left_edge = CGPoint::new(frame.origin.x + 10., frame.mid().y);
+    assert_eq!(
+        reactor.drop_action_for(dragged, target, near_left_edge),
+        Some(DropAction::Swap)
+    );
+}
+
+#[test]
+fn drop_action_needs_both_windows_in_the_layout() {
+    let (mut reactor, dragged, target, space, frame) =
+        reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let stray = WindowId::new(1, 3);
+    reactor.add_test_window(stray, WindowServerId::new(103), Some(space), frame);
+
+    assert_eq!(reactor.drop_action_for(dragged, stray, frame.mid()), None);
+    assert_eq!(reactor.drop_action_for(stray, target, frame.mid()), None);
+}
+
+#[test]
+fn drop_overlay_is_taken_down_when_the_drag_ends_without_a_drop() {
+    let (mut reactor, dragged, target, space, _frame) =
+        reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let frame = reactor.state.windows.window(dragged).unwrap().frame_monotonic;
+    reactor.drag_manager.drag_state = DragState::PendingSwap {
+        session: DragSession {
+            window: dragged,
+            last_frame: frame,
+            origin_space: Some(space),
+            settled_space: Some(space),
+            layout_dirty: true,
+        },
+        target,
+    };
+    reactor.drag_manager.drop_overlay_shown = true;
+
+    // The target going away ends the pending drop inside a workflow that
+    // knows nothing about the overlay; the overlay still has to come down.
+    reactor.handle_event(Event::WindowDestroyed(target));
+    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+    assert!(!reactor.drag_manager.drop_overlay_shown);
+}
+
+#[test]
+fn drop_overlay_stays_while_the_drop_is_still_pending() {
+    let (mut reactor, dragged, target, space, _frame) =
+        reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let frame = reactor.state.windows.window(dragged).unwrap().frame_monotonic;
+    reactor.drag_manager.drag_state = DragState::PendingSwap {
+        session: DragSession {
+            window: dragged,
+            last_frame: frame,
+            origin_space: Some(space),
+            settled_space: Some(space),
+            layout_dirty: true,
+        },
+        target,
+    };
+    reactor.drag_manager.drop_overlay_shown = true;
+
+    // An unrelated event must not take it down.
+    reactor.handle_event(Event::WindowTitleChanged(target, "renamed".into()));
+    assert!(matches!(
+        reactor.drag_manager.drag_state,
+        DragState::PendingSwap { .. }
+    ));
+    assert!(reactor.drag_manager.drop_overlay_shown);
+}
+
+/// Two tiled windows, one above the other, with a drag session open on the
+/// top one. Returns the reactor, the two windows, the space and the bottom
+/// window's frame.
+fn reactor_dragging_top_of_two_stacked_windows() -> (Reactor, WindowId, WindowId, SpaceId, CGRect) {
+    let (mut reactor, top, bottom, space, _) = reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let top_frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 450.));
+    let bottom_frame = CGRect::new(CGPoint::new(0., 450.), CGSize::new(1440., 450.));
+    reactor.state.windows.window_mut(top).unwrap().frame_monotonic = top_frame;
+    reactor.state.windows.window_mut(bottom).unwrap().frame_monotonic = bottom_frame;
+    // Off by default; these tests are about when it is shown.
+    reactor.config.settings.ui.drop_overlay.enabled = true;
+    reactor.drag_manager.drag_state = DragState::Active {
+        session: DragSession {
+            window: top,
+            last_frame: top_frame,
+            origin_space: Some(space),
+            settled_space: Some(space),
+            layout_dirty: true,
+        },
+    };
+    (reactor, top, bottom, space, bottom_frame)
+}
+
+#[test]
+fn drop_target_is_the_tiled_window_under_the_pointer_regardless_of_overlap() {
+    use crate::actor::drag_swap::DropAction;
+    let (mut reactor, top, bottom, _space, bottom_frame) =
+        reactor_dragging_top_of_two_stacked_windows();
+
+    // The pointer is on the bottom window's left edge, with the full-width
+    // dragged window hanging mostly off the left of the screen: almost no
+    // overlap, which used to mean no target and no overlay.
+    let cursor = CGPoint::new(bottom_frame.origin.x + 20., bottom_frame.mid().y);
+    let dragged_frame = CGRect::new(CGPoint::new(-1300., 430.), CGSize::new(1440., 450.));
+    reactor.evaluate_drop_target(top, dragged_frame, Some(cursor));
+
+    assert_eq!(reactor.get_pending_drag_swap(), Some((top, bottom)));
+    assert!(reactor.drag_manager.drop_overlay_shown);
+    assert_eq!(
+        reactor.drop_action_for(top, bottom, cursor),
+        Some(DropAction::Insert(Direction::Left))
+    );
+}
+
+#[test]
+fn no_drop_target_while_the_pointer_is_over_the_dragged_windows_own_slot() {
+    let (mut reactor, top, bottom, _space, bottom_frame) =
+        reactor_dragging_top_of_two_stacked_windows();
+
+    // Nudged down so it overlaps the bottom window heavily, but the pointer
+    // is still in the top slot: that is not a drop on anything.
+    let cursor = CGPoint::new(720., 100.);
+    let dragged_frame = CGRect::new(CGPoint::new(0., 300.), CGSize::new(1440., 450.));
+    assert!(dragged_frame.intersection(&bottom_frame).size.height > 250.);
+    reactor.evaluate_drop_target(top, dragged_frame, Some(cursor));
+
+    assert_eq!(reactor.get_pending_drag_swap(), None);
+    assert!(matches!(
+        reactor.drag_manager.drag_state,
+        DragState::Active { .. }
+    ));
+    assert!(!reactor.drag_manager.drop_overlay_shown);
+    let _ = bottom;
+}
+
+#[test]
+fn leaving_the_target_clears_the_pending_drop_and_the_overlay() {
+    let (mut reactor, top, bottom, _space, bottom_frame) =
+        reactor_dragging_top_of_two_stacked_windows();
+    let dragged_frame = CGRect::new(CGPoint::new(0., 300.), CGSize::new(1440., 450.));
+
+    reactor.evaluate_drop_target(top, dragged_frame, Some(bottom_frame.mid()));
+    assert_eq!(reactor.get_pending_drag_swap(), Some((top, bottom)));
+    assert!(reactor.drag_manager.drop_overlay_shown);
+
+    reactor.evaluate_drop_target(top, dragged_frame, Some(CGPoint::new(720., 100.)));
+    assert_eq!(reactor.get_pending_drag_swap(), None);
+    assert!(matches!(
+        reactor.drag_manager.drag_state,
+        DragState::Active { .. }
+    ));
+    assert!(!reactor.drag_manager.drop_overlay_shown);
+}
+
+#[test]
+fn pointer_samples_during_a_drag_re_evaluate_the_drop_target() {
+    let (mut reactor, top, bottom, _space, bottom_frame) =
+        reactor_dragging_top_of_two_stacked_windows();
+    let mid = bottom_frame.mid();
+    reactor.handle_event(Event::MouseDragged { x: mid.x, y: mid.y });
+    assert_eq!(reactor.get_pending_drag_swap(), Some((top, bottom)));
+    assert!(reactor.drag_manager.drop_overlay_shown);
+
+    reactor.handle_event(Event::MouseDragged { x: 720., y: 100. });
+    assert_eq!(reactor.get_pending_drag_swap(), None);
+    assert!(!reactor.drag_manager.drop_overlay_shown);
+}
+
+#[test]
+fn split_preview_is_where_the_window_lands_not_half_of_the_target() {
+    let (reactor, left, right, space, _) = reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let screen = reactor.space_state.screen_by_space(space).unwrap().frame;
+    let preview = |target: WindowId, direction: Direction| {
+        reactor.preview_insert_frame(target, direction, right)
+    };
+
+    // Dropping the right window on the left one's right edge yields the
+    // layout it started from: the preview must be the right half of the
+    // screen, which is where the window already is — not the right half of
+    // the left window.
+    let same_place = preview(left, Direction::Right).expect("bsp can split");
+    assert!(
+        same_place.origin.x >= screen.mid().x - 1.0 && same_place.size.width > 600.,
+        "expected the right half of the screen, got {same_place:?}"
+    );
+
+    // Dropping it below the left window instead splits the whole screen
+    // top/bottom: full width, bottom half.
+    let below = preview(left, Direction::Down).expect("bsp can split");
+    assert!(below.size.width > 1200., "full width, got {below:?}");
+    assert!(
+        below.origin.y >= screen.mid().y - 1.0,
+        "bottom half, got {below:?}"
+    );
+
+    // The simulation must not have touched the real tree.
+    assert!(reactor.layout_manager.layout_engine.is_window_tiled(space, left));
+    assert!(reactor.layout_manager.layout_engine.is_window_tiled(space, right));
+}
+
+#[test]
+fn a_drop_on_a_target_lands_in_the_targets_space_however_the_window_hangs_over() {
+    // Two displays stacked vertically, each with its own space.
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &crate::common::config::LayoutSettings {
+            mode: LayoutMode::Bsp,
+            ..crate::common::config::LayoutSettings::default()
+        },
+        None,
+    ));
+    let top = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+    let bottom = CGRect::new(CGPoint::new(0., 900.), CGSize::new(1440., 900.));
+    let (space1, space2) = (SpaceId::new(1), SpaceId::new(2));
+    reactor.handle_event(space_state_event(
+        vec![top, bottom],
+        vec![Some(space1), Some(space2)],
+    ));
+    reactor.add_test_app(1);
+    let workspace = reactor.test_workspace(space1, 0);
+    let _ = reactor.test_workspace_ids(space2);
+
+    let left = WindowId::new(1, 1);
+    let dragged = WindowId::new(1, 2);
+    let left_frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(720., 900.));
+    let right_frame = CGRect::new(CGPoint::new(720., 0.), CGSize::new(720., 900.));
+    for (wid, wsid, frame) in [(left, 101, left_frame), (dragged, 102, right_frame)] {
+        reactor.add_test_window(wid, WindowServerId::new(wsid), Some(space1), frame);
+        assert!(reactor.assign_test_window_to_workspace(space1, wid, workspace));
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space1, wid));
+    }
+
+    // Dropped low on the top display, the window straddles the seam and the
+    // drag believes it has settled on the lower display.
+    let hanging = CGRect::new(CGPoint::new(100., 700.), CGSize::new(720., 900.));
+    reactor.state.windows.window_mut(dragged).unwrap().frame_monotonic = hanging;
+    reactor.drag_manager.drag_state = DragState::PendingSwap {
+        session: DragSession {
+            window: dragged,
+            last_frame: hanging,
+            origin_space: Some(space1),
+            settled_space: Some(space2),
+            layout_dirty: true,
+        },
+        target: left,
+    };
+    reactor.handle_event(Event::MouseUp);
+
+    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+    let engine = &reactor.layout_manager.layout_engine;
+    assert!(
+        engine.is_window_tiled(space1, dragged),
+        "still tiled where it was dropped"
+    );
+    assert!(
+        !engine.is_window_tiled(space2, dragged),
+        "not moved to the display it hung over"
+    );
+    assert_eq!(reactor.assigned_space_for_window_id(dragged), Some(space1));
+}
+
+#[test]
+fn a_window_that_refuses_its_size_is_given_at_least_that_size() {
+    let (mut reactor, left, right, space, _) = reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    let screen = reactor.space_state.screen_by_space(space).unwrap().frame;
+    let gaps = reactor.config.settings.layout.gaps.effective_for_display(None);
+    let widths = |reactor: &mut Reactor| -> (f64, f64) {
+        let frames: std::collections::HashMap<_, _> = reactor
+            .layout_manager
+            .layout_engine
+            .calculate_layout(space, screen, &gaps, 0.0, Default::default(), Default::default())
+            .into_iter()
+            .collect();
+        (frames[&left].size.width, frames[&right].size.width)
+    };
+    let (l0, r0) = widths(&mut reactor);
+    assert!((l0 - r0).abs() < 1.0, "starts even: {l0} vs {r0}");
+
+    // Asked for its half, it came back a thousand wide.
+    let learnt = reactor.layout_manager.layout_engine.note_observed_min_size(
+        right,
+        CGSize::new(r0, 900.),
+        CGSize::new(1000., 900.),
+    );
+    assert!(learnt);
+    let (l1, r1) = widths(&mut reactor);
+    assert!(r1 >= 999.0, "slot grows to the refused size: {r1}");
+    assert!(l1 < l0, "the neighbour gives way: {l1}");
+
+    // Nothing new to learn from the same refusal, so no further arranges.
+    assert!(!reactor.layout_manager.layout_engine.note_observed_min_size(
+        right,
+        CGSize::new(r1, 900.),
+        CGSize::new(1000., 900.),
+    ));
+
+    // Seen at 600 wide, the minimum was wrong and comes down.
+    reactor
+        .layout_manager
+        .layout_engine
+        .relax_observed_min_size(right, CGSize::new(600., 900.));
+    let (l2, r2) = widths(&mut reactor);
+    assert!((l2 - r2).abs() < 1.0, "even again: {l2} vs {r2}");
+}

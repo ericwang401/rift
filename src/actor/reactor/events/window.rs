@@ -1,4 +1,4 @@
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use tracing::{debug, trace};
 
 use crate::actor::app::WindowId;
@@ -196,6 +196,12 @@ pub struct WindowFrameChangedPayload {
 
 pub enum FrameChangeDisposition {
     Handled,
+    /// The window acknowledged a frame write but came back bigger than asked:
+    /// it has a minimum size it did not tell anyone about.
+    HandledRefusedSize {
+        requested: CGSize,
+        observed: CGSize,
+    },
     NeedsGeometryAnalysis,
 }
 
@@ -243,7 +249,16 @@ pub fn classify_window_frame_change(
             if let Some(window) = state.windows.window_mut(wid) {
                 window.frame_monotonic = new_frame;
             }
-            return FrameChangeDisposition::Handled;
+            let refused = new_frame.size.width > target.size.width + 1.0
+                || new_frame.size.height > target.size.height + 1.0;
+            return if refused {
+                FrameChangeDisposition::HandledRefusedSize {
+                    requested: target.size,
+                    observed: new_frame.size,
+                }
+            } else {
+                FrameChangeDisposition::Handled
+            };
         }
     }
     if requested {

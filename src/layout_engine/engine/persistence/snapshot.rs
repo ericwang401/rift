@@ -67,6 +67,7 @@ impl PersistedLayout {
             app_rules: AppRuleEngine::default(),
             focused_window: None,
             window_layout_constraints: HashMap::default(),
+            observed_min_sizes: HashMap::default(),
             virtual_workspace_manager: self.virtual_workspace_manager,
             layout_settings: LayoutSettings::default(),
             broadcast_tx: None,

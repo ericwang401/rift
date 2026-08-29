@@ -154,6 +154,10 @@ pub struct LayoutEngine {
     app_rules: AppRuleEngine,
     focused_window: Option<WindowId>,
     window_layout_constraints: HashMap<WindowId, WindowLayoutConstraints>,
+    /// Sizes windows have refused to go below when asked. Few apps publish a
+    /// minimum size, but most enforce one, and a window asked for less than
+    /// it will accept simply stays larger — and lies over its neighbour.
+    observed_min_sizes: HashMap<WindowId, CGSize>,
     virtual_workspace_manager: WorkspaceStore,
     layout_settings: LayoutSettings,
     broadcast_tx: Option<BroadcastSender>,
@@ -1073,6 +1077,7 @@ impl LayoutEngine {
             self.focused_window = None;
         }
         self.window_layout_constraints.remove(&wid);
+        self.observed_min_sizes.remove(&wid);
 
         if let Some(space) = removal.active_space {
             self.broadcast_windows_changed(window_store, space);
@@ -1365,6 +1370,7 @@ impl LayoutEngine {
             app_rules: AppRuleEngine::new(&virtual_workspace_config.app_rules),
             focused_window: None,
             window_layout_constraints: HashMap::default(),
+            observed_min_sizes: HashMap::default(),
             virtual_workspace_manager,
             layout_settings: layout_settings.clone(),
             broadcast_tx,
@@ -1557,14 +1563,19 @@ impl LayoutEngine {
                         min_size,
                         max_size,
                     ) = info;
+                    let observed = self.observed_min_sizes.get(&wid).copied();
                     self.window_layout_constraints.insert(
                         wid,
                         WindowLayoutConstraints {
                             is_resizable,
                             locked_width: size_hint.width,
                             locked_height: size_hint.height,
-                            min_width: min_size.map_or(0.0, |s| s.width),
-                            min_height: min_size.map_or(0.0, |s| s.height),
+                            min_width: min_size
+                                .map_or(0.0, |s| s.width)
+                                .max(observed.map_or(0.0, |s| s.width)),
+                            min_height: min_size
+                                .map_or(0.0, |s| s.height)
+                                .max(observed.map_or(0.0, |s| s.height)),
                             max_width: max_size.map_or(0.0, |s| s.width),
                             max_height: max_size.map_or(0.0, |s| s.height),
                         }
@@ -1651,6 +1662,7 @@ impl LayoutEngine {
                 }
                 self.floating.remove_all_for_pid(pid);
                 self.window_layout_constraints.retain(|wid, _| wid.pid != pid);
+                self.observed_min_sizes.retain(|wid, _| wid.pid != pid);
                 self.forget_persisted_app(pid);
 
                 self.virtual_workspace_manager.remove_windows_for_app(window_store, pid);
@@ -3216,6 +3228,129 @@ impl LayoutEngine {
             self.workspace_layouts.mark_last_saved(space, ws_id, layout);
         }
         inserted
+    }
+
+    /// Whether the active layout on `space` can split a window for a drop on
+    /// its edge. Only the tree layouts can; everywhere else such a drop swaps.
+    pub fn can_insert_next_to(&self, space: SpaceId) -> bool {
+        self.workspace_and_layout(space)
+            .is_some_and(|(ws_id, _)| self.workspace_tree(ws_id).can_insert_next_to())
+    }
+
+    /// Where `window` would be laid out after a drop that splits `target` and
+    /// puts it on the `direction` side, found by making the change on a copy
+    /// of the layout and laying that out.
+    ///
+    /// Half of the target's current frame is not the answer. The dragged
+    /// window leaves the tree before the split and its old slot collapses
+    /// into whatever it was split from, so the target's frame at the moment
+    /// of the split is not the one on screen. With two windows side by side,
+    /// dropping the right one onto the left one's right edge produces the very
+    /// layout it started from — and drawing the left window's right half
+    /// promised a change that never came.
+    #[allow(clippy::too_many_arguments)]
+    pub fn preview_insert_next_to(
+        &self,
+        space: SpaceId,
+        target: WindowId,
+        direction: Direction,
+        window: WindowId,
+        screen: CGRect,
+        gaps: &crate::common::config::GapSettings,
+        stack_line_thickness: f64,
+        stack_line_horiz: crate::common::config::HorizontalPlacement,
+        stack_line_vert: crate::common::config::VerticalPlacement,
+    ) -> Option<CGRect> {
+        let (ws_id, layout) = self.workspace_and_layout(space)?;
+        // The systems are persisted through serde, so a round trip through
+        // the same format is a faithful deep copy; nothing else clones a tree
+        // with its structure intact (`clone_layout` re-adds the windows one
+        // by one). RON rather than JSON because the trees key maps by window.
+        let copy = ron::to_string(self.workspace_tree(ws_id)).ok()?;
+        let mut copy: LayoutSystemKind = ron::from_str(&copy).ok()?;
+        if !copy.insert_window_next_to(layout, target, direction, window) {
+            return None;
+        }
+        copy.calculate_layout(
+            layout,
+            screen,
+            self.layout_settings.stack.stack_offset,
+            &self.window_layout_constraints,
+            gaps,
+            stack_line_thickness,
+            stack_line_horiz,
+            stack_line_vert,
+        )
+        .into_iter()
+        .find(|(wid, _)| *wid == window)
+        .map(|(_, frame)| frame)
+    }
+
+    /// Records that `window`, asked to be `requested`, came back `observed`
+    /// instead: whichever axis it would not shrink on is now its minimum, and
+    /// the layout stops asking for less. Returns whether anything was learnt,
+    /// which is the cue to lay out again so the neighbour gives up the space
+    /// the window was never going to.
+    pub fn note_observed_min_size(
+        &mut self,
+        window: WindowId,
+        requested: CGSize,
+        observed: CGSize,
+    ) -> bool {
+        let entry = self.observed_min_sizes.entry(window).or_insert(CGSize::new(0.0, 0.0));
+        let mut grew = false;
+        if observed.width > requested.width + 1.0 && observed.width > entry.width + 0.5 {
+            entry.width = observed.width;
+            grew = true;
+        }
+        if observed.height > requested.height + 1.0 && observed.height > entry.height + 0.5 {
+            entry.height = observed.height;
+            grew = true;
+        }
+        let entry = *entry;
+        if grew {
+            // A window the discovery pass has not described yet still gets
+            // its minimum; discovery merges the record in when it does.
+            let constraints =
+                self.window_layout_constraints.entry(window).or_insert(WindowLayoutConstraints {
+                    is_resizable: true,
+                    ..WindowLayoutConstraints::default()
+                });
+            constraints.min_width = constraints.min_width.max(entry.width);
+            constraints.min_height = constraints.min_height.max(entry.height);
+        }
+        grew
+    }
+
+    /// A window seen at `size` can evidently be that size, so a recorded
+    /// minimum above it was wrong — an app's minimum can change with its
+    /// content — and comes down to match.
+    pub fn relax_observed_min_size(&mut self, window: WindowId, size: CGSize) {
+        let Some(entry) = self.observed_min_sizes.get_mut(&window) else {
+            return;
+        };
+        let mut changed = false;
+        if size.width + 0.5 < entry.width {
+            entry.width = size.width;
+            changed = true;
+        }
+        if size.height + 0.5 < entry.height {
+            entry.height = size.height;
+            changed = true;
+        }
+        let entry = *entry;
+        if changed && let Some(constraints) = self.window_layout_constraints.get_mut(&window) {
+            constraints.min_width = constraints.min_width.min(entry.width);
+            constraints.min_height = constraints.min_height.min(entry.height);
+        }
+    }
+
+    /// Whether `window` is part of the active layout on `space`: tiled, as
+    /// opposed to merely tracked, floating, minimized, or assigned elsewhere.
+    pub fn is_window_tiled(&self, space: SpaceId, window: WindowId) -> bool {
+        self.workspace_and_layout(space).is_some_and(|(ws_id, layout)| {
+            self.workspace_tree(ws_id).contains_window(layout, window)
+        })
     }
 
     pub fn store_floating_position(

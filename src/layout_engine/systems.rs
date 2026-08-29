@@ -188,6 +188,12 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
         false
     }
 
+    /// Whether `insert_window_next_to` can succeed here at all, so a drop
+    /// preview only promises a split the layout is able to make.
+    fn can_insert_next_to(&self) -> bool {
+        false
+    }
+
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction);
     fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
         self.join_selection_with_direction(layout, direction);

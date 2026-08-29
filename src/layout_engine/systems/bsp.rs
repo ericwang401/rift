@@ -517,7 +517,9 @@ impl BspLayoutSystem {
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
         out: &mut Vec<(WindowId, CGRect)>,
+        nodes: &mut Vec<(NodeId, CGRect)>,
     ) {
+        nodes.push((node, rect));
         match self.kind.get(node) {
             Some(NodeKind::Leaf {
                 window,
@@ -612,10 +614,26 @@ impl BspLayoutSystem {
                     );
                     let mut it = node.children(&self.tree.map);
                     if let Some(first) = it.next() {
-                        self.calculate_layout_recursive(first, r1, screen, constraints, gaps, out);
+                        self.calculate_layout_recursive(
+                            first,
+                            r1,
+                            screen,
+                            constraints,
+                            gaps,
+                            out,
+                            nodes,
+                        );
                     }
                     if let Some(second) = it.next() {
-                        self.calculate_layout_recursive(second, r2, screen, constraints, gaps, out);
+                        self.calculate_layout_recursive(
+                            second,
+                            r2,
+                            screen,
+                            constraints,
+                            gaps,
+                            out,
+                            nodes,
+                        );
                     }
                 }
                 Orientation::Vertical => {
@@ -667,10 +685,26 @@ impl BspLayoutSystem {
                     );
                     let mut it = node.children(&self.tree.map);
                     if let Some(first) = it.next() {
-                        self.calculate_layout_recursive(first, r1, screen, constraints, gaps, out);
+                        self.calculate_layout_recursive(
+                            first,
+                            r1,
+                            screen,
+                            constraints,
+                            gaps,
+                            out,
+                            nodes,
+                        );
                     }
                     if let Some(second) = it.next() {
-                        self.calculate_layout_recursive(second, r2, screen, constraints, gaps, out);
+                        self.calculate_layout_recursive(
+                            second,
+                            r2,
+                            screen,
+                            constraints,
+                            gaps,
+                            out,
+                            nodes,
+                        );
                     }
                 }
             },
@@ -840,6 +874,118 @@ mod tests {
         system.draw_tree(layout).lines().map(|line| line.trim().to_string()).collect()
     }
 
+    /// Three windows in a row, laid out on `screen` with no gaps, returned
+    /// left to right as (window, frame).
+    fn three_in_a_row(screen: CGRect) -> (BspLayoutSystem, LayoutId, Vec<(WindowId, CGRect)>) {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        for idx in 1..=3 {
+            system.add_window_after_selection(layout, w(idx));
+        }
+        // Whatever shape adding produced, make the splits all horizontal so
+        // the windows sit side by side.
+        for node in system.nodes_in_layout(layout) {
+            if let Some(NodeKind::Split { orientation, .. }) = system.kind.get_mut(node) {
+                *orientation = Orientation::Horizontal;
+            }
+        }
+        system.rebalance(layout);
+        let frames = row(&system, layout, screen);
+        (system, layout, frames)
+    }
+
+    fn row(system: &BspLayoutSystem, layout: LayoutId, screen: CGRect) -> Vec<(WindowId, CGRect)> {
+        let gaps = crate::common::config::GapSettings::default();
+        let mut frames = system.calculate_layout(
+            layout,
+            screen,
+            0.0,
+            &HashMap::default(),
+            &gaps,
+            0.0,
+            Default::default(),
+            Default::default(),
+        );
+        frames.sort_by(|a, b| a.1.origin.x.partial_cmp(&b.1.origin.x).unwrap());
+        frames
+    }
+
+    #[test]
+    fn balance_gives_a_row_of_three_equal_thirds() {
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1200.0, 800.0));
+        let (_, _, frames) = three_in_a_row(screen);
+        let widths: Vec<f64> = frames.iter().map(|(_, f)| f.size.width).collect();
+        for width in &widths {
+            assert!(
+                (width - widths[0]).abs() < 1.0,
+                "expected equal widths, got {widths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dragging_the_left_edge_of_the_middle_window_moves_only_that_boundary() {
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1200.0, 800.0));
+        let (mut system, layout, before) = three_in_a_row(screen);
+        let gaps = crate::common::config::GapSettings::default();
+        let (middle, old) = before[1];
+
+        // Left edge 100 to the left, right edge where it was.
+        let new = CGRect::new(
+            CGPoint::new(old.origin.x - 100.0, old.origin.y),
+            CGSize::new(old.size.width + 100.0, old.size.height),
+        );
+        system.on_window_resized(layout, middle, old, new, screen, &gaps);
+
+        let after = row(&system, layout, screen);
+        let find =
+            |frames: &[(WindowId, CGRect)], wid| frames.iter().find(|(w, _)| *w == wid).unwrap().1;
+        let middle_after = find(&after, middle);
+        assert!(
+            (middle_after.origin.x - new.origin.x).abs() < 1.0,
+            "left edge should follow the drag: {middle_after:?} vs {new:?}"
+        );
+        assert!(
+            (middle_after.max().x - old.max().x).abs() < 1.0,
+            "right edge must stay put: {middle_after:?} vs {old:?}"
+        );
+        let (right, right_before) = before[2];
+        let right_after = find(&after, right);
+        assert!(
+            (right_after.size.width - right_before.size.width).abs() < 1.0,
+            "the window on the far side must not change: {right_after:?} vs {right_before:?}"
+        );
+        let (left, left_before) = before[0];
+        assert!(
+            (find(&after, left).size.width - (left_before.size.width - 100.0)).abs() < 1.0,
+            "the neighbour across the boundary gives up the space"
+        );
+    }
+
+    #[test]
+    fn dragging_the_right_edge_of_the_middle_window_moves_only_that_boundary() {
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1200.0, 800.0));
+        let (mut system, layout, before) = three_in_a_row(screen);
+        let gaps = crate::common::config::GapSettings::default();
+        let (middle, old) = before[1];
+        let new = CGRect::new(old.origin, CGSize::new(old.size.width + 100.0, old.size.height));
+        system.on_window_resized(layout, middle, old, new, screen, &gaps);
+
+        let after = row(&system, layout, screen);
+        let find =
+            |frames: &[(WindowId, CGRect)], wid| frames.iter().find(|(w, _)| *w == wid).unwrap().1;
+        let middle_after = find(&after, middle);
+        assert!(
+            (middle_after.origin.x - old.origin.x).abs() < 1.0,
+            "left edge stays: {middle_after:?}"
+        );
+        assert!(
+            (middle_after.max().x - new.max().x).abs() < 1.0,
+            "right edge follows: {middle_after:?}"
+        );
+        assert!((find(&after, before[0].0).size.width - before[0].1.size.width).abs() < 1.0);
+    }
+
     fn two_window_layout() -> (BspLayoutSystem, LayoutId) {
         let mut system = BspLayoutSystem::default();
         let layout = system.create_layout();
@@ -906,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn balance_resets_every_split_to_an_even_share() {
+    fn balance_shares_each_split_by_the_windows_on_each_side() {
         let mut system = BspLayoutSystem::default();
         let layout = system.create_layout();
         for id in 1..=4 {
@@ -925,15 +1071,24 @@ mod tests {
 
         system.rebalance(layout);
 
-        let uneven: Vec<String> = system
+        // Even means each split shares by how many windows sit on each side
+        // along its axis, as yabai's `window_node_equalize` does — not every
+        // split a half. The tree is `1 | (2 / (3 | 4))`: the root has one
+        // window on the left and two side by side on the right, so it splits
+        // a third to two thirds; the others are one against one.
+        let ratios: Vec<String> = system
             .draw_tree(layout)
             .lines()
-            .filter(|line| line.contains("Split") && !line.contains("0.50"))
-            .map(str::to_string)
+            .filter(|line| line.contains("Split"))
+            .map(|line| line.trim().to_string())
             .collect();
-        assert!(
-            uneven.is_empty(),
-            "splits left uneven after balancing: {uneven:?}"
+        assert_eq!(
+            ratios,
+            [
+                "Split Horizontal 0.33",
+                "Split Vertical 0.50",
+                "Split Horizontal 0.50"
+            ]
         );
     }
 
@@ -1208,6 +1363,176 @@ mod tests {
     }
 }
 
+impl BspLayoutSystem {
+    /// The rectangle every node of `layout` occupies, split containers
+    /// included, as the layout pass would place them.
+    fn node_rects(
+        &self,
+        layout: LayoutId,
+        screen: CGRect,
+        gaps: &crate::common::config::GapSettings,
+    ) -> HashMap<NodeId, CGRect> {
+        let mut nodes = Vec::new();
+        if let Some(state) = self.layouts.get(layout).copied() {
+            let rect = Self::apply_outer_gaps(screen, gaps);
+            let mut out = Vec::new();
+            self.calculate_layout_recursive(
+                state.root,
+                rect,
+                screen,
+                &HashMap::default(),
+                gaps,
+                &mut out,
+                &mut nodes,
+            );
+        }
+        nodes.into_iter().collect()
+    }
+
+    /// Moves the boundary on one side of `leaf` to `position`, an absolute
+    /// coordinate along the split axis.
+    ///
+    /// The boundary belongs to the nearest ancestor split of that orientation
+    /// where the subtree containing `leaf` sits on the near side: for a left
+    /// or top edge that is the split where it is the second child, for a
+    /// right or bottom edge the one where it is the first. A window in the
+    /// middle of a row has each of its edges owned by a different split, and
+    /// resizing by size alone always found the same one, so dragging its left
+    /// edge moved its right edge instead.
+    fn move_edge_to(
+        &mut self,
+        rects: &HashMap<NodeId, CGRect>,
+        leaf: NodeId,
+        horizontal: bool,
+        near_side: bool,
+        position: f64,
+        gap: f64,
+    ) {
+        let mut current = leaf;
+        while let Some(parent) = current.parent(&self.tree.map) {
+            let is_first = Some(current) == parent.first_child(&self.tree.map);
+            let owns_edge = matches!(
+                self.kind.get(parent),
+                Some(NodeKind::Split { orientation, .. })
+                    if (*orientation == Orientation::Horizontal) == horizontal
+            ) && is_first != near_side;
+            if !owns_edge {
+                current = parent;
+                continue;
+            }
+            let Some(rect) = rects.get(&parent) else {
+                return;
+            };
+            let (origin, total) = if horizontal {
+                (rect.origin.x, rect.size.width)
+            } else {
+                (rect.origin.y, rect.size.height)
+            };
+            let available = total - gap;
+            if available <= 0.0 {
+                return;
+            }
+            // The first child runs from the container's origin to the
+            // boundary; the second starts a gap after it.
+            let first_len = if near_side {
+                position - origin - gap
+            } else {
+                position - origin
+            };
+            let ratio = (first_len / available).clamp(0.05, 0.95) as f32;
+            if let Some(NodeKind::Split { ratio: r, .. }) = self.kind.get_mut(parent) {
+                *r = ratio;
+            }
+
+            // The subtree on the near side of that boundary has just been
+            // given a different extent, and its own splits are ratios of it,
+            // so every boundary inside it would slide along. The user dragged
+            // one edge; the others stay where they were on screen, which
+            // means re-deriving each ratio on the way back down to the leaf
+            // from the boundary's old absolute position.
+            let first_len = f64::from(ratio) * available;
+            let mut interval = if near_side {
+                (origin + first_len + gap, available - first_len)
+            } else {
+                (origin, first_len)
+            };
+            let mut path = vec![leaf];
+            while *path.last().unwrap() != current {
+                let up =
+                    path.last().unwrap().parent(&self.tree.map).expect("leaf lies under current");
+                path.push(up);
+            }
+            for pair in path.windows(2).rev() {
+                let (split, child) = (pair[1], pair[0]);
+                let Some(NodeKind::Split { orientation, .. }) = self.kind.get(split).cloned()
+                else {
+                    continue;
+                };
+                if (orientation == Orientation::Horizontal) != horizontal {
+                    continue;
+                }
+                let is_first = Some(child) == split.first_child(&self.tree.map);
+                let (Some(first), Some(split_rect)) = (
+                    split.first_child(&self.tree.map).and_then(|n| rects.get(&n)),
+                    rects.get(&split),
+                ) else {
+                    return;
+                };
+                let (split_origin, first_old) = if horizontal {
+                    (split_rect.origin.x, first.size.width)
+                } else {
+                    (split_rect.origin.y, first.size.height)
+                };
+                let boundary = split_origin + first_old;
+                let available = interval.1 - gap;
+                if available <= 0.0 {
+                    return;
+                }
+                let ratio = ((boundary - interval.0) / available).clamp(0.05, 0.95) as f32;
+                if let Some(NodeKind::Split { ratio: r, .. }) = self.kind.get_mut(split) {
+                    *r = ratio;
+                }
+                let first_len = f64::from(ratio) * available;
+                interval = if is_first {
+                    (interval.0, first_len)
+                } else {
+                    (interval.0 + first_len + gap, available - first_len)
+                };
+            }
+            return;
+        }
+    }
+
+    /// Gives every leaf under `node` an equal share along each axis, the way
+    /// yabai's `space --balance` does (`window_node_equalize`).
+    ///
+    /// Returns how many leaves the subtree lays side by side horizontally and
+    /// vertically. A split along an axis adds its children's counts on that
+    /// axis and keeps the larger on the other, and its ratio is the first
+    /// child's share of the sum: three windows in a row split 1:2 at the
+    /// root and 1:1 below, which is thirds. Setting every ratio to a half
+    /// gave the first window half the screen and the other two a quarter.
+    fn equalize(&mut self, node: NodeId) -> (f64, f64) {
+        let Some(NodeKind::Split { orientation, .. }) = self.kind.get(node).cloned() else {
+            return (1.0, 1.0);
+        };
+        let children: Vec<NodeId> = node.children(&self.tree.map).collect();
+        let [first, second] = children[..] else {
+            return (1.0, 1.0);
+        };
+        let (fx, fy) = self.equalize(first);
+        let (sx, sy) = self.equalize(second);
+        let (ratio, weights) = match orientation {
+            Orientation::Horizontal => (fx / (fx + sx), (fx + sx, fy.max(sy))),
+            Orientation::Vertical => (fy / (fy + sy), (fx.max(sx), fy + sy)),
+        };
+        if let Some(NodeKind::Split { ratio: r, .. }) = self.kind.get_mut(node) {
+            *r = ratio as f32;
+        }
+        weights
+    }
+}
+
 impl LayoutSystem for BspLayoutSystem {
     /// A quarter turn is a swap plus an axis flip, applied to every split.
     ///
@@ -1392,7 +1717,16 @@ impl LayoutSystem for BspLayoutSystem {
         let mut out = Vec::new();
         if let Some(state) = self.layouts.get(layout).copied() {
             let rect = Self::apply_outer_gaps(screen, gaps);
-            self.calculate_layout_recursive(state.root, rect, screen, constraints, gaps, &mut out);
+            let mut nodes = Vec::new();
+            self.calculate_layout_recursive(
+                state.root,
+                rect,
+                screen,
+                constraints,
+                gaps,
+                &mut out,
+                &mut nodes,
+            );
         }
         out
     }
@@ -1678,50 +2012,34 @@ impl LayoutSystem for BspLayoutSystem {
                     return;
                 }
 
-                let mut current = node;
-                while let Some(parent) = current.parent(&self.tree.map) {
-                    let Some(NodeKind::Split { orientation, ratio }) = self.kind.get_mut(parent)
-                    else {
-                        current = parent;
-                        continue;
-                    };
-
-                    let (old_len, new_len) = match orientation {
-                        Orientation::Horizontal if width_changed => {
-                            (old_frame.size.width, new_frame.size.width)
-                        }
-                        Orientation::Vertical if height_changed => {
-                            (old_frame.size.height, new_frame.size.height)
-                        }
-                        _ => {
-                            current = parent;
-                            continue;
-                        }
-                    };
-
-                    let current_ratio = f64::from(*ratio);
-                    let is_first = Some(current) == parent.first_child(&self.tree.map);
-                    let denom = if is_first {
-                        current_ratio
+                // Which edges moved says which boundaries to move; the new
+                // frame says where to. Working from absolute edge positions
+                // rather than size deltas means a stale `old_frame` — the app
+                // not having reported the last arrange yet — cannot make the
+                // change accumulate.
+                let moved = |a: f64, b: f64| (a - b).abs() > 0.5;
+                let rects = self.node_rects(layout, screen, gaps);
+                if width_changed {
+                    let left = moved(new_frame.origin.x, old_frame.origin.x);
+                    let right = moved(new_frame.max().x, old_frame.max().x);
+                    let gap = gaps.inner.horizontal as f64;
+                    // Both moving is a resize about the centre; treat it as
+                    // the far edge, which is what a plain size change was.
+                    if left && !right {
+                        self.move_edge_to(&rects, node, true, true, new_frame.origin.x, gap);
                     } else {
-                        1.0 - current_ratio
-                    };
-                    if old_len <= 0.0 || denom <= f64::EPSILON {
-                        break;
+                        self.move_edge_to(&rects, node, true, false, new_frame.max().x, gap);
                     }
-
-                    let parent_len = old_len / denom;
-                    if parent_len <= 0.0 {
-                        break;
-                    }
-
-                    let raw_ratio = (new_len / parent_len).clamp(0.05, 0.95);
-                    *ratio = if is_first {
-                        raw_ratio as f32
+                }
+                if height_changed {
+                    let top = moved(new_frame.origin.y, old_frame.origin.y);
+                    let bottom = moved(new_frame.max().y, old_frame.max().y);
+                    let gap = gaps.inner.vertical as f64;
+                    if top && !bottom {
+                        self.move_edge_to(&rects, node, false, true, new_frame.origin.y, gap);
                     } else {
-                        (1.0 - raw_ratio) as f32
-                    };
-                    break;
+                        self.move_edge_to(&rects, node, false, false, new_frame.max().y, gap);
+                    }
                 }
             }
         }
@@ -2052,10 +2370,10 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    /// Resets every split to an even share, yabai's `space --balance`.
-    ///
-    /// A bsp tree carries its proportions on the splits rather than on the
-    /// leaves, so an even tree is one whose splits are all half and half.
+    fn can_insert_next_to(&self) -> bool {
+        true
+    }
+
     fn insert_window_next_to(
         &mut self,
         layout: LayoutId,
@@ -2086,11 +2404,10 @@ impl LayoutSystem for BspLayoutSystem {
         true
     }
 
+    /// Gives every window an equal share, yabai's `space --balance`.
     fn rebalance(&mut self, layout: LayoutId) {
-        for node in self.nodes_in_layout(layout) {
-            if let Some(NodeKind::Split { ratio, .. }) = self.kind.get_mut(node) {
-                *ratio = 0.5;
-            }
+        if let Some(state) = self.layouts.get(layout).copied() {
+            self.equalize(state.root);
         }
     }
 
