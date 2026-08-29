@@ -890,6 +890,19 @@ mod tests {
 
         // A window cannot be dropped on itself.
         assert!(!system.insert_window_next_to(layout, w(1), Direction::Left, w(1)));
+
+        // Dropping onto a window this tree does not hold must change nothing.
+        // Removing the dragged window before discovering that would leave it in
+        // no tree at all: untiled, unarranged, and stranded wherever the drag
+        // ended.
+        let before = system.draw_tree(layout);
+        assert!(!system.insert_window_next_to(layout, w(99), Direction::Left, w(2)));
+        assert_eq!(
+            system.draw_tree(layout),
+            before,
+            "a refused insert must leave the tree untouched"
+        );
+        assert!(system.windows_for_app(layout, w(2).pid).contains(&w(2)));
     }
 
     #[test]
@@ -2050,19 +2063,25 @@ impl LayoutSystem for BspLayoutSystem {
         direction: Direction,
         window: WindowId,
     ) -> bool {
-        if target == window {
+        if target == window || !self.layouts.contains_key(layout) {
             return false;
         }
-        // The window is normally already somewhere in this tree, so it has to
-        // leave before it can be re-inserted; splitting first would strand its
-        // old leaf, since window_to_node holds one node per window.
+        // Check the target is in this tree before touching anything. Removing
+        // the dragged window first and only then discovering there is nowhere
+        // to put it leaves it in no tree at all: it stops being tiled, stops
+        // being laid out, and sits wherever the drag left it.
+        if !self.window_to_node.contains_key(&target) {
+            return false;
+        }
+        // It is normally already somewhere in this tree, so it has to leave
+        // before it can be re-inserted; splitting first would strand its old
+        // leaf, since window_to_node holds one node per window.
         self.remove_window(window);
+        // Re-read the target: removing a window collapses its parent split, so
+        // the node the target lives in may not be the one seen above.
         let Some(&leaf) = self.window_to_node.get(&target) else {
             return false;
         };
-        if !self.layouts.contains_key(layout) {
-            return false;
-        }
         self.split_leaf_in_direction(leaf, direction, window);
         true
     }

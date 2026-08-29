@@ -1610,7 +1610,14 @@ impl Reactor {
                 // Where the pointer sits inside the target decides whether the
                 // drop swaps or splits, so it has to be read before the drag
                 // state is torn down.
-                let drop_action = pending_swap.and_then(|(_, target)| {
+                let drop_action = pending_swap.and_then(|(dragged, target)| {
+                    // Same requirement as the preview: only the tree can swap
+                    // or split, so a floating window on either end has no drop
+                    // action at all.
+                    let engine = &self.layout_manager.layout_engine;
+                    if engine.is_window_floating(dragged) || engine.is_window_floating(target) {
+                        return None;
+                    }
                     let frame = self.state.windows.window(target)?.frame_monotonic;
                     let cursor = window_server::current_cursor_location().ok()?;
                     Some(crate::actor::drag_swap::DragManager::drop_action(frame, cursor))
