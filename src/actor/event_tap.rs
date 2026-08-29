@@ -120,8 +120,6 @@ struct State {
 #[derive(Clone, Copy)]
 struct ModifierDrag {
     button: MouseButton,
-    action: MouseAction,
-    window: WindowServerId,
     /// Where the press landed. Movement is reported against this rather than
     /// against the previous event, so a long drag cannot drift.
     origin: CGPoint,
@@ -707,8 +705,6 @@ impl EventTap {
         _ = self.events_tx.send(Event::MouseModifierDragBegin { window, at: loc, action });
         Some(ModifierDrag {
             button,
-            action,
-            window,
             origin: loc,
             last: loc,
             last_sent: Instant::now(),

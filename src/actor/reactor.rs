@@ -34,6 +34,7 @@ mod SpaceEventHandler {
             active_spaces: reactor.active_spaces.clone(),
             mission_control_active: reactor.is_mission_control_active(),
             ordered_in: crate::sys::window_server::window_ordered_in(wsid),
+            exists: crate::sys::window_server::get_window(wsid).is_some(),
             assigned_space,
             last_known_user_space: super::events::space::resolve_last_known_user_space(
                 tracked_window.and_then(|window| reactor.best_space_for_window_id(window)),
@@ -1341,6 +1342,7 @@ impl Reactor {
                     active_spaces: self.active_spaces.clone(),
                     mission_control_active: self.is_mission_control_active(),
                     ordered_in: window_server::window_ordered_in(wsid),
+                    exists: window_server::get_window(wsid).is_some(),
                     assigned_space,
                     last_known_user_space,
                 };
