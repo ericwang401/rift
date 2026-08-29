@@ -681,7 +681,12 @@ impl EventTap {
         if held != modifier {
             return None;
         }
-        let window = mouse_window_hint(event)?;
+        // The under-pointer field is populated for left-button events but comes
+        // back empty for right-button ones, which is why a right-drag looked
+        // like it was never captured at all. Fall back to asking the window
+        // server what is under the cursor.
+        let window =
+            mouse_window_hint(event).or_else(crate::sys::window_server::window_under_cursor)?;
         debug!(?button, ?action, ?window, "Beginning modifier drag");
         Some(ModifierDrag {
             button,

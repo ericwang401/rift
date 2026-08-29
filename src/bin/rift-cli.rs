@@ -334,6 +334,10 @@ enum LayoutCommands {
     ToggleOrientation,
     /// Unjoin previously joined windows
     Unjoin,
+    /// Focus the next window in the active workspace
+    NextWindow,
+    /// Focus the previous window in the active workspace
+    PrevWindow,
     /// Rotate the whole tree a quarter turn (90, 180 or 270)
     Rotate { degrees: String },
     /// Mirror the whole tree across an axis (x or y)
@@ -942,6 +946,12 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
         ))),
         LayoutCommands::Unjoin => {
             Ok(CliCommand::Reactor(reactor::Command::Layout(LC::UnjoinWindows)))
+        }
+        LayoutCommands::NextWindow => {
+            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::NextWindow)))
+        }
+        LayoutCommands::PrevWindow => {
+            Ok(CliCommand::Reactor(reactor::Command::Layout(LC::PrevWindow)))
         }
         LayoutCommands::Rotate { degrees } => {
             let degrees = match degrees.as_str() {

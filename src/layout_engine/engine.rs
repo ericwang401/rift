@@ -1971,15 +1971,22 @@ impl LayoutEngine {
             }
             LayoutCommand::NextWindow | LayoutCommand::PrevWindow => {
                 let forward = matches!(command, LayoutCommand::NextWindow);
-                let windows = if is_floating {
-                    self.active_floating_windows_in_workspace(window_store, space)
-                } else {
+                let tiled = || {
                     self.filter_active_workspace_windows(
                         window_store,
                         space,
                         self.workspace_tree(workspace_id).visible_windows_in_layout(layout),
                     )
                 };
+                let floating = || self.active_floating_windows_in_workspace(window_store, space);
+                // `is_floating` describes the focused window, and there may not
+                // be one — on a workspace whose windows all float, that picks
+                // the empty tiled list and cycling does nothing at all. Fall
+                // back to whichever list actually has windows in it.
+                let mut windows = if is_floating { floating() } else { tiled() };
+                if windows.is_empty() {
+                    windows = if is_floating { tiled() } else { floating() };
+                }
                 if let Some(idx) = windows.iter().position(|&w| Some(w) == self.focused_window) {
                     let next = if forward {
                         (idx + 1) % windows.len()
