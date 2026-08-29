@@ -1798,9 +1798,12 @@ impl Reactor {
                 // never fires and the cursor gets left behind on the window's
                 // old position. Defer a warp to the moved window's post-layout
                 // frame, reusing the workspace-switch deferred-warp hook.
+                // Goes through the same per-app check as every other warp, so
+                // an app on mouse_follows_focus_blacklist is not dragged onto
+                // by this path either.
                 if matches!(command, layout::LayoutCommand::MoveNode(_))
-                    && self.config.settings.mouse_follows_focus
                     && let Some(wid) = self.main_window()
+                    && self.mouse_follows_focus_allowed_for(wid)
                 {
                     self.workspace_switch_manager.pending_workspace_mouse_warp = Some(wid);
                 }
