@@ -6,19 +6,22 @@
 //! only while the region is still travelling and stops as soon as it settles —
 //! a drag that is not moving between drop zones costs nothing.
 
-use std::time::Duration;
-
+use dispatchr::queue;
+use dispatchr::time::Time;
 use objc2_core_foundation::CGRect;
-use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, instrument, warn};
 
 use crate::actor;
 use crate::common::config::Config;
+use crate::sys::dispatch::DispatchExt;
 use crate::ui::drop_overlay::{DropOverlayConfig, DropOverlayWindow};
 
-/// Frame interval while the region is moving. Matched to a 60Hz display; the
-/// timer is idle whenever nothing is animating.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Frame interval while the region is moving, in nanoseconds. Roughly 60Hz.
+///
+/// rift runs its actors on its own executor rather than a Tokio runtime, so
+/// there is no timer driver to await; frames are scheduled onto the main
+/// dispatch queue, the same way deferred work is done elsewhere.
+const FRAME_INTERVAL_NS: i64 = 16 * 1_000_000;
 
 #[derive(Debug)]
 pub enum Event {
@@ -29,6 +32,8 @@ pub enum Event {
     },
     /// The drag ended or left every drop target.
     Hide,
+    /// Advance the animation one frame. Scheduled by the actor itself.
+    Tick,
     ConfigUpdated(Config),
 }
 
@@ -37,34 +42,45 @@ pub type Receiver = actor::Receiver<Event>;
 
 pub struct DropOverlay {
     rx: Receiver,
+    tx: Sender,
     config: Config,
     window: Option<DropOverlayWindow>,
+    /// Whether a frame is already scheduled, so a burst of drag updates does
+    /// not pile timers on top of each other.
+    tick_scheduled: bool,
 }
 
 impl DropOverlay {
-    pub fn new(config: Config, rx: Receiver) -> Self {
-        Self { rx, config, window: None }
+    pub fn new(config: Config, tx: Sender, rx: Receiver) -> Self {
+        Self {
+            rx,
+            tx,
+            config,
+            window: None,
+            tick_scheduled: false,
+        }
     }
 
     pub async fn run(mut self) {
-        let mut frames = interval(FRAME_INTERVAL);
-        // Frames are only interesting while something is moving; a late tick
-        // should be dropped rather than fired back to back to catch up.
-        frames.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut animating = false;
-
-        loop {
-            tokio::select! {
-                event = self.rx.recv() => {
-                    let Some((span, event)) = event else { break };
-                    let _guard = span.enter();
-                    animating = self.handle_event(event);
-                }
-                _ = frames.tick(), if animating => {
-                    animating = self.window.as_ref().is_some_and(DropOverlayWindow::step);
-                }
+        while let Some((span, event)) = self.rx.recv().await {
+            let _guard = span.enter();
+            let animating = self.handle_event(event);
+            if animating {
+                self.schedule_tick();
             }
         }
+    }
+
+    fn schedule_tick(&mut self) {
+        if self.tick_scheduled {
+            return;
+        }
+        self.tick_scheduled = true;
+        queue::main().after_f_s(
+            Time::new_after(Time::NOW, FRAME_INTERVAL_NS),
+            self.tx.clone(),
+            |tx| tx.send(Event::Tick),
+        );
     }
 
     fn settings(&self) -> DropOverlayConfig {
@@ -95,6 +111,10 @@ impl DropOverlay {
                     window.hide();
                 }
                 false
+            }
+            Event::Tick => {
+                self.tick_scheduled = false;
+                self.window.as_ref().is_some_and(DropOverlayWindow::step)
             }
             Event::Aim { screen, region } => {
                 if !self.config.settings.ui.drop_overlay.enabled {

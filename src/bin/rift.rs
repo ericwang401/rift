@@ -324,8 +324,11 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         stack_line_hit_rects,
     );
 
-    let drop_overlay =
-        rift_wm::actor::drop_overlay::DropOverlay::new(config.clone(), drop_overlay_rx);
+    let drop_overlay = rift_wm::actor::drop_overlay::DropOverlay::new(
+        config.clone(),
+        drop_overlay_tx.clone(),
+        drop_overlay_rx,
+    );
 
     let mission_control =
         MissionControlActor::new(config.clone(), mc_rx, mc_tx.clone(), reactor.clone(), mtm);

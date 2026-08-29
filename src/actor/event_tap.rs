@@ -35,9 +35,7 @@ use crate::actor;
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{
-    Config, LayoutMode, MouseAction, MouseButton, MouseSettings, StackLineHoverMode,
-};
+use crate::common::config::{Config, LayoutMode, MouseButton, MouseSettings, StackLineHoverMode};
 use crate::sys::event::{self, Hotkey, KeyCode, MouseState, set_mouse_state};
 use crate::sys::hotkey::{
     Modifiers, is_modifier_key, key_code_from_event, modifier_key_is_active, modifiers_from_flags,
@@ -120,8 +118,6 @@ struct State {
 #[derive(Clone, Copy)]
 struct ModifierDrag {
     button: MouseButton,
-    action: MouseAction,
-    window: WindowServerId,
     /// Where the press landed. Movement is reported against this rather than
     /// against the previous event, so a long drag cannot drift.
     origin: CGPoint,
@@ -707,8 +703,6 @@ impl EventTap {
         _ = self.events_tx.send(Event::MouseModifierDragBegin { window, at: loc, action });
         Some(ModifierDrag {
             button,
-            action,
-            window,
             origin: loc,
             last: loc,
             last_sent: Instant::now(),

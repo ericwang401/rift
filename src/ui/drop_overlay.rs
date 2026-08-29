@@ -106,7 +106,7 @@ impl DropOverlayWindow {
     }
 
     fn style_highlight(&self) {
-        with_disabled_actions(|| unsafe {
+        with_disabled_actions(|| {
             self.highlight.setCornerRadius(self.config.corner_radius);
             self.highlight.setBorderWidth(self.config.border_width);
             self.highlight
