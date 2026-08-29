@@ -121,10 +121,16 @@ impl DropOverlayWindow {
     /// toward, so moving between drop zones reads as one region moving rather
     /// than two regions blinking.
     pub fn aim_at(&self, region: CGRect) {
+        // Window frames run y-down from the top of the display; layers run
+        // y-up from the bottom. ui::common::WindowLayoutMetrics::rect_for does
+        // the same flip when it places window thumbnails, and without it the
+        // region is mirrored about the middle of the screen — which reads as
+        // the overlay hovering in the centre instead of sitting on a window.
         let local = CGRect::new(
             CGPoint::new(
                 region.origin.x - self.screen.origin.x,
-                region.origin.y - self.screen.origin.y,
+                self.screen.size.height
+                    - (region.origin.y - self.screen.origin.y + region.size.height),
             ),
             region.size,
         );
