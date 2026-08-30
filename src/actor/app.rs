@@ -747,7 +747,7 @@ impl State {
             windows.push((wid, info));
         }
 
-        self.main_window = self.app.main_window().ok().and_then(|w| self.id(&w).ok());
+        self.main_window = self.read_main_window().ok().and_then(|w| self.id(&w).ok());
         self.is_frontmost = self.app.frontmost().unwrap_or(false);
 
         self.events_tx.send(Event::ApplicationLaunched {
@@ -821,6 +821,12 @@ impl State {
                 }
             }
             Request::SetWindowPos(wid, pos, txid, _) => {
+                debug!(?wid, ?pos, ?txid, "writing window position");
+                crate::sys::trace::note_write(
+                    wid.pid,
+                    wid.idx.get(),
+                    CGRect::new(pos, objc2_core_foundation::CGSize::new(-1.0, -1.0)),
+                );
                 let elem = match self.window_mut(wid) {
                     Ok(window) => {
                         window.last_seen_txid = txid;
@@ -865,6 +871,7 @@ impl State {
                 ));
             }
             Request::AnimationFrame { wid, frame, set_size, txid } => {
+                crate::sys::trace::note_write(wid.pid, wid.idx.get(), frame);
                 self.pending_frames.insert(
                     wid,
                     PendingFrame {
@@ -876,6 +883,8 @@ impl State {
                 );
             }
             Request::SetWindowFrame(wid, desired, txid, _) => {
+                debug!(?wid, ?desired, ?txid, "writing window frame");
+                crate::sys::trace::note_write(wid.pid, wid.idx.get(), desired);
                 let elem = match self.window_mut(wid) {
                     Ok(window) => {
                         window.last_seen_txid = txid;
@@ -911,6 +920,10 @@ impl State {
                 ));
             }
             Request::SetBatchWindowFrame(frames, txid, _) => {
+                debug!(?frames, ?txid, "writing window frames");
+                for (wid, frame) in frames.iter() {
+                    crate::sys::trace::note_write(wid.pid, wid.idx.get(), *frame);
+                }
                 for (wid, desired) in frames {
                     let elem = match self.window_mut(wid) {
                         Ok(window) => {
@@ -1386,12 +1399,32 @@ impl State {
         Ok(())
     }
 
+    /// The app's main window, or its focused window when the app does not
+    /// support `AXMainWindow` at all. Premiere Pro is one: its document
+    /// window is an `AXLayoutArea`, `AXMainWindow` is unsupported, and only
+    /// `AXFocusedWindow` names it. Without the fallback an activation from
+    /// the Dock resolved no window, and every focused-window command kept
+    /// acting on whatever was focused before.
+    fn read_main_window(&self) -> Result<AXUIElement, AxError> {
+        match trace("main_window", &self.app, || self.app.main_window()) {
+            Ok(elem) => Ok(elem),
+            Err(main_err) => match trace("focused_window", &self.app, || self.app.focused_window())
+            {
+                Ok(elem) => {
+                    debug!(?self.pid, ?main_err, "AXMainWindow unavailable; using AXFocusedWindow");
+                    Ok(elem)
+                }
+                Err(_) => Err(main_err),
+            },
+        }
+    }
+
     fn on_main_window_changed(
         &mut self,
         quiet_if: Option<WindowId>,
         allow_register: bool,
     ) -> Option<WindowId> {
-        let elem = match trace("main_window", &self.app, || self.app.main_window()) {
+        let elem = match self.read_main_window() {
             Ok(elem) => elem,
             Err(e) => {
                 if self.windows.is_empty() {

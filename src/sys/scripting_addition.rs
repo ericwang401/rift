@@ -170,10 +170,12 @@ fn send(op: u8, args: &[u8]) -> bool {
 
 /// Moves a window to a space, both by their window-server ids.
 pub fn move_window_to_space(window_server_id: u32, space: u64) -> bool {
-    let mut args = Vec::with_capacity(12);
-    args.extend_from_slice(&space.to_ne_bytes());
-    args.extend_from_slice(&window_server_id.to_ne_bytes());
-    send(opcode::WINDOW_TO_SPACE, &args)
+    crate::sys::trace::observe("sa_move_window_to_space", (window_server_id, space), || {
+        let mut args = Vec::with_capacity(12);
+        args.extend_from_slice(&space.to_ne_bytes());
+        args.extend_from_slice(&window_server_id.to_ne_bytes());
+        send(opcode::WINDOW_TO_SPACE, &args)
+    })
 }
 
 /// Focuses a space by id, with no animation whatsoever.
@@ -189,7 +191,9 @@ pub fn move_window_to_space(window_server_id: u32, space: u64) -> bool {
 /// Dock settling somewhere other than the last space asked for. Fine for
 /// ordinary use, worse than the gesture under repeated rapid switching.
 pub fn focus_space(space: u64) -> bool {
-    send(opcode::SPACE_FOCUS, &space.to_ne_bytes())
+    crate::sys::trace::observe("sa_focus_space", space, || {
+        send(opcode::SPACE_FOCUS, &space.to_ne_bytes())
+    })
 }
 
 /// Creates a space on the display holding `space`.

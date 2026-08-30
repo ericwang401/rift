@@ -229,7 +229,14 @@ pub fn classify_window_frame_change(
         return FrameChangeDisposition::Handled;
     }
 
+    // A report with the button down is the user moving the window. It is
+    // never an echo of rift's own write — a held window is not laid out —
+    // so it is never stale, whatever transaction it trails. Discarding it
+    // lost whole drags: no session, no drop resolution, and a stale frame
+    // stored at release.
+    let user_is_dragging = *mouse_state == Some(MouseState::Down);
     if let Some(server) = server_id
+        && !user_is_dragging
         && let Some(target) = transactions.get_target_frame(server)
         && let Some(seen) = last_seen
     {

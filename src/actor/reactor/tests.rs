@@ -3509,6 +3509,113 @@ fn topology_window_delta_is_not_ignored_by_command_space_only_short_circuit() {
     assert_eq!(reactor.state.windows.window_server_space(wsid), Some(space2));
 }
 
+/// During a modifier (alt-drag) resize rift writes the window's frame from
+/// the pointer, and the app echoes each write with the button down. Those
+/// echoes are not the user dragging the window: holding it on their account
+/// left it out of every arrange while its neighbours followed the pointer.
+#[test]
+fn modifier_drag_echoes_do_not_hold_the_window() {
+    let (mut reactor, wid, wsid, space1, _space2, initial_frame, _screen2) =
+        reactor_with_window_on_space1_two_displays();
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space1, wid));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space1, wid));
+
+    reactor.handle_event(Event::MouseModifierDragBegin {
+        window: wsid,
+        at: CGPoint::new(
+            initial_frame.origin.x + initial_frame.size.width - 5.0,
+            initial_frame.origin.y + initial_frame.size.height / 2.0,
+        ),
+        action: crate::common::config::MouseAction::Resize,
+    });
+    reactor.handle_event(Event::MouseModifierDrag { dx: -40.0, dy: 0.0 });
+
+    let mut echoed = initial_frame;
+    echoed.size.width -= 40.0;
+    let txid = reactor.transaction_manager.get_last_sent_txid(wsid);
+    reactor.handle_event(Event::WindowFrameChanged(
+        wid,
+        echoed,
+        Some(txid),
+        Requested(false),
+        Some(crate::sys::event::MouseState::Down),
+    ));
+
+    assert_eq!(
+        reactor.window_in_drag(),
+        None,
+        "an echo of rift's own resize is not the user dragging the window"
+    );
+    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+
+    reactor.handle_event(Event::MouseUp);
+    assert!(
+        reactor.modifier_drag.is_none(),
+        "the modifier drag ends with the button"
+    );
+}
+
+/// The window server hands a dragged window to the display under the pointer
+/// before the app reports the first frame with the button down. Acting on the
+/// space change re-tiled the window on the other display mid-drag: it has to
+/// wait for the drop.
+#[test]
+fn window_that_changes_space_with_the_button_down_is_held_until_the_drop() {
+    let (mut reactor, wid, wsid, space1, space2, _initial_frame, screen2) =
+        reactor_with_window_on_space1_two_displays();
+    let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+
+    crate::sys::window_server::set_window_spaces_override(wsid, Some(vec![space2.get()]));
+    crate::sys::window_server::set_space_window_list_for_space_override(space1.get(), Some(vec![]));
+    crate::sys::window_server::set_space_window_list_for_space_override(
+        space2.get(),
+        Some(vec![wsid.as_u32()]),
+    );
+    crate::sys::event::set_mouse_state_override(Some(crate::sys::event::MouseState::Down));
+
+    reactor.handle_event(space_state_event_with(
+        vec![screen1, screen2],
+        vec![Some(space1), Some(space2)],
+        |state| {
+            state.has_seen_display_set = true;
+            state.topology_window_delta = Some(crate::actor::spaces::TopologyWindowDelta {
+                epoch: 12,
+                flags: crate::sys::skylight::DisplayReconfigFlags::MOVED,
+                appeared: vec![(wsid, space2)],
+                disappeared: vec![(wsid, space1)],
+            });
+        },
+    ));
+
+    assert_eq!(
+        reactor.assigned_space_for_window_id(wid),
+        Some(space1),
+        "a window in the user's hand keeps its tree until the drop"
+    );
+    assert_eq!(
+        reactor.window_in_drag(),
+        Some(wid),
+        "the window is held for the drag"
+    );
+
+    // The button comes up without the app ever having reported the drag:
+    // the window is where the window server has it.
+    crate::sys::event::set_mouse_state_override(Some(crate::sys::event::MouseState::Up));
+    reactor.handle_event(Event::MouseUp);
+
+    crate::sys::event::set_mouse_state_override(None);
+    crate::sys::window_server::set_window_spaces_override(wsid, None);
+    crate::sys::window_server::set_space_window_list_for_space_override(space1.get(), None);
+    crate::sys::window_server::set_space_window_list_for_space_override(space2.get(), None);
+
+    assert_eq!(reactor.window_in_drag(), None);
+    assert_eq!(
+        reactor.assigned_space_for_window_id(wid),
+        Some(space2),
+        "the drop settles the window where the window server has it"
+    );
+}
+
 #[test]
 fn forwarded_space_state_does_not_clear_existing_fullscreen_tracks_when_snapshot_has_none() {
     let mut reactor = test_reactor();
@@ -5498,6 +5605,70 @@ mod mouse_follows_focus {
 
     use super::*;
 
+    fn two_apps_focused_on_first() -> (Apps, Reactor, WindowId, WindowId) {
+        let (mut apps, mut reactor) = test_context();
+        reactor.config.settings.mouse_follows_focus = true;
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+        let a = WindowId::new(1, 1);
+        let b = WindowId::new(2, 1);
+        crate::sys::window_server::set_cursor_location_override(Some(CGPoint::new(-5000., -5000.)));
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(1), Some(a), true, true));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_events(apps.make_app_with_opts(2, make_windows(1), Some(b), false, true));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(reactor.main_window(), Some(a));
+        reactor.test_mouse_warps.clear();
+        (apps, reactor, a, b)
+    }
+
+    /// Focus that changes because of a click — into a window, on another
+    /// display's menu bar, to dismiss a popover — is the pointer's own doing.
+    /// The pointer stays where the user put it, even far from the window.
+    #[test]
+    fn focus_change_right_after_a_click_does_not_warp() {
+        let (_apps, mut reactor, _a, b) = two_apps_focused_on_first();
+        reactor.handle_event(Event::MouseUp);
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        reactor.handle_event(Event::ApplicationActivated(2, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(b));
+        assert!(
+            reactor.test_mouse_warps.is_empty(),
+            "a focus change that follows a click does not move the pointer"
+        );
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// Focus that leaves for something rift has no window for (a status-item
+    /// popover, a menu) and comes straight back is the user finishing with
+    /// that, not choosing the window again: no warp.
+    #[test]
+    fn focus_returning_from_a_windowless_app_does_not_warp() {
+        let (mut apps, mut reactor, a, _b) = two_apps_focused_on_first();
+        // A status-item app: activated, no windows at all.
+        reactor.handle_events(apps.make_app_with_opts(3, Vec::new(), None, false, true));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyActivated(3));
+        reactor.handle_event(Event::ApplicationActivated(3, Quiet::No));
+        assert_eq!(reactor.main_window(), None);
+        reactor.test_mouse_warps.clear();
+
+        // The popover closes; focus falls back to where it was.
+        reactor.handle_event(Event::ApplicationDeactivated(3));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(a));
+        assert!(
+            reactor.test_mouse_warps.is_empty(),
+            "focus coming back from a windowless app does not move the pointer"
+        );
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
     /// A window that gains focus by any route — here cmd-tab between apps,
     /// nothing rift did — pulls the pointer with it, floating or not, unless
     /// the pointer is already inside it.
@@ -6958,5 +7129,333 @@ mod display_archive {
             );
         }
         clear_overrides(&f.exiled_wsids);
+    }
+}
+
+/// Same drag, but with the session's origin space known — the normal case.
+/// The float must arrive on the other display still floating, not tiled.
+#[test]
+fn cross_display_drag_of_a_float_keeps_it_floating() {
+    let (mut reactor, wid, _wsid, space1, space2, initial_frame, screen2) =
+        reactor_with_window_on_space1_two_displays();
+    let source_workspace = reactor
+        .layout_manager
+        .layout_engine
+        .active_workspace(space1)
+        .expect("source workspace");
+
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space1, wid));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space1, wid));
+    reactor.handle_test_layout_command(LayoutCommand::ToggleWindowFloating);
+    assert!(reactor.layout_manager.layout_engine.is_window_floating(wid));
+    reactor.layout_manager.layout_engine.store_floating_position(
+        space1,
+        source_workspace,
+        wid,
+        initial_frame,
+    );
+
+    let moved_frame = CGRect::new(
+        CGPoint::new(screen2.origin.x + 120.0, initial_frame.origin.y),
+        initial_frame.size,
+    );
+    reactor.drag_manager.drag_state = DragState::Active {
+        session: DragSession {
+            window: wid,
+            last_frame: moved_frame,
+            origin_space: Some(space1),
+            settled_space: Some(space2),
+            layout_dirty: true,
+        },
+    };
+
+    // The full path: the reactor resolves the drop space from where the
+    // pointer lets go and applies the resulting layout events.
+    crate::sys::window_server::set_cursor_location_override(Some(CGPoint::new(
+        screen2.origin.x + 200.0,
+        screen2.origin.y + 100.0,
+    )));
+    reactor.handle_event(Event::MouseUp);
+    crate::sys::window_server::set_cursor_location_override(None);
+    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+
+    assert_eq!(reactor.assigned_space_for_window_id(wid), Some(space2));
+    assert!(
+        reactor.layout_manager.layout_engine.is_window_floating(wid),
+        "a dragged float must still be floating after crossing displays"
+    );
+    assert!(!reactor.layout_manager.layout_engine.is_window_tiled(space2, wid));
+    assert!(!reactor.layout_manager.layout_engine.is_window_tiled(space1, wid));
+}
+
+mod unmanaged_focus {
+    use test_log::test;
+
+    use super::*;
+
+    fn reactor_with_tiled_window() -> (Reactor, CGRect, SpaceId, WindowId) {
+        let mut reactor = test_reactor();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+        reactor.add_test_app(1);
+        let main = WindowId::new(1, 1);
+        reactor.add_test_window(
+            main,
+            WindowServerId::new(101),
+            Some(space),
+            CGRect::new(CGPoint::new(100., 100.), CGSize::new(1200., 700.)),
+        );
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, main, workspace));
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, main));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::WindowServerFocusChanged(main, space));
+        assert!(has_window_in_layout(&mut reactor, space, screen, main));
+        assert_eq!(reactor.layout_manager.layout_engine.focused_window(), Some(main));
+        (reactor, screen, space, main)
+    }
+
+    /// Premiere in front: its main window is tracked but not admitted. The
+    /// toggle must not reach back to the last managed window.
+    #[test]
+    fn toggle_floating_with_an_unmanaged_window_in_front_does_nothing() {
+        let (mut reactor, screen, space, main) = reactor_with_tiled_window();
+        reactor.add_test_app(2);
+        let unmanaged = WindowId::new(2, 1);
+        reactor.add_test_window_with_manageability(
+            unmanaged,
+            WindowServerId::new(201),
+            Some(space),
+            CGRect::new(CGPoint::new(200., 150.), CGSize::new(1000., 600.)),
+            false,
+        );
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        reactor.handle_event(Event::WindowServerFocusChanged(unmanaged, space));
+
+        reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+
+        assert!(!reactor.layout_manager.layout_engine.is_window_floating(main));
+        assert!(has_window_in_layout(&mut reactor, space, screen, main));
+        assert!(!reactor.layout_manager.layout_engine.is_window_floating(unmanaged));
+        assert!(!has_window_in_layout(&mut reactor, space, screen, unmanaged));
+    }
+
+    /// An app in front whose window rift never resolved at all (no AX main
+    /// window, nothing under the window server focus) is treated the same.
+    #[test]
+    fn toggle_floating_with_a_windowless_foreign_app_in_front_does_nothing() {
+        let (mut reactor, screen, space, main) = reactor_with_tiled_window();
+        reactor.add_test_app(2);
+        reactor.handle_event(Event::WindowDestroyed(main));
+        // `main` is still in the layout for this test's purpose: re-add it so
+        // only the focus bookkeeping is reset, not the window itself.
+        reactor.add_test_window(
+            main,
+            WindowServerId::new(101),
+            Some(space),
+            CGRect::new(CGPoint::new(100., 100.), CGSize::new(1200., 700.)),
+        );
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, main, workspace));
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, main));
+        reactor.send_layout_event(LayoutEvent::WindowFocused(space, main));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        assert_eq!(reactor.main_window(), None);
+
+        reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+
+        assert!(!reactor.layout_manager.layout_engine.is_window_floating(main));
+        assert!(has_window_in_layout(&mut reactor, space, screen, main));
+    }
+
+    /// Premiere from the Dock: the tracker learns its window through AX
+    /// (`AXFocusedWindow`) but the engine never gets a `WindowFocused` for it,
+    /// so its focus record still points at the last managed window. The
+    /// toggle must act on Premiere and leave that window alone.
+    #[test]
+    fn toggle_floating_acts_on_the_admitted_window_in_front_not_the_engines_stale_focus() {
+        let (mut reactor, screen, space, main) = reactor_with_tiled_window();
+        reactor.add_test_app(2);
+        reactor.main_window_tracker.register_app_for_test(2);
+        let premiere = WindowId::new(2, 1);
+        reactor.add_test_window(
+            premiere,
+            WindowServerId::new(201),
+            Some(space),
+            CGRect::new(CGPoint::new(200., 150.), CGSize::new(1000., 600.)),
+        );
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, premiere, workspace));
+        reactor.layout_manager.layout_engine.mark_window_floating(premiere);
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, premiere));
+        // Engine focus is still on `main` from the helper.
+        assert_eq!(reactor.layout_manager.layout_engine.focused_window(), Some(main));
+
+        // Dock activation: global activation plus the AX main-window
+        // resolution, no window-server focus event.
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        reactor.handle_event(Event::ApplicationMainWindowChanged(2, Some(premiere), Quiet::No));
+        assert_eq!(reactor.main_window(), Some(premiere));
+        assert_eq!(
+            reactor.layout_manager.layout_engine.focused_window(),
+            Some(main),
+            "precondition: the engine's focus record is stale"
+        );
+
+        reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+
+        assert!(!reactor.layout_manager.layout_engine.is_window_floating(premiere));
+        assert!(has_window_in_layout(&mut reactor, space, screen, premiere));
+        assert!(!reactor.layout_manager.layout_engine.is_window_floating(main));
+        assert!(has_window_in_layout(&mut reactor, space, screen, main));
+    }
+
+    /// The managed window in front still toggles.
+    #[test]
+    fn toggle_floating_with_the_managed_window_in_front_still_works() {
+        let (mut reactor, screen, space, main) = reactor_with_tiled_window();
+        reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+        assert!(reactor.layout_manager.layout_engine.is_window_floating(main));
+        assert!(!has_window_in_layout(&mut reactor, space, screen, main));
+    }
+}
+
+mod float_frames_are_never_invented {
+    use test_log::test;
+
+    use super::*;
+
+    fn reactor_with_float(frame: CGRect) -> (Reactor, WindowId, WindowServerId, SpaceId, CGRect) {
+        let mut reactor = test_reactor();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+        reactor.add_test_app(1);
+        let wid = WindowId::new(1, 1);
+        let wsid = WindowServerId::new(101);
+        reactor.add_test_window(wid, wsid, Some(space), frame);
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+        reactor.layout_manager.layout_engine.mark_window_floating(wid);
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+        (reactor, wid, wsid, space, screen)
+    }
+
+    fn laid_out(
+        reactor: &mut Reactor,
+        space: SpaceId,
+        screen: CGRect,
+        wid: WindowId,
+    ) -> Option<CGRect> {
+        let gaps = reactor.config.settings.layout.gaps.clone();
+        reactor
+            .layout_manager
+            .layout_engine
+            .calculate_layout_with_virtual_workspaces(
+                &reactor.state.windows,
+                space,
+                screen,
+                &gaps,
+                0.0,
+                Default::default(),
+                Default::default(),
+                |w| reactor.state.windows.window(w).map(|s| s.frame_monotonic),
+                &[screen],
+            )
+            .into_iter()
+            .find(|(w, _)| *w == wid)
+            .map(|(_, f)| f)
+    }
+
+    /// Preview's Open panel: a float whose only known frame is empty (the
+    /// window server has not laid it out yet) gets no frame from rift at
+    /// all — it used to be centred at 0x0.
+    #[test]
+    fn a_float_with_no_usable_frame_is_left_alone() {
+        let empty = CGRect::new(CGPoint::new(0., 0.), CGSize::new(0., 0.));
+        let (mut reactor, wid, _wsid, space, screen) = reactor_with_float(empty);
+        assert_eq!(laid_out(&mut reactor, space, screen, wid), None);
+    }
+
+    /// An empty frame from the window server is the absence of a frame.
+    #[test]
+    fn an_empty_window_server_frame_is_not_adopted() {
+        let at = CGRect::new(CGPoint::new(100., 100.), CGSize::new(300., 200.));
+        let (mut reactor, wid, wsid, _space, _screen) = reactor_with_float(at);
+        crate::sys::window_server::set_live_frame_override(
+            wsid,
+            Some(CGRect::new(CGPoint::new(0., 0.), CGSize::new(0., 0.))),
+        );
+        reactor.refresh_floating_frames_from_window_server();
+        assert!(reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(at));
+
+        let moved = CGRect::new(CGPoint::new(400., 300.), CGSize::new(300., 200.));
+        crate::sys::window_server::set_live_frame_override(wsid, Some(moved));
+        reactor.refresh_floating_frames_from_window_server();
+        assert!(reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(moved));
+        crate::sys::window_server::set_live_frame_override(wsid, None);
+    }
+
+    /// The user tiled it; leaving a workspace does not hand it back to a
+    /// floating rule.
+    #[test]
+    fn a_users_tile_choice_survives_removal_from_a_workspace() {
+        let at = CGRect::new(CGPoint::new(100., 100.), CGSize::new(300., 200.));
+        let (mut reactor, wid, _wsid, space, _screen) = reactor_with_float(at);
+        reactor.send_layout_event(LayoutEvent::WindowFocused(space, wid));
+        reactor.handle_test_layout_command(LayoutCommand::ToggleWindowFloating);
+        assert!(!reactor.layout_manager.layout_engine.is_window_floating(wid));
+        assert_eq!(reactor.state.windows.user_floating(wid), Some(false));
+
+        reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
+        assert_eq!(
+            reactor.state.windows.user_floating(wid),
+            Some(false),
+            "the user's choice is about the window, not the workspace"
+        );
+    }
+}
+
+mod removal_scrubs_every_tree {
+    use test_log::test;
+
+    use super::*;
+
+    /// A drop on another display reassigns the window before the removal
+    /// runs. The removal must still take it out of the tree it is actually
+    /// in, or it ends up tiled on both displays and bounces between them.
+    #[test]
+    fn a_window_reassigned_before_removal_leaves_its_old_tree() {
+        let (mut reactor, wid, _wsid, space1, space2, _frame, screen2) =
+            reactor_with_window_on_space1_two_displays();
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space1, wid));
+        let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        assert!(has_window_in_layout(&mut reactor, space1, screen1, wid));
+
+        // The store now says space2, as after a drop there; the tree has not
+        // been told yet.
+        let target = reactor.layout_manager.layout_engine.active_workspace(space2).unwrap();
+        assert!(
+            reactor
+                .layout_manager
+                .layout_engine
+                .virtual_workspace_manager_mut()
+                .assign_window_to_workspace(&mut reactor.state.windows, space2, wid, target)
+        );
+        reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
+        assert!(!has_window_in_layout(&mut reactor, space1, screen1, wid));
+
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space2, wid));
+        assert!(has_window_in_layout(&mut reactor, space2, screen2, wid));
+        assert!(!has_window_in_layout(&mut reactor, space1, screen1, wid));
     }
 }

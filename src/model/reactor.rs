@@ -96,13 +96,14 @@ pub(crate) struct AppState {
     pub(crate) handle: AppThreadHandle,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WindowState {
     pub(crate) info: WindowInfo,
     /// The last known frame of the window. Always includes the last write.
     ///
     /// This value only updates monotonically with respect to writes; in other
     /// words, we only accept reads when we know they come after the last write.
+    #[serde(with = "crate::sys::geometry::CGRectDef")]
     pub(crate) frame_monotonic: CGRect,
     /// Rift/macOS heuristic result, kept separately from an explicit app-rule
     /// override so every discovered window can remain tracked.

@@ -622,19 +622,17 @@ pub fn current_space_for_display_uuid(display_uuid: &str) -> Option<SpaceId> {
         return None;
     }
 
-    let uuid = CFString::from_str(display_uuid);
-    let id = unsafe {
-        CGSManagedDisplayGetCurrentSpace(
-            SLSMainConnectionID(),
-            CFRetained::<CFString>::as_ptr(&uuid).as_ptr(),
-        )
-    };
-
-    if id == 0 {
-        None
-    } else {
-        Some(SpaceId::new(id as u64))
-    }
+    crate::sys::trace::observe("display_current_space", display_uuid, || {
+        let uuid = CFString::from_str(display_uuid);
+        let id = unsafe {
+            CGSManagedDisplayGetCurrentSpace(
+                SLSMainConnectionID(),
+                CFRetained::<CFString>::as_ptr(&uuid).as_ptr(),
+            )
+        };
+        (id != 0).then_some(id as u64)
+    })
+    .map(SpaceId::new)
 }
 
 pub fn displays_have_separate_spaces() -> bool {
@@ -700,8 +698,47 @@ pub fn order_visible_spaces_by_position(
     spaces.into_iter().map(|(space, _)| space).collect()
 }
 
+/// One display's spaces, in the window server's own order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDisplaySpaces {
+    pub display_uuid: String,
+    pub spaces: Vec<SpaceId>,
+}
+
 pub fn managed_display_space_ids() -> HashMap<String, Vec<SpaceId>> {
-    let mut out: HashMap<String, Vec<SpaceId>> = HashMap::default();
+    managed_display_spaces_in_order()
+        .into_iter()
+        .map(|display| (display.display_uuid, display.spaces))
+        .collect()
+}
+
+/// The frame of a display, by its UUID.
+pub fn display_frame_for_uuid(display_uuid: &str) -> Option<CGRect> {
+    if display_uuid.is_empty() {
+        return None;
+    }
+    let uuid_string = CFString::from_str(display_uuid);
+    unsafe {
+        let uuid = CFUUIDCreateFromString(
+            std::ptr::null_mut(),
+            CFRetained::<CFString>::as_ptr(&uuid_string).as_ptr(),
+        );
+        if uuid.is_null() {
+            return None;
+        }
+        let did = CGDisplayGetDisplayIDFromUUID(uuid);
+        CFRelease(uuid as *mut _);
+        if did == 0 {
+            return None;
+        }
+        Some(CGDisplayBounds(did))
+    }
+}
+
+/// Every display's spaces, in the order the window server lists displays —
+/// the order Mission Control numbers spaces in, across displays.
+pub fn managed_display_spaces_in_order() -> Vec<ManagedDisplaySpaces> {
+    let mut out: Vec<ManagedDisplaySpaces> = Vec::new();
     unsafe {
         let raw = CGSCopyManagedDisplaySpaces(SLSMainConnectionID());
         if raw.is_null() {
@@ -749,7 +786,10 @@ pub fn managed_display_space_ids() -> HashMap<String, Vec<SpaceId>> {
                 }
             }
 
-            out.insert(display_id, space_ids);
+            out.push(ManagedDisplaySpaces {
+                display_uuid: display_id,
+                spaces: space_ids,
+            });
         }
     }
 

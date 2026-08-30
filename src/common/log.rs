@@ -11,7 +11,13 @@ pub fn init_logging() {
     tracing_subscriber::registry()
         .with(tree_layer())
         .with(timing_layer())
-        .with(EnvFilter::from_default_env())
+        // Info unless `RUST_LOG` says otherwise: enough to see what rift
+        // decided (a command ignored, a window admitted, a display homed)
+        // without the per-event debug stream.
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("rift_wm=info,info")),
+        )
         .init();
 }
 

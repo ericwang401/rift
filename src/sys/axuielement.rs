@@ -238,6 +238,12 @@ impl AXUIElement {
         Ok(AXUIElement::new(element))
     }
 
+    pub fn focused_window(&self) -> Result<AXUIElement> {
+        let value = self.copy_required_attribute("AXFocusedWindow")?;
+        let element = self.downcast::<RawAXUIElement>(value)?;
+        Ok(AXUIElement::new(element))
+    }
+
     /// Whether this element is the "main" window (AXMain).
     ///
     /// This is primarily used by developer tooling and may not be supported by all elements.

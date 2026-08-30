@@ -451,6 +451,9 @@ fn apply_assignment_result(
 }
 
 pub(crate) struct EmitLayoutPayload<'a> {
+    /// The window held in a drag; its membership is frozen (see
+    /// `Reactor::window_in_drag`).
+    pub frozen_window: Option<WindowId>,
     pub(crate) pid: pid_t,
     pub(crate) known_visible: &'a [WindowId],
     pub(crate) app_info: &'a Option<AppInfo>,
@@ -473,6 +476,7 @@ pub(crate) fn emit_layout_events(
         authoritative_spaces,
         active_spaces,
         focused_window,
+        frozen_window,
     } = payload;
     let mut outcome = crate::actor::reactor::events::EventOutcome::default();
     if !state.windows.iter_windows().any(|(wid, _)| wid.pid == pid) {
@@ -498,6 +502,12 @@ pub(crate) fn emit_layout_events(
         .filter(|wid| wid.pid == pid)
         .filter(|wid| state.windows.window(*wid).is_some_and(WindowState::can_reconcile_admission))
     {
+        // The window in the user's hand keeps its tree until the drop: the
+        // window server already has it on the display under the pointer,
+        // and assigning it there from this snapshot re-tiled it mid-drag.
+        if frozen_window == Some(wid) {
+            continue;
+        }
         let Some(space) = discovery_spaces.get(&wid).copied() else {
             continue;
         };
@@ -524,6 +534,9 @@ pub(crate) fn emit_layout_events(
             // Once the active-space snapshot already contains some windows for
             // this app, do not let AX-only fallback resurrect other windows on
             // the current desktop via geometry inference alone.
+            continue;
+        }
+        if frozen_window == Some(wid) {
             continue;
         }
         let Some(_state) = state.windows.window(wid) else {

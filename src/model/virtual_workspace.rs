@@ -284,7 +284,7 @@ impl WorkspaceStore {
         }
         self.workspaces_by_space.insert(space, ids.clone());
 
-        let default_idx = self.default_workspace.min(ids.len() - 1);
+        let default_idx = self.default_workspace.min(ids.len().saturating_sub(1));
         if let Some(&default_id) = ids.get(default_idx) {
             self.active_workspace_per_space.insert(space, (None, default_id));
         }

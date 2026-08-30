@@ -1,15 +1,17 @@
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 
 use crate::actor::app::WindowId;
 use crate::common::collections::{HashMap, HashSet};
 use crate::model::VirtualWorkspaceId;
 use crate::model::reactor::WindowState;
+use crate::sys::geometry::CGRectDef;
 use crate::sys::screen::SpaceId;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowVisibility {
     #[default]
     Unknown,
@@ -18,7 +20,7 @@ pub enum WindowVisibility {
     Minimized,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowPlacement {
     #[default]
     Tiled,
@@ -26,15 +28,17 @@ pub enum WindowPlacement {
     NativeFullscreen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[serde_as]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PendingWindowOperation {
     pub generation: u64,
+    #[serde_as(as = "Option<CGRectDef>")]
     pub requested_frame: Option<objc2_core_foundation::CGRect>,
     pub requested_space: Option<SpaceId>,
 }
 
 /// The complete reactor-owned state for one AX window identity.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct WindowRecord {
     state: Option<WindowState>,
     window_server_id: Option<WindowServerId>,
@@ -101,14 +105,14 @@ impl WindowRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeFullscreenTransition {
     EnterRequested,
     Suspended,
     ExitRequested,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeFullscreenRecord {
     pub original_window_id: WindowId,
     pub current_window_id: WindowId,
@@ -128,7 +132,7 @@ pub struct PendingNativeFullscreenRecord {
     pub transition: NativeFullscreenTransition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingNativeFullscreenState {
     pid: i32,
     last_known_user_space: Option<SpaceId>,
@@ -136,13 +140,14 @@ struct PendingNativeFullscreenState {
     transition: NativeFullscreenTransition,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct WindowServerRecord {
     window_id: Option<WindowId>,
     visible: bool,
     observed: bool,
     space: Option<SpaceId>,
     info: Option<WindowServerInfo>,
+    #[serde(skip)]
     recent_at: Option<Instant>,
     pending_native_fullscreen: Option<PendingNativeFullscreenState>,
 }
@@ -160,14 +165,22 @@ pub struct WindowWorkspaceInfo {
 /// assignment index here avoids the old class of bugs where a window could be
 /// present in multiple workspace-owned sets after sleep/wake or same-space
 /// workspace moves, which then leaked into queries and layout recovery.
-#[derive(Debug, Default)]
+#[serde_as]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct WindowStore {
+    #[serde_as(as = "Vec<(_, _)>")]
     windows: HashMap<WindowId, WindowRecord>,
+    #[serde_as(as = "Vec<(_, _)>")]
     app_windows: HashMap<i32, HashSet<WindowId>>,
+    #[serde_as(as = "Vec<(_, _)>")]
     window_servers: HashMap<WindowServerId, WindowServerRecord>,
+    #[serde_as(as = "Vec<(_, _)>")]
     workspace_windows: HashMap<WindowWorkspaceInfo, HashSet<WindowId>>,
+    #[serde_as(as = "Vec<(_, _)>")]
     native_fullscreen_records_by_original_window: HashMap<WindowId, NativeFullscreenRecord>,
+    #[serde_as(as = "Vec<(_, _)>")]
     native_fullscreen_original_window_by_current_window: HashMap<WindowId, WindowId>,
+    #[serde_as(as = "Vec<(_, _)>")]
     native_fullscreen_original_window_by_window_server: HashMap<WindowServerId, WindowId>,
 }
 
@@ -887,10 +900,14 @@ impl WindowStore {
         self.windows.get(&window_id).is_some_and(|record| record.rule_floating)
     }
 
+    /// Forget what the rules decided for this window. The user's own
+    /// tile/float choice is about the window, not the workspace it was in,
+    /// and outlives its removal from one: a window the user tiled and then
+    /// dragged to another display arrives there still tiled, instead of
+    /// being handed back to a catch-all floating rule.
     pub fn clear_rule_metadata(&mut self, window_id: WindowId) {
         if let Some(record) = self.windows.get_mut(&window_id) {
             record.rule_floating = false;
-            record.user_floating = None;
         }
         self.prune_window_record(window_id);
     }
@@ -1001,7 +1018,7 @@ impl WindowStore {
     where
         I: IntoIterator<Item = WindowServerId>,
     {
-        let now = Instant::now();
+        let now = crate::sys::trace::now();
         for wsid in wsids {
             self.server_record_mut(wsid).recent_at = Some(now);
         }
@@ -1015,7 +1032,7 @@ impl WindowStore {
     }
 
     pub fn purge_expired(&mut self, ttl_ms: u64) {
-        let now = Instant::now();
+        let now = crate::sys::trace::now();
         let wsids: Vec<_> = self.window_servers.keys().copied().collect();
         for wsid in wsids {
             if let Some(record) = self.window_servers.get_mut(&wsid)

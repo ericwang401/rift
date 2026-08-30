@@ -52,11 +52,26 @@ pub fn set_mouse_state(state: MouseState) {
     MOUSE_STATE.store(state.into(), Ordering::Relaxed);
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_MOUSE_STATE_OVERRIDE: std::cell::Cell<Option<MouseState>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes `get_mouse_state` answer `state` on this thread, for tests.
+#[cfg(test)]
+pub fn set_mouse_state_override(state: Option<MouseState>) {
+    TEST_MOUSE_STATE_OVERRIDE.with(|cell| cell.set(state));
+}
+
 pub fn get_mouse_state() -> Option<MouseState> {
-    match MouseState::try_from(MOUSE_STATE.load(Ordering::Relaxed)) {
-        Ok(s) => Some(s),
-        Err(_) => None,
+    #[cfg(test)]
+    if let Some(state) = TEST_MOUSE_STATE_OVERRIDE.with(|cell| cell.get()) {
+        return Some(state);
     }
+    crate::sys::trace::observe("mouse_state", (), || MOUSE_STATE.load(Ordering::Relaxed))
+        .try_into()
+        .ok()
 }
 
 pub fn warp_mouse(point: CGPoint) -> Result<(), CGError> {

@@ -133,8 +133,41 @@ pub struct CGPointDef {
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "ic::CGSize")]
 pub struct CGSizeDef {
+    #[serde(deserialize_with = "f64_or_null")]
     pub width: f64,
+    #[serde(deserialize_with = "f64_or_null")]
     pub height: f64,
+}
+
+/// A size the window server reports as unbounded is infinite, which JSON
+/// writes as `null`. Read it back as infinity.
+fn f64_or_null<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    struct Lenient;
+    impl<'de> serde::de::Visitor<'de> for Lenient {
+        type Value = f64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a number, or null for an unbounded size")
+        }
+        fn visit_f64<E>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_unit<E>(self) -> Result<f64, E> {
+            Ok(f64::INFINITY)
+        }
+        fn visit_none<E>(self) -> Result<f64, E> {
+            Ok(f64::INFINITY)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<f64, D2::Error> {
+            d.deserialize_any(Lenient)
+        }
+    }
+    deserializer.deserialize_any(Lenient)
 }
 
 impl SerializeAs<ic::CGRect> for CGRectDef {

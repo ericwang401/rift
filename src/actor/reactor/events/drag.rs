@@ -68,7 +68,16 @@ pub fn handle_mouse_up(
         let window = session.window;
         if session.origin_space != payload.final_space {
             if session.origin_space.is_some() {
-                outcome = outcome.with_layout_event(LayoutEvent::WindowRemoved(window));
+                // A float dragged onto another space is still a float. Plain
+                // `WindowRemoved` drops the floating mark, and the
+                // `WindowAdded` below then tiled it — a floating window that
+                // was merely dragged across displays landed in the tree.
+                let removal = if layout.layout_engine.is_window_floating(window) {
+                    LayoutEvent::WindowRemovedPreserveFloating(window)
+                } else {
+                    LayoutEvent::WindowRemoved(window)
+                };
+                outcome = outcome.with_layout_event(removal);
             }
             if let Some(space) = payload.final_space {
                 if let Some(server_id) =
@@ -106,12 +115,22 @@ pub fn handle_mouse_up(
                 .workspace_for_window(&state.windows, space, window)
                 .or_else(|| layout.layout_engine.active_workspace(space))
             {
-                layout.layout_engine.store_floating_position(
-                    space,
-                    workspace,
-                    window,
-                    session.last_frame,
-                );
+                // Where the window server has the window now, not where the
+                // session last saw it: the app's frame reports for this drag
+                // may all have been discarded (they trail rift's own last
+                // write), leaving `last_frame` at some earlier drag's end.
+                // Storing that made the next arrange put the float back
+                // there — the float "jumping" on release.
+                let dropped_at = state
+                    .windows
+                    .window(window)
+                    .and_then(|w| w.info.sys_id)
+                    .and_then(crate::sys::window_server::live_window_frame)
+                    .filter(|frame| frame.size.width > 0.0 && frame.size.height > 0.0)
+                    .unwrap_or(session.last_frame);
+                layout
+                    .layout_engine
+                    .store_floating_position(space, workspace, window, dropped_at);
             }
         }
     }

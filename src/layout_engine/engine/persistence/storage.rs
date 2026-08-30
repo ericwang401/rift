@@ -36,15 +36,26 @@ impl LayoutEngine {
     pub(super) fn load_with_schema_version(path: &Path) -> anyhow::Result<(Self, u32)> {
         let mut buf = String::new();
         File::open(path)?.read_to_string(&mut buf)?;
-        Self::deserialize_from_str_with_schema_version(&buf)
+        Self::deserialize_from_str_with_schema_version(&buf, false)
     }
 
     pub(crate) fn deserialize_from_str(buf: &str) -> anyhow::Result<Self> {
-        Self::deserialize_from_str_with_schema_version(buf).map(|(engine, _)| engine)
+        Self::deserialize_from_str_with_schema_version(buf, false).map(|(engine, _)| engine)
     }
 
-    fn deserialize_from_str_with_schema_version(buf: &str) -> anyhow::Result<(Self, u32)> {
-        let persisted = match PersistedLayout::deserialize(buf) {
+    /// Loads a snapshot of a running engine (a trace header). Unlike a saved
+    /// layout, a live engine may list workspaces for spaces it has never
+    /// laid out — their layout state is created on exposure — so those get
+    /// the placeholder state exposure would give them.
+    pub(crate) fn deserialize_snapshot_from_str(buf: &str) -> anyhow::Result<Self> {
+        Self::deserialize_from_str_with_schema_version(buf, true).map(|(engine, _)| engine)
+    }
+
+    fn deserialize_from_str_with_schema_version(
+        buf: &str,
+        heal_snapshot: bool,
+    ) -> anyhow::Result<(Self, u32)> {
+        let mut persisted = match PersistedLayout::deserialize(buf) {
             Ok(persisted) => persisted,
             Err(original_error) => {
                 let Some(migrated) = migrate_legacy_layout_system_tags(buf) else {
@@ -68,6 +79,27 @@ impl LayoutEngine {
             .virtual_workspace_manager
             .validate_persisted_topology()
             .map_err(|error| anyhow::anyhow!("invalid workspace topology: {error}"))?;
+        if heal_snapshot {
+            let placeholder = objc2_core_foundation::CGSize::new(1920.0, 1080.0);
+            for space in persisted.virtual_workspace_manager.initialized_spaces() {
+                for (workspace, _) in persisted.virtual_workspace_manager.existing_workspaces(space)
+                {
+                    if persisted.workspace_layouts.has_state(space, workspace) {
+                        continue;
+                    }
+                    if let Some(info) =
+                        persisted.virtual_workspace_manager.workspaces.get_mut(workspace)
+                    {
+                        persisted.workspace_layouts.ensure_active_for_workspace(
+                            space,
+                            placeholder,
+                            workspace,
+                            &mut info.layout_system,
+                        );
+                    }
+                }
+            }
+        }
         persisted
             .workspace_layouts
             .validate_persisted(&persisted.virtual_workspace_manager)

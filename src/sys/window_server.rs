@@ -33,6 +33,7 @@ use crate::sys::mach::mach_get_window_sub_level;
 use crate::sys::process::ProcessSerialNumber;
 use crate::sys::screen::{ScreenInfo, SpaceId};
 use crate::sys::skylight::*;
+use crate::sys::trace;
 
 static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
 static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
@@ -430,16 +431,23 @@ pub fn mission_control_dock_overlay_visible() -> bool {
 }
 
 pub fn window_parent(id: WindowServerId) -> Option<WindowServerId> {
-    let query = WindowIterator::new(&[id])?;
-    if query.count() == 1 {
-        let p = query.advance()?.parent_id();
-        (p != 0).then(|| WindowServerId::new(p))
-    } else {
-        None
-    }
+    trace::observe("window_parent", id.as_u32(), || {
+        let query = WindowIterator::new(&[id])?;
+        if query.count() == 1 {
+            let p = query.advance()?.parent_id();
+            (p != 0).then_some(p)
+        } else {
+            None
+        }
+    })
+    .map(WindowServerId::new)
 }
 
 pub fn window_is_sticky(id: WindowServerId) -> bool {
+    trace::observe("window_is_sticky", id.as_u32(), || window_is_sticky_raw(id))
+}
+
+fn window_is_sticky_raw(id: WindowServerId) -> bool {
     let cf_windows = cf_array_from_ids(&[id]);
     let space_list_ref = unsafe {
         SLSCopySpacesForWindows(*G_CONNECTION, 0x7, CFRetained::as_ptr(&cf_windows).as_ptr())
@@ -459,6 +467,13 @@ pub fn window_spaces(id: WindowServerId) -> Vec<crate::sys::screen::SpaceId> {
         return override_spaces.into_iter().map(crate::sys::screen::SpaceId::new).collect();
     }
 
+    trace::observe("window_spaces", id.as_u32(), || window_spaces_raw(id))
+        .into_iter()
+        .map(crate::sys::screen::SpaceId::new)
+        .collect()
+}
+
+fn window_spaces_raw(id: WindowServerId) -> Vec<u64> {
     let cf_windows = cf_array_from_ids(&[id]);
     let space_list_ref = unsafe {
         SLSCopySpacesForWindows(*G_CONNECTION, 0x7, CFRetained::as_ptr(&cf_windows).as_ptr())
@@ -472,7 +487,7 @@ pub fn window_spaces(id: WindowServerId) -> Vec<crate::sys::screen::SpaceId> {
         .iter()
         .filter_map(|num| num.as_i64())
         .filter_map(|value| u64::try_from(value).ok())
-        .filter_map(|value| (value != 0).then(|| crate::sys::screen::SpaceId::new(value)))
+        .filter(|value| *value != 0)
         .collect()
 }
 
@@ -497,13 +512,12 @@ pub fn window_ordered_in(id: WindowServerId) -> Option<bool> {
         return Some(ordered);
     }
 
-    let mut ordered: u8 = 0;
-    if let Ok(_) = cg_ok(unsafe { SLSWindowIsOrderedIn(*G_CONNECTION, id.as_u32(), &mut ordered) })
-    {
-        return Some(ordered != 0);
-    }
-
-    None
+    trace::observe("window_ordered_in", id.as_u32(), || {
+        let mut ordered: u8 = 0;
+        cg_ok(unsafe { SLSWindowIsOrderedIn(*G_CONNECTION, id.as_u32(), &mut ordered) })
+            .ok()
+            .map(|_| ordered != 0)
+    })
 }
 
 pub fn window_is_ordered_in(id: WindowServerId) -> bool {
@@ -564,16 +578,20 @@ pub fn get_windows(ids: &[WindowServerId]) -> Vec<WindowServerInfo> {
 pub fn get_window(id: WindowServerId) -> Option<WindowServerInfo> {
     #[cfg(test)]
     {
-        return get_windows(&[id]).into_iter().next();
+        return trace::observe("get_window", id.as_u32(), || {
+            get_windows(&[id]).into_iter().next()
+        });
     }
 
     #[cfg(not(test))]
     {
-        let query = WindowIterator::new(&[id])?;
-        if query.count() != 1 || query.advance().is_none() {
-            return None;
-        }
-        return window_info_from_query(&query);
+        return trace::observe("get_window", id.as_u32(), || {
+            let query = WindowIterator::new(&[id])?;
+            if query.count() != 1 || query.advance().is_none() {
+                return None;
+            }
+            window_info_from_query(&query)
+        });
     }
 }
 
@@ -677,11 +695,14 @@ fn is_own_window(cid: i32) -> bool {
 }
 
 pub fn get_window_at_point(mut point: CGPoint) -> Option<WindowServerId> {
-    let (mut wid, cid) = find_window_at_point(&mut point, None)?;
-    if is_own_window(cid) {
-        wid = find_window_at_point(&mut point, Some(wid))?.0;
-    }
-    Some(WindowServerId(wid))
+    trace::observe("window_at_point", trace::point_to(point), || {
+        let (mut wid, cid) = find_window_at_point(&mut point, None)?;
+        if is_own_window(cid) {
+            wid = find_window_at_point(&mut point, Some(wid))?.0;
+        }
+        Some(wid)
+    })
+    .map(WindowServerId)
 }
 
 /// Returns `true` if an external application window at normal level or above
@@ -735,10 +756,19 @@ pub fn set_live_frame_override(id: WindowServerId, frame: Option<CGRect>) {
 pub fn live_window_frame(id: WindowServerId) -> Option<CGRect> {
     #[cfg(test)]
     {
-        return TEST_LIVE_FRAME_OVERRIDE.with(|cell| cell.borrow().get(&id.as_u32()).copied());
+        if let Some(frame) =
+            TEST_LIVE_FRAME_OVERRIDE.with(|cell| cell.borrow().get(&id.as_u32()).copied())
+        {
+            return Some(frame);
+        }
+        return trace::observe("live_frame", id.as_u32(), || None::<trace::Rect>)
+            .map(trace::rect_from);
     }
     #[allow(unreachable_code)]
-    get_window(id).map(|info| info.frame)
+    trace::observe("live_frame", id.as_u32(), || {
+        get_window(id).map(|info| trace::rect_to(info.frame))
+    })
+    .map(trace::rect_from)
 }
 
 #[cfg(test)]
@@ -751,9 +781,14 @@ pub fn current_cursor_location() -> Result<CGPoint, CGError> {
     if let Some(point) = TEST_CURSOR_LOCATION_OVERRIDE.with(|cell| *cell.borrow()) {
         return Ok(point);
     }
-    let mut point = CGPoint::new(0.0, 0.0);
-    cg_ok(unsafe { SLSGetCurrentCursorLocation(*G_CONNECTION, &mut point) })?;
-    Ok(point)
+    trace::observe("cursor", (), || {
+        let mut point = CGPoint::new(0.0, 0.0);
+        cg_ok(unsafe { SLSGetCurrentCursorLocation(*G_CONNECTION, &mut point) })
+            .ok()
+            .map(|_| trace::point_to(point))
+    })
+    .map(trace::point_from)
+    .ok_or(CGError::Failure)
 }
 
 pub fn window_under_cursor() -> Option<WindowServerId> {
@@ -762,14 +797,17 @@ pub fn window_under_cursor() -> Option<WindowServerId> {
 }
 
 #[cfg(test)]
-pub fn window_level(_wid: u32) -> Option<NSWindowLevel> {
-    Some(0)
+pub fn window_level(wid: u32) -> Option<NSWindowLevel> {
+    trace::observe("window_level", wid, || Some(0i64)).map(|level| level as NSWindowLevel)
 }
 
 #[cfg(not(test))]
 pub fn window_level(wid: u32) -> Option<NSWindowLevel> {
-    let query = WindowIterator::new(&[WindowServerId::new(wid)])?;
-    Some(query.advance()?.level() as NSWindowLevel)
+    trace::observe("window_level", wid, || {
+        let query = WindowIterator::new(&[WindowServerId::new(wid)])?;
+        Some(query.advance()?.level() as i64)
+    })
+    .map(|level| level as NSWindowLevel)
 }
 
 pub fn window_sub_level(wid: u32) -> c_int {
@@ -817,6 +855,18 @@ pub fn space_window_list_for_connection(
         return override_ids;
     }
 
+    trace::observe(
+        "space_window_list",
+        (spaces.to_vec(), owner, include_minimized),
+        || space_window_list_for_connection_raw(spaces, owner, include_minimized),
+    )
+}
+
+fn space_window_list_for_connection_raw(
+    spaces: &[u64],
+    owner: u32,
+    include_minimized: bool,
+) -> Vec<u32> {
     let cf_space_array = cf_array_from_u64s(spaces);
 
     let mut set_tags: u64 = 0;
@@ -877,6 +927,18 @@ pub fn space_window_list_for_connection(
 /// reactor's tracked-window state so callers can use it to trigger discovery of
 /// a newly materialized native tab.
 pub fn key_focused_window(space: SpaceId) -> Option<WindowId> {
+    trace::observe("key_focused_window", space.get(), || {
+        key_focused_window_raw(space).map(|wid| (wid.pid, wid.idx.get()))
+    })
+    .and_then(|(pid, idx)| {
+        Some(WindowId {
+            pid,
+            idx: NonZeroU32::new(idx)?,
+        })
+    })
+}
+
+fn key_focused_window_raw(space: SpaceId) -> Option<WindowId> {
     let mut psn = ProcessSerialNumber::default();
     let mut fallback = 0u8;
     if cg_ok(unsafe { SLPSGetKeyFocusProcess(&mut psn, &mut fallback) }).is_err() {
@@ -912,7 +974,9 @@ pub fn key_focused_window(space: SpaceId) -> Option<WindowId> {
 
 /// The space on the display currently holding WindowServer focus.
 pub fn active_space() -> SpaceId {
-    SpaceId::new(unsafe { CGSGetActiveSpace(*G_CONNECTION) })
+    SpaceId::new(trace::observe("active_space", (), || unsafe {
+        CGSGetActiveSpace(*G_CONNECTION)
+    }))
 }
 
 #[cfg(test)]
@@ -957,13 +1021,14 @@ pub fn set_window_ordered_in_override(id: WindowServerId, ordered: Option<bool>)
 }
 
 pub fn app_window_suitability(id: WindowServerId) -> Option<bool> {
-    let query = WindowIterator::new(&[id])?;
-
-    if query.count() > 0 && query.advance().is_some() {
-        Some(iterator_window_suitable(query.iter))
-    } else {
-        Some(false)
-    }
+    trace::observe("app_window_suitability", id.as_u32(), || {
+        let query = WindowIterator::new(&[id])?;
+        if query.count() > 0 && query.advance().is_some() {
+            Some(iterator_window_suitable(query.iter))
+        } else {
+            Some(false)
+        }
+    })
 }
 
 pub fn app_window_suitable(id: WindowServerId) -> bool {
@@ -971,10 +1036,14 @@ pub fn app_window_suitable(id: WindowServerId) -> bool {
 }
 
 pub fn space_is_user(sid: u64) -> bool {
-    unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 0 }
+    trace::observe("space_is_user", sid, || unsafe {
+        SLSSpaceGetType(*G_CONNECTION, sid) == 0
+    })
 }
 pub fn space_is_fullscreen(sid: u64) -> bool {
-    unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 4 }
+    trace::observe("space_is_fullscreen", sid, || unsafe {
+        SLSSpaceGetType(*G_CONNECTION, sid) == 4
+    })
 }
 
 // credit: https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468

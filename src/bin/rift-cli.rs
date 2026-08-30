@@ -161,6 +161,11 @@ enum ExecuteCommands {
     },
     /// Print layout tree debugging output in the running rift instance
     Debug,
+    /// Record a trace of everything rift sees, for offline replay (see `tests/traces`)
+    Trace {
+        #[command(subcommand)]
+        trace_cmd: TraceCommands,
+    },
     /// Serialize and print runtime state
     Serialize,
     /// this command is deprecated, use `rift-cli execute space toggle-activated`
@@ -218,6 +223,14 @@ enum WindowCommands {
         #[arg(long, visible_alias = "window-server-id")]
         window_id: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TraceCommands {
+    /// Start recording to PATH (a `.trace` file)
+    Start { path: PathBuf },
+    /// Stop recording
+    Stop,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -694,6 +707,17 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
         }
         ExecuteCommands::Debug => {
             CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Debug))
+        }
+        ExecuteCommands::Trace { trace_cmd } => {
+            let path = match trace_cmd {
+                TraceCommands::Start { path } => {
+                    Some(std::path::absolute(path).map_err(|e| e.to_string())?)
+                }
+                TraceCommands::Stop => None,
+            };
+            CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::RecordTrace {
+                path,
+            }))
         }
         ExecuteCommands::Serialize => {
             CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Serialize))

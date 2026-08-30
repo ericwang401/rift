@@ -172,6 +172,10 @@ pub struct LayoutEngine {
     /// been seen to take effect. For these the stored frame is laid out;
     /// for every other visible float the live frame is the truth.
     pending_float_placement: HashMap<WindowId, PendingPlacement>,
+    /// The window the user is dragging, if any. Its layout membership is
+    /// frozen for the drag: discovery may not move it between trees. Set by
+    /// the reactor; never persisted.
+    frozen_window: Option<WindowId>,
 }
 
 /// A float placement rift decided on, waiting for the app to act on it. It
@@ -182,6 +186,12 @@ pub struct LayoutEngine {
 /// placements to apps that never match, which pinned their windows in place.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingPlacement {
+    /// The workspace the placement was stored for. Only that workspace's
+    /// layout may treat its stored frame as intended: a window can hold a
+    /// remembered frame on several workspaces, and a placement on one must
+    /// not resurrect a stale frame on another.
+    space: SpaceId,
+    workspace: crate::model::VirtualWorkspaceId,
     seen_live: Option<CGRect>,
     since: std::time::Instant,
 }
@@ -189,10 +199,12 @@ pub(crate) struct PendingPlacement {
 impl PendingPlacement {
     const GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(space: SpaceId, workspace: crate::model::VirtualWorkspaceId) -> Self {
         Self {
+            space,
+            workspace,
             seen_live: None,
-            since: std::time::Instant::now(),
+            since: crate::sys::trace::now(),
         }
     }
 }
@@ -1123,18 +1135,22 @@ impl LayoutEngine {
         let tiled_workspaces =
             self.virtual_workspace_manager.workspaces_for_window(window_store, wid);
 
-        if !tiled_workspaces.is_empty() {
-            for ws_id in &tiled_workspaces {
-                self.workspace_tree_mut(*ws_id).remove_window(wid);
-            }
-            return WindowRemovalImpact { active_space };
+        for ws_id in &tiled_workspaces {
+            self.workspace_tree_mut(*ws_id).remove_window(wid);
         }
 
-        // The store may already have dropped the record (for example after
-        // WindowDestroyed). Layout membership is only a projection, so scrub
-        // every tree when its authoritative assignment is unavailable.
+        // Layout membership is only a projection of the assignment, and the
+        // two can disagree at the moment of removal: a drop onto another
+        // display reassigns the window first and removes it afterwards, so
+        // the assignment already names the destination while the window
+        // still sits in the origin's tree. (The store may also have dropped
+        // the record altogether, after WindowDestroyed.) A window is in at
+        // most one tree, so scrub every tree that still holds it.
         let ws_ids: Vec<_> = self.virtual_workspace_manager.workspaces.keys().collect();
         for ws_id in ws_ids {
+            if tiled_workspaces.contains(&ws_id) {
+                continue;
+            }
             self.workspace_tree_mut(ws_id).remove_window_and_rebalance_parent(wid);
         }
         WindowRemovalImpact { active_space }
@@ -1233,6 +1249,11 @@ impl LayoutEngine {
             .is_none()
     }
 
+    /// See `frozen_window`.
+    pub fn set_frozen_window(&mut self, window: Option<WindowId>) {
+        self.frozen_window = window;
+    }
+
     fn sync_tiled_windows_for_app(
         &mut self,
         window_store: &WindowStore,
@@ -1242,6 +1263,7 @@ impl LayoutEngine {
     ) -> Vec<(crate::model::VirtualWorkspaceId, LayoutId)> {
         let total_tiled_count: usize = tiled_by_workspace.values().map(|v| v.len()).sum();
         let mut changed_layouts = Vec::new();
+        let frozen = self.frozen_window;
 
         for (ws_id, layout) in self.workspace_layouts.active_layouts_for_space(space) {
             let mut desired = tiled_by_workspace.get(&ws_id).cloned().unwrap_or_default();
@@ -1252,6 +1274,7 @@ impl LayoutEngine {
                 // Skip re-adding if the VWM no longer assigns this window to this space
                 // (it was moved to another space during this discovery cycle).
                 if wid.pid != pid
+                    || frozen == Some(wid)
                     || self.floating.is_floating(wid)
                     || desired.contains(&wid)
                     || authoritative_native_space.is_some_and(|native_space| native_space != space)
@@ -1305,6 +1328,23 @@ impl LayoutEngine {
             // their normal insertion semantics, so preserve the selection
             // explicitly across discovery-driven synchronization.
             let selected_window = self.workspace_tree(ws_id).selected_window(layout);
+            // A window is in at most one tree. Whatever this workspace is
+            // about to take in leaves every other tree first — discovery can
+            // otherwise leave a window tiled on two spaces, and every
+            // arrange then writes it two frames.
+            let arriving: Vec<WindowId> =
+                desired.iter().copied().filter(|wid| !current.contains(wid)).collect();
+            let other_workspaces: Vec<_> = self
+                .virtual_workspace_manager
+                .workspaces
+                .keys()
+                .filter(|other| *other != ws_id)
+                .collect();
+            for wid in arriving {
+                for other in &other_workspaces {
+                    self.workspace_tree_mut(*other).remove_window(wid);
+                }
+            }
             self.workspace_tree_mut(ws_id).set_windows_for_app(layout, pid, desired);
             if let Some(selected_window) = selected_window
                 && self.workspace_tree(ws_id).contains_window(layout, selected_window)
@@ -1484,6 +1524,7 @@ impl LayoutEngine {
             persistence: PersistenceState::default(),
             startup_restore_pending: false,
             pending_float_placement: HashMap::default(),
+            frozen_window: None,
         }
     }
 
@@ -1880,6 +1921,18 @@ impl LayoutEngine {
             let Some(wid) = self.focused_window else {
                 return EventResponse::default();
             };
+            // The window's own place, not the command's: a command is issued
+            // from whatever display the pointer is on, and the window may be
+            // on the other one. Floating it used to remove it from the
+            // pointer's display's tree — leaving it tiled *and* floating on
+            // its own, with every arrange writing its tile frame back over
+            // the float — and tiling it again put it in the wrong tree.
+            let own_space = self
+                .virtual_workspace_manager
+                .workspace_info_for_window_any(window_store, wid)
+                .map(|info| info.space)
+                .or_else(|| self.space_with_window(wid));
+            let space = own_space.or(space);
             if is_floating {
                 if let Some(space) = space {
                     let assigned_workspace = self
@@ -1908,10 +1961,12 @@ impl LayoutEngine {
                 // otherwise re-asserted on the next space activation.
                 window_store.set_user_floating(wid, false);
             } else {
+                // Out of every tree: a window is in at most one, and it is
+                // not necessarily the one under the pointer.
+                self.remove_window_from_all_tiling_trees(wid);
                 if let Some(space) = space {
                     self.floating.add_active(space, wid.pid, wid);
                     if let Some((ws_id, _)) = self.workspace_and_layout(space) {
-                        self.workspace_tree_mut(ws_id).remove_window(wid);
                         if options != ToggleWindowFloatingOptions::default()
                             && let (Some(center), Some(size), Some(current)) = (
                                 visible_space_centers.get(&space),
@@ -1933,7 +1988,8 @@ impl LayoutEngine {
                                 options.size,
                             );
                             self.floating_positions.store(space, ws_id, wid, frame);
-                            self.pending_float_placement.insert(wid, PendingPlacement::new());
+                            self.pending_float_placement
+                                .insert(wid, PendingPlacement::new(space, ws_id));
                         }
                     } else {
                         debug!(
@@ -1964,7 +2020,12 @@ impl LayoutEngine {
             if self.floating.fullscreen_kind(wid) == Some(target) {
                 self.floating.set_fullscreen(wid, None);
                 // Back to the frame saved when fullscreen was entered.
-                self.pending_float_placement.insert(wid, PendingPlacement::new());
+                if let Some(info) =
+                    self.virtual_workspace_manager.workspace_info_for_window_any(window_store, wid)
+                {
+                    self.pending_float_placement
+                        .insert(wid, PendingPlacement::new(info.space, info.workspace_id));
+                }
             } else {
                 // Only save the pre-fullscreen frame when switching from a non-fullscreen state,
                 // and _not_ when switching between fullscreen kinds.
@@ -2423,17 +2484,13 @@ impl LayoutEngine {
         use crate::model::HideCorner;
 
         let mut positions = HashMap::default();
-        let window_size = |wid| {
-            get_window_frame(wid)
-                .map(|f| f.size)
-                .unwrap_or_else(|| CGSize::new(500.0, 500.0))
-        };
-        let center_rect = |size: CGSize| {
-            let center = screen.mid();
-            let origin = CGPoint::new(center.x - size.width / 2.0, center.y - size.height / 2.0);
-            CGRect::new(origin, size)
-        };
 
+        // A float is laid out at a frame rift has a reason to believe in:
+        // where the window is, or where it was before rift parked it. There
+        // is no third option. Making one up — centring a window whose frame
+        // was unknown or read as empty — is what wrote 0x0 frames to the
+        // middle of the screen and snapped panels the user never touched.
+        // A float with no usable frame is left alone.
         fn ensure_visible_floating(
             engine: &mut LayoutEngine,
             positions: &mut HashMap<WindowId, CGRect>,
@@ -2444,20 +2501,22 @@ impl LayoutEngine {
             store_if_absent: bool,
             screen: &CGRect,
             all_screens: &[CGRect],
-            center_rect: &impl Fn(CGSize) -> CGRect,
-            window_size: &impl Fn(WindowId) -> CGSize,
         ) {
             let existing = positions.get(&wid).copied();
             let bundle_id = engine.get_app_bundle_id_for_window(wid);
-            let visible = candidate.or(existing).filter(|rect| {
-                !engine.virtual_workspace_manager.is_hidden_position_multi(
-                    screen,
-                    rect,
-                    bundle_id.as_deref(),
-                    all_screens,
-                )
-            });
-            let rect = visible.unwrap_or_else(|| center_rect(window_size(wid)));
+            let usable = |rect: &CGRect| {
+                rect.size.width > 0.0
+                    && rect.size.height > 0.0
+                    && !engine.virtual_workspace_manager.is_hidden_position_multi(
+                        screen,
+                        rect,
+                        bundle_id.as_deref(),
+                        all_screens,
+                    )
+            };
+            let Some(rect) = candidate.filter(usable).or_else(|| existing.filter(usable)) else {
+                return;
+            };
             positions.insert(wid, rect);
             if store_if_absent {
                 engine.floating_positions.store_if_absent(space, workspace_id, wid, rect);
@@ -2511,7 +2570,10 @@ impl LayoutEngine {
                     });
                     let raw_live = get_window_frame(window_id);
                     let intended = match self.pending_float_placement.get_mut(&window_id) {
-                        Some(pending) => {
+                        Some(pending)
+                            if pending.space == space
+                                && pending.workspace == active_workspace_id =>
+                        {
                             let answered = match (pending.seen_live, raw_live) {
                                 (Some(seen), Some(now)) => !now.same_as(seen),
                                 _ => false,
@@ -2531,6 +2593,9 @@ impl LayoutEngine {
                                 true
                             }
                         }
+                        // Pending for another workspace: not this layout's
+                        // intent, and not a reason to move the window here.
+                        Some(_) => false,
                         None => false,
                     };
                     let candidate = if intended {
@@ -2548,8 +2613,6 @@ impl LayoutEngine {
                         false,
                         &screen,
                         all_screens,
-                        &center_rect,
-                        &window_size,
                     );
                 }
             }
@@ -2576,8 +2639,6 @@ impl LayoutEngine {
                     false,
                     &screen,
                     all_screens,
-                    &center_rect,
-                    &window_size,
                 );
             }
 
@@ -2624,8 +2685,6 @@ impl LayoutEngine {
                         true,
                         &screen,
                         all_screens,
-                        &center_rect,
-                        &window_size,
                     );
                 }
             }
@@ -3570,7 +3629,8 @@ impl LayoutEngine {
         frame: CGRect,
     ) {
         self.floating_positions.store(space, workspace, window, frame);
-        self.pending_float_placement.insert(window, PendingPlacement::new());
+        self.pending_float_placement
+            .insert(window, PendingPlacement::new(space, workspace));
     }
 
     /// Record where a float has moved to on its own — no placement intent,

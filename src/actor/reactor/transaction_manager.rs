@@ -70,4 +70,11 @@ impl TransactionManager {
     pub fn get_target_frame(&self, wsid: WindowServerId) -> Option<CGRect> {
         self.store.get(&wsid)?.target
     }
+
+    /// Whether a target is pending for the window and was sent within
+    /// `within` — a write still to be believed over the window server's
+    /// report of where the window is.
+    pub fn target_sent_within(&self, wsid: WindowServerId, within: std::time::Duration) -> bool {
+        self.store.target_age(&wsid).is_some_and(|age| age <= within)
+    }
 }

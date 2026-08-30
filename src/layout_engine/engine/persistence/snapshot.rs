@@ -114,6 +114,7 @@ impl PersistedLayout {
             persistence: self.persistence,
             startup_restore_pending: false,
             pending_float_placement: HashMap::default(),
+            frozen_window: None,
         }
     }
 }

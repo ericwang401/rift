@@ -6,7 +6,7 @@ use std::mem::size_of;
 
 use dispatchr::queue;
 use dispatchr::time::Time;
-use objc2_core_foundation::{CFData, CFRetained};
+use objc2_core_foundation::{CFData, CFRetained, CGPoint};
 use objc2_core_graphics::{CGEvent, CGEventField};
 use objc2_foundation::NSProcessInfo;
 use once_cell::sync::Lazy;
@@ -188,14 +188,38 @@ const K_SPACE_STEP_DELAY_NS: i64 = 90 * 1_000_000;
 /// that hides windows offscreen, so this is the command for people who want
 /// their native spaces and keep rift for tiling within them. Nothing happens if
 /// the index is out of range or already active.
+/// Switches to space `index`, numbered across all displays in Mission
+/// Control order. A space on another display is switched on that display:
+/// by the scripting addition when it is available, otherwise by moving the
+/// pointer there and swiping, since the Dock swipes the display under the
+/// pointer.
 pub unsafe fn switch_to_space_index(index: usize, method: SpaceSwitchMethod) {
-    let Some(steps) = steps_to_space_index(index) else {
+    let Some(target) = space_at_index(index) else {
         return;
     };
-    if let Some(target) = space_at_index(index)
-        && teleport_to_space(target, method)
-    {
+    let Some(display) = display_holding_space(target) else {
         return;
+    };
+    let Some(current) = crate::sys::screen::current_space_for_display_uuid(&display.display_uuid)
+    else {
+        return;
+    };
+    if current == target {
+        return;
+    }
+    if teleport_to_space_on_display(target, &display.display_uuid, method) {
+        return;
+    }
+    let Some(steps) = steps_between(&display.spaces, current, target) else {
+        return;
+    };
+    if active_space() != current
+        && let Some(frame) = crate::sys::screen::display_frame_for_uuid(&display.display_uuid)
+    {
+        let _ = crate::sys::event::warp_mouse(CGPoint::new(
+            frame.origin.x + frame.size.width / 2.0,
+            frame.origin.y + frame.size.height / 2.0,
+        ));
     }
     let direction = if steps > 0 {
         Direction::Right
@@ -203,6 +227,22 @@ pub unsafe fn switch_to_space_index(index: usize, method: SpaceSwitchMethod) {
         Direction::Left
     };
     unsafe { switch_space_repeated(direction, steps.unsigned_abs()) };
+}
+
+/// The display whose space list contains `space`.
+fn display_holding_space(space: SpaceId) -> Option<crate::sys::screen::ManagedDisplaySpaces> {
+    crate::sys::screen::managed_display_spaces_in_order()
+        .into_iter()
+        .find(|display| display.spaces.contains(&space))
+}
+
+/// Signed number of swipes from `current` to `target` within one display's
+/// spaces. `None` when either is not in the list or they are the same.
+fn steps_between(spaces: &[SpaceId], current: SpaceId, target: SpaceId) -> Option<isize> {
+    let from = spaces.iter().position(|id| *id == current)?;
+    let to = spaces.iter().position(|id| *id == target)?;
+    let steps = to as isize - from as isize;
+    (steps != 0).then_some(steps)
 }
 
 /// How long the scripting addition gets to land a switch before the gesture
@@ -225,10 +265,25 @@ static TELEPORT_COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// twice. The check is what makes `Auto` safe — the alternative, trusting the
 /// call and gesturing as well, would double-switch whenever it did work.
 fn teleport_to_space(target: SpaceId, method: SpaceSwitchMethod) -> bool {
+    match display_holding_space(target) {
+        Some(display) => teleport_to_space_on_display(target, &display.display_uuid, method),
+        None => false,
+    }
+}
+
+/// Like `teleport_to_space`, judged against the display that owns the
+/// space: `CGSGetActiveSpace` only reports the display the pointer is on,
+/// which says nothing about a switch on the other one.
+fn teleport_to_space_on_display(
+    target: SpaceId,
+    display_uuid: &str,
+    method: SpaceSwitchMethod,
+) -> bool {
     if method == SpaceSwitchMethod::Gesture {
         return false;
     }
-    if active_space() == target {
+    let current = || crate::sys::screen::current_space_for_display_uuid(display_uuid);
+    if current() == Some(target) {
         return true;
     }
     if method == SpaceSwitchMethod::Auto && !teleport_is_available() {
@@ -244,7 +299,7 @@ fn teleport_to_space(target: SpaceId, method: SpaceSwitchMethod) -> bool {
     // sample.
     let started = Instant::now();
     while started.elapsed() < TELEPORT_DEADLINE {
-        if active_space() == target {
+        if current() == Some(target) {
             TELEPORT_MISSES.store(0, Ordering::Relaxed);
             return true;
         }
@@ -294,14 +349,26 @@ fn space_in_direction(direction: Direction) -> Option<SpaceId> {
 }
 
 /// The macOS space at 1-based `index` on the display holding the active space.
+/// The space numbered `index` (1-based) across all displays, in Mission
+/// Control order: the first display's spaces, then the next display's.
 pub fn space_at_index(index: usize) -> Option<SpaceId> {
     let target = index.checked_sub(1)?;
-    spaces_on_active_display()?.get(target).copied()
+    all_spaces_in_display_order().get(target).copied()
+}
+
+/// Every space, in Mission Control numbering order.
+pub fn all_spaces_in_display_order() -> Vec<SpaceId> {
+    crate::sys::screen::managed_display_spaces_in_order()
+        .into_iter()
+        .flat_map(|display| display.spaces)
+        .collect()
 }
 
 /// The currently active macOS space.
 pub fn active_space() -> SpaceId {
-    SpaceId::new(unsafe { CGSGetActiveSpace(SLSMainConnectionID()) })
+    SpaceId::new(crate::sys::trace::observe("active_space", (), || unsafe {
+        CGSGetActiveSpace(SLSMainConnectionID())
+    }))
 }
 
 /// The ordered spaces of the display holding the active space.
@@ -310,23 +377,6 @@ pub fn spaces_on_active_display() -> Option<Vec<SpaceId>> {
     crate::sys::screen::managed_display_space_ids()
         .into_values()
         .find(|ids| ids.contains(&active))
-}
-
-/// Signed number of spaces between the active one and `index` on the same
-/// display. `None` when the index is out of range or the space is already
-/// active.
-fn steps_to_space_index(index: usize) -> Option<isize> {
-    let target = index.checked_sub(1)?;
-    let active = active_space();
-
-    let spaces = spaces_on_active_display()?;
-    if target >= spaces.len() {
-        return None;
-    }
-
-    let current = spaces.iter().position(|id| *id == active)?;
-    let steps = target as isize - current as isize;
-    (steps != 0).then_some(steps)
 }
 
 /// Posts `steps` switches in one direction, one after another.
@@ -756,5 +806,32 @@ mod tests {
         assert_eq!(std::mem::size_of::<IOHIDSystemQueueElement>(), 28);
         assert_eq!(std::mem::size_of::<IOHIDFluidTouchGestureData>(), 40);
         assert_eq!(std::mem::size_of::<IOHIDVelocityEventData>(), 28);
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn steps_between_spaces_on_one_display() {
+        let spaces: Vec<SpaceId> =
+            [5u64, 421, 437, 176, 440].into_iter().map(SpaceId::new).collect();
+        assert_eq!(
+            steps_between(&spaces, SpaceId::new(5), SpaceId::new(437)),
+            Some(2)
+        );
+        assert_eq!(
+            steps_between(&spaces, SpaceId::new(440), SpaceId::new(421)),
+            Some(-3)
+        );
+        assert_eq!(
+            steps_between(&spaces, SpaceId::new(437), SpaceId::new(437)),
+            None
+        );
+        assert_eq!(
+            steps_between(&spaces, SpaceId::new(437), SpaceId::new(999)),
+            None
+        );
     }
 }

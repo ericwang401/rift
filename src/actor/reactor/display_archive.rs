@@ -124,6 +124,16 @@ impl DisplayArchive {
         self.entries.get(display_uuid).is_some_and(|entry| entry.homing.is_some())
     }
 
+    /// The space `wid` has been sent home to and not yet reported on, if
+    /// it is one of the windows a returned display is waiting for.
+    pub(super) fn homing_destination(&self, wid: WindowId) -> Option<SpaceId> {
+        self.entries
+            .values()
+            .filter_map(|entry| entry.homing.as_ref())
+            .find(|homing| homing.waiting.contains(&wid))
+            .map(|homing| homing.space)
+    }
+
     /// A stay-behind archive is only actionable once the display it waits
     /// for is back on screen.
     fn is_ready(&self, display_uuid: &str, screens: &[ScreenInfo]) -> bool {
@@ -228,7 +238,7 @@ impl Reactor {
                 self.display_archive.pre_churn = Some(PreChurn {
                     layout,
                     members,
-                    taken: Instant::now(),
+                    taken: crate::sys::trace::now(),
                 });
             }
             Err(error) => debug!(%error, "Could not take a pre-churn layout snapshot"),
@@ -497,15 +507,20 @@ impl Reactor {
             return;
         };
         let mut moved = 0usize;
+        let mut sent = Vec::new();
         for window in &entry.windows {
             let Some(wsid) = window.wsid else {
                 continue;
             };
             if scripting_addition::move_window_to_space(wsid.as_u32(), parking.get()) {
                 moved += 1;
+                sent.push(wsid);
             }
         }
         entry.parked_on = Some(parking);
+        for wsid in sent {
+            self.note_window_sent_to_space(wsid);
+        }
         info!(
             display = %uuid,
             %survivor,
@@ -700,6 +715,8 @@ impl Reactor {
                 || !scripting_addition::move_window_to_space(wsid.as_u32(), new_space.get())
             {
                 refused += 1;
+            } else {
+                self.note_window_sent_to_space(*wsid);
             }
             waiting.insert(*wid);
         }
@@ -725,7 +742,7 @@ impl Reactor {
         entry.homing = Some(Homing {
             space: new_space,
             waiting,
-            started: Instant::now(),
+            started: crate::sys::trace::now(),
         });
         if immediate {
             return self.finish_display_homing(uuid);

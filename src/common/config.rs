@@ -473,8 +473,19 @@ pub enum MouseAction {
 ///
 /// Deserialized from a string rather than reusing `Modifiers` directly, whose
 /// derived impl reads the raw bitfield integer.
-#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct MouseModifier(pub Modifiers);
+
+/// Written the way it is read — as the modifier's name — so a recorded
+/// config (a trace header) deserializes again.
+impl Serialize for MouseModifier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
 
 impl<'de> Deserialize<'de> for MouseModifier {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

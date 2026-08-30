@@ -18,11 +18,31 @@ pub(crate) fn refresh_heuristic(
     let window = state.windows.window(wid)?;
     let was_admitted = window.is_admitted();
     let server_id = window.info.sys_id;
+    // A rejection is re-checked against the window as it is now, not as it
+    // was when first seen: a document window can sit on a non-zero layer
+    // for the instant it opens (Preview, behind its Open sheet), and a
+    // snapshot cached then kept it unmanaged for good. A cached layer 0
+    // stands — only a would-be rejection is worth another query, and the
+    // answer refreshes the cache.
+    let server_info = server_id.and_then(|wsid| {
+        let cached = state.windows.get_window_server_info(wsid);
+        if cached.is_some_and(|info| info.layer == 0) {
+            return cached;
+        }
+        match crate::sys::window_server::get_window(wsid) {
+            Some(fresh) => {
+                state.windows.track_window_server_info(fresh);
+                Some(fresh)
+            }
+            None => cached,
+        }
+    });
+    let window = state.windows.window(wid)?;
     let manageable = !window.info.is_minimized
         && window.info.is_standard
         && window.info.is_root
         && server_id.is_none_or(|wsid| {
-            !state.windows.get_window_server_info(wsid).is_some_and(|info| info.layer != 0)
+            !server_info.is_some_and(|info| info.layer != 0)
                 && !window_is_sticky(wsid)
                 && window_level(wsid.0).is_none_or(|level| level == NSNormalWindowLevel)
         });

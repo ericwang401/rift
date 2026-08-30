@@ -11,6 +11,10 @@ use crate::sys::window_server::WindowServerId;
 pub struct TxRecord {
     pub txid: TransactionId,
     pub target: Option<CGRect>,
+    /// When `target` was sent. A write is in flight until the app applies
+    /// it, and the window server reports the window where it still is
+    /// until then; how old the write is says whether to believe that.
+    pub sent_at: Option<std::time::Instant>,
 }
 
 /// Thread-safe cache mapping window server IDs to their last known transaction.
@@ -23,14 +27,25 @@ impl WindowTxStore {
     }
 
     pub fn insert(&self, id: WindowServerId, txid: TransactionId, target: CGRect) {
+        let record = TxRecord {
+            txid,
+            target: Some(target),
+            sent_at: Some(crate::sys::trace::now()),
+        };
         match self.0.entry(id) {
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() = TxRecord { txid, target: Some(target) }
-            }
+            Entry::Occupied(mut entry) => *entry.get_mut() = record,
             Entry::Vacant(entry) => {
-                entry.insert(TxRecord { txid, target: Some(target) });
+                entry.insert(record);
             }
         }
+    }
+
+    /// How long ago the pending target for `id` was sent, if one is pending.
+    pub fn target_age(&self, id: &WindowServerId) -> Option<std::time::Duration> {
+        let record = self.get(id)?;
+        record.target?;
+        let sent_at = record.sent_at?;
+        Some(crate::sys::trace::now().saturating_duration_since(sent_at))
     }
 
     pub fn get(&self, id: &WindowServerId) -> Option<TxRecord> {
@@ -52,12 +67,15 @@ impl WindowTxStore {
             Entry::Occupied(mut entry) => {
                 let record = entry.get_mut();
                 let new_txid = record.txid.next();
-                *record = TxRecord { txid: new_txid, target: None };
+                *record = TxRecord {
+                    txid: new_txid,
+                    ..Default::default()
+                };
                 new_txid
             }
             Entry::Vacant(entry) => {
                 let txid = TransactionId::default().next();
-                entry.insert(TxRecord { txid, target: None });
+                entry.insert(TxRecord { txid, ..Default::default() });
                 txid
             }
         };
@@ -72,7 +90,7 @@ impl WindowTxStore {
                 record.target = None;
             }
             Entry::Vacant(entry) => {
-                entry.insert(TxRecord { txid, target: None });
+                entry.insert(TxRecord { txid, ..Default::default() });
             }
         }
     }
@@ -80,6 +98,42 @@ impl WindowTxStore {
     pub fn last_txid(&self, id: &WindowServerId) -> TransactionId {
         self.get(id).map(|record| record.txid).unwrap_or_default()
     }
+
+    /// Every window's last transaction and pending target, for a trace
+    /// header: a replay must issue the ids live issued, or it discards the
+    /// frame reports live accepted.
+    pub fn snapshot(&self) -> Vec<TxSnapshotEntry> {
+        let mut out: Vec<TxSnapshotEntry> = self
+            .0
+            .iter()
+            .map(|entry| TxSnapshotEntry {
+                window: *entry.key(),
+                txid: entry.value().txid,
+                target: entry.value().target.map(crate::sys::trace::rect_to),
+            })
+            .collect();
+        out.sort_by_key(|entry| entry.window.as_u32());
+        out
+    }
+
+    pub fn restore(&self, entries: &[TxSnapshotEntry]) {
+        for entry in entries {
+            match entry.target {
+                Some(target) => {
+                    self.insert(entry.window, entry.txid, crate::sys::trace::rect_from(target))
+                }
+                None => self.set_last_txid(entry.window, entry.txid),
+            }
+        }
+    }
+}
+
+/// One window's transaction state in a trace header.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TxSnapshotEntry {
+    pub window: WindowServerId,
+    pub txid: TransactionId,
+    pub target: Option<crate::sys::trace::Rect>,
 }
 
 #[cfg(test)]

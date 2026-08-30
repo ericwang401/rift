@@ -100,7 +100,7 @@ struct DisplayTopologyState {
 }
 
 /// Forwarded read-only space/display snapshot consumed by the reactor.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ForwardedSpaceState {
     pub screens: Vec<ScreenInfo>,
     pub fullscreen_spaces: HashSet<SpaceId>,
@@ -119,6 +119,7 @@ pub struct ForwardedSpaceState {
     /// Releases the reactor's display-churn gate only after this authoritative
     /// snapshot has been incorporated into its workspace model.
     pub releases_display_churn_refresh_quarantine: bool,
+    #[serde(with = "resized_spaces_serde")]
     pub resized_spaces: Vec<(SpaceId, CGSize)>,
     pub topology_window_delta: Option<TopologyWindowDelta>,
     pub active_window_spaces: HashMap<WindowServerId, SpaceId>,
@@ -144,9 +145,10 @@ struct PendingScreenParameters {
     converter: CoordinateConverter,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TopologyWindowDelta {
     pub epoch: u64,
+    #[serde(with = "reconfig_flags_serde")]
     pub flags: DisplayReconfigFlags,
     pub appeared: Vec<(WindowServerId, SpaceId)>,
     pub disappeared: Vec<(WindowServerId, SpaceId)>,
@@ -1410,3 +1412,51 @@ impl SpacesActor {
 
 #[cfg(test)]
 mod tests;
+
+/// `CGSize` has no serde; write the pairs as plain numbers.
+mod resized_spaces_serde {
+    use objc2_core_foundation::CGSize;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::sys::screen::SpaceId;
+
+    pub fn serialize<S: Serializer>(
+        value: &[(SpaceId, CGSize)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let plain: Vec<(SpaceId, f64, f64)> =
+            value.iter().map(|(space, size)| (*space, size.width, size.height)).collect();
+        plain.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(SpaceId, CGSize)>, D::Error> {
+        let plain = Vec::<(SpaceId, f64, f64)>::deserialize(deserializer)?;
+        Ok(plain
+            .into_iter()
+            .map(|(space, width, height)| (space, CGSize::new(width, height)))
+            .collect())
+    }
+}
+
+mod reconfig_flags_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::sys::skylight::DisplayReconfigFlags;
+
+    pub fn serialize<S: Serializer>(
+        value: &DisplayReconfigFlags,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.bits().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<DisplayReconfigFlags, D::Error> {
+        Ok(DisplayReconfigFlags::from_bits_retain(u32::deserialize(
+            deserializer,
+        )?))
+    }
+}

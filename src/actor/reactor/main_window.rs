@@ -101,6 +101,12 @@ impl MainWindowTracker {
         None
     }
 
+    /// The app the window server says is in front, whether or not any of
+    /// its windows is known.
+    pub fn global_frontmost(&self) -> Option<pid_t> {
+        self.global_frontmost
+    }
+
     pub fn main_window(&self) -> Option<WindowId> {
         let Some(pid) = self.global_frontmost else {
             return None;
@@ -116,6 +122,20 @@ impl MainWindowTracker {
             }) => Some(window),
             _ => None,
         }
+    }
+
+    /// Register an app as `ApplicationLaunched` would, for tests that drive
+    /// activation events directly.
+    #[cfg(test)]
+    pub(crate) fn register_app_for_test(&mut self, pid: pid_t) {
+        self.apps.insert(
+            pid,
+            AppState {
+                is_frontmost: false,
+                frontmost_is_quiet: Quiet::No,
+                main_window: None,
+            },
+        );
     }
 
     pub fn is_globally_frontmost(&self, pid: pid_t) -> bool {

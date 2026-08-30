@@ -41,6 +41,13 @@ pub struct DragManager {
     /// The space a just-dropped window belongs to, held until its frame has
     /// landed there. See `DropPin`.
     pub drop_pin: Option<DropPin>,
+    /// A window whose frame the app reported moving with the button down,
+    /// until the button comes up. Kept apart from the drag session, which
+    /// only exists for frame reports rift accepted: a report that trails
+    /// rift's own last write is discarded, and a drag that starts right
+    /// after a re-tile would otherwise be invisible. See
+    /// `Reactor::window_in_drag`.
+    pub held_window: Option<WindowId>,
 }
 
 /// A window dropped on a target hanging over a display seam has, as far as the
@@ -335,10 +342,13 @@ impl LayoutManager {
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         let main_window = reactor.main_window();
         trace!(?main_window);
+        // The window in the user's hand is never laid out, for the whole
+        // drag — not only in the one pass a frame report requested it for.
+        // Whatever put it in a tree meanwhile, writing its slot under the
+        // cursor is the one thing that must not happen; the drop lays it out.
         let skip_wid = reactor
-            .drag_manager
-            .skip_layout_for_window
-            .take()
+            .window_in_drag()
+            .or_else(|| reactor.drag_manager.skip_layout_for_window.take())
             .or(reactor.drag_manager.drag_swap_manager.dragged());
         let mut any_frame_changed = false;
 

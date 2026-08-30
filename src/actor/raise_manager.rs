@@ -176,7 +176,7 @@ impl RaiseManager {
                         // Restart the timeout window so the focus phase gets its
                         // own timeout. Otherwise a hung focus raise could never
                         // time out again and would block all future raises.
-                        sequence.started_at = Instant::now();
+                        sequence.started_at = crate::sys::trace::now();
                         sequence.timed_out = false;
                     }
                 }
@@ -265,7 +265,7 @@ impl RaiseManager {
                 focus_batch,
                 app_handles,
                 raise_token,
-                started_at: Instant::now(),
+                started_at: crate::sys::trace::now(),
                 timed_out: false,
             });
         }

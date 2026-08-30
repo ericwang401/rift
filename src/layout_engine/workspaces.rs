@@ -282,6 +282,14 @@ impl WorkspaceLayouts {
             .insert(Size::from(size), layout);
     }
 
+    pub(crate) fn has_state(
+        &self,
+        space: SpaceId,
+        workspace_id: crate::model::VirtualWorkspaceId,
+    ) -> bool {
+        self.map.contains_key(&(space, workspace_id))
+    }
+
     pub(crate) fn ensure_active_for_workspace(
         &mut self,
         space: SpaceId,

@@ -633,8 +633,12 @@ impl EventTap {
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
                 set_mouse_state(MouseState::Up);
                 // Swallow the release that closes a drag we swallowed the press
-                // for, so the application never sees half a click.
+                // for, so the application never sees half a click. The reactor
+                // still has to hear it: left believing the drag was on, it read
+                // the user's next plain drag of the window as echoes of its own
+                // writes and never put the window back until some later click.
                 if self.end_modifier_drag(event_type) {
+                    _ = self.events_tx.send(Event::MouseUp);
                     return false;
                 }
             }

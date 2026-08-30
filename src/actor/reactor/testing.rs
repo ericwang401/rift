@@ -222,7 +222,10 @@ impl Reactor {
             wid,
             super::WindowState {
                 info: WindowInfo {
-                    is_standard: true,
+                    // A test window that is not manageable is one the
+                    // heuristic would turn away, as it will again whenever
+                    // the window is looked at afresh.
+                    is_standard: is_manageable,
                     is_root: true,
                     is_minimized: false,
                     is_resizable: true,

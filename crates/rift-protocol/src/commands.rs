@@ -98,6 +98,12 @@ pub enum LayoutCommand {
 #[serde(rename_all = "snake_case")]
 pub enum ReactorCommand {
     Debug,
+    /// Start (`Some(path)`) or stop (`None`) recording a trace of everything
+    /// the reactor sees — events and the system's answers — for offline
+    /// replay. See `sys::trace`.
+    RecordTrace {
+        path: Option<PathBuf>,
+    },
     Serialize,
     SaveLayout {
         path: PathBuf,
