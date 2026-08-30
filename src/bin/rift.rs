@@ -125,7 +125,16 @@ fn main() {
         NSApplication::load();
     }
 
-    unsafe { SLSWindowManagementBridgeSetDelegate(std::ptr::null_mut()) };
+    // Nulling the window-management-bridge delegate disconnects the system's
+    // own window manager for this login session while rift runs. The bridge
+    // is what lets an app's *programmatic* window move carry the window
+    // across the display seam (a server-side titlebar drag doesn't need it) —
+    // with it nulled, an app that animates its own drag (Warp's tab-bar drag)
+    // has the move bounced at the seam and the window snaps back.
+    // RIFT_KEEP_WM_BRIDGE=1 leaves the bridge alone, for A/B-ing that.
+    if std::env::var_os("RIFT_KEEP_WM_BRIDGE").is_none_or(|v| v != "1") {
+        unsafe { SLSWindowManagementBridgeSetDelegate(std::ptr::null_mut()) };
+    }
 
     ensure_accessibility_permission();
     init_window_sub_level_server_port();

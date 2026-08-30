@@ -62,6 +62,9 @@ pub enum Request {
     ConfigUpdated(Config),
     LayoutModesChanged(Vec<(SpaceId, crate::common::config::LayoutMode)>),
     SetLowPowerMode(bool),
+    /// The grab strips (title/tab bars) of the floating windows, for the
+    /// plain-drag takeover: `(window server id, pid, strip)`.
+    SetFloatDragStrips(Vec<(u32, i32, CGRect)>),
 }
 
 pub struct EventTap {
@@ -73,6 +76,12 @@ pub struct EventTap {
     mouse_move_min_interval_ns: Cell<u64>,
     mouse_window: Cell<MouseWindow>,
     modifier_drag: Cell<Option<ModifierDrag>>,
+    /// See `Request::SetFloatDragStrips`.
+    float_strips: RefCell<Vec<(u32, i32, CGRect)>>,
+    /// A press that landed on a float's grab strip: `(down point, wsid,
+    /// pid)`. Becomes a takeover once the pointer moves past the threshold;
+    /// forgotten on release (it was a click).
+    pending_float_grab: Cell<Option<(CGPoint, u32, i32)>>,
     tap: RefCell<Option<crate::sys::event_tap::EventTap>>,
     tap_generation: Cell<u64>,
     disable_hotkey: RefCell<Option<Hotkey>>,
@@ -332,6 +341,8 @@ impl EventTap {
             mouse_move_min_interval_ns: Cell::new(mouse_move_min_interval_ns),
             mouse_window: Cell::new(MouseWindow::default()),
             modifier_drag: Cell::new(None),
+            float_strips: RefCell::new(Vec::new()),
+            pending_float_grab: Cell::new(None),
             tap: RefCell::new(None),
             tap_generation: Cell::new(0),
             disable_hotkey: RefCell::new(disable_hotkey),
@@ -395,6 +406,7 @@ impl EventTap {
         let mut state = self.state.borrow_mut();
         match request {
             Request::Warp(point) => {
+                crate::sys::trace::act("warp", &(point.x, point.y));
                 self.reset_mouse_window();
                 if let Err(e) = event::warp_mouse(point) {
                     warn!("Failed to warp mouse: {e:?}");
@@ -520,6 +532,9 @@ impl EventTap {
                     state.layout_mode_by_space.len()
                 );
             }
+            Request::SetFloatDragStrips(strips) => {
+                *self.float_strips.borrow_mut() = strips;
+            }
             Request::SetLowPowerMode(enabled) => {
                 if state.low_power_mode != enabled {
                     debug!("low_power_mode changed in event tap: {}", enabled);
@@ -579,6 +594,23 @@ impl EventTap {
             return self.on_mouse_moved(event);
         }
 
+        // Mouse events rift posted itself (the click-closing release of a
+        // float-drag takeover) must pass through untouched: reading one as
+        // the user's release would flip the tracked button state while the
+        // physical button is still down.
+        if matches!(
+            event_type,
+            CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::RightMouseDragged
+        ) && event::is_rift_synthetic_event(event)
+        {
+            return true;
+        }
+
         let mut state = self.state.borrow_mut();
 
         if !matches!(
@@ -623,10 +655,46 @@ impl EventTap {
                     let _ = self.stack_line_tx.try_send(stack_line::Event::MouseDown(loc));
                     return false;
                 }
+
+                // A press on a floating window's grab strip: remember it.
+                // The press reaches the app (it is a click until proven a
+                // drag); the takeover begins only past the drag threshold.
+                // The window under the point comes from the window server —
+                // matching the press against remembered strip rectangles
+                // ignored z-order and grabbed whichever float's strip lay
+                // under the point, topmost or not.
+                if event_type == CGEventType::LeftMouseDown {
+                    self.pending_float_grab.set(None);
+                    let hinted = mouse_window_hint(event)
+                        .or_else(crate::sys::window_server::window_under_cursor);
+                    if let Some(wsid) = hinted {
+                        let float = self
+                            .float_strips
+                            .borrow()
+                            .iter()
+                            .find(|(id, _, _)| *id == wsid.as_u32())
+                            .map(|&(id, pid, _)| (id, pid));
+                        if let Some((id, pid)) = float
+                            && let Some(frame) =
+                                crate::sys::window_server::live_window_frame(wsid)
+                            && loc.x >= frame.origin.x
+                            && loc.x < frame.origin.x + frame.size.width
+                            && loc.y >= frame.origin.y
+                            && loc.y < frame.origin.y + 44.0_f64.min(frame.size.height)
+                        {
+                            self.pending_float_grab.set(Some((loc, id, pid)));
+                        }
+                    }
+                }
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 set_mouse_state(MouseState::Down);
                 if self.continue_modifier_drag(event_type, event) {
+                    return false;
+                }
+                if event_type == CGEventType::LeftMouseDragged
+                    && self.maybe_begin_float_takeover(event)
+                {
                     return false;
                 }
             }
@@ -637,6 +705,9 @@ impl EventTap {
                 // still has to hear it: left believing the drag was on, it read
                 // the user's next plain drag of the window as echoes of its own
                 // writes and never put the window back until some later click.
+                // A release before the drag threshold: it was a click, and
+                // the app already has it.
+                self.pending_float_grab.set(None);
                 if self.end_modifier_drag(event_type) {
                     _ = self.events_tx.send(Event::MouseUp);
                     return false;
@@ -679,6 +750,44 @@ impl EventTap {
             _ => (),
         }
 
+        true
+    }
+
+    /// Turns a pending float-strip grab into a rift-driven drag once the
+    /// pointer has moved past the click threshold.
+    ///
+    /// The app keeps the press as a completed click (a synthetic release is
+    /// posted at the press point) and never sees the drag; rift moves the
+    /// window through the modifier-drag machinery. An app that animates its
+    /// own drag (Warp's tab bar) otherwise fights macOS over the display
+    /// seam — the vibrating, snapping drag — while rift-driven moves cross
+    /// it cleanly.
+    fn maybe_begin_float_takeover(&self, event: &CGEvent) -> bool {
+        let Some((down, wsid, pid)) = self.pending_float_grab.get() else {
+            return false;
+        };
+        let loc = CGEvent::location(Some(event));
+        const THRESHOLD: f64 = 12.0;
+        if (loc.x - down.x).abs() + (loc.y - down.y).abs() < THRESHOLD {
+            return false;
+        }
+        self.pending_float_grab.set(None);
+        debug!(?wsid, ?down, "taking over a float drag from its grab strip");
+        let _ = event::post_synthetic_left_mouse_up(pid, down);
+        _ = self.events_tx.send(Event::MouseModifierDragBegin {
+            window: crate::sys::window_server::WindowServerId::new(wsid),
+            at: down,
+            action: crate::common::config::MouseAction::Move,
+        });
+        self.modifier_drag.set(Some(ModifierDrag {
+            button: MouseButton::Left,
+            origin: down,
+            last: loc,
+            last_sent: Instant::now(),
+        }));
+        // Report the movement already made, so the window catches up to the
+        // pointer instead of starting from the press point.
+        let _ = self.continue_modifier_drag(CGEventType::LeftMouseDragged, event);
         true
     }
 
@@ -991,8 +1100,21 @@ unsafe extern "C-unwind" fn mouse_callback(
         return event_ref.as_ptr();
     }
 
+    let tap_entered = std::time::Instant::now();
     let result =
         std::panic::catch_unwind(AssertUnwindSafe(|| ctx.this.on_event(event_type, event)));
+
+    // The tap sits in the input latency path of every application. When a
+    // trace is recording, keep a record of anything it did that an app
+    // could feel: an event it consumed, or a callback slow enough to delay
+    // delivery.
+    if crate::sys::trace::is_recording() {
+        let us = tap_entered.elapsed().as_micros() as u64;
+        let consumed = matches!(result, Ok(false));
+        if consumed || us > 1_000 {
+            crate::sys::trace::act("tap", &(format!("{event_type:?}"), consumed, us));
+        }
+    }
 
     match result {
         Ok(true) => event_ref.as_ptr(),

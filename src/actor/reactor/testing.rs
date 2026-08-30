@@ -554,7 +554,9 @@ impl Apps {
             debug!(?request);
             match request {
                 Request::Terminate => break,
-                Request::WindowMaybeDestroyed(_) | Request::VerifyWindowAlive(_) => {}
+                Request::WindowMaybeDestroyed(_)
+                | Request::VerifyWindowAlive(_)
+                | Request::SetDragNotificationSilence(..) => {}
                 Request::GetVisibleWindows => {
                     if got_visible_windows {
                         continue;

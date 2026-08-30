@@ -369,6 +369,14 @@ pub enum Request {
     /// parameter for the last window only. Events for other windows will be
     /// marked `Quiet::Yes` automatically.
     Raise(Vec<WindowId>, CancellationToken, u64, Quiet),
+
+    /// Silence (or restore) a window's own move/resize notifications while
+    /// the user drags it. An app that animates its drag itself (Warp's
+    /// tab-bar drag) emits a notification per animation frame; servicing
+    /// them re-enters its accessibility bridge mid-gesture and the drag
+    /// glitched. The drop is resolved from window-server state, so nothing
+    /// downstream needs the silenced reports.
+    SetDragNotificationSilence(WindowId, bool),
 }
 
 impl Request {
@@ -435,6 +443,9 @@ struct AppWindowState {
     title: String,
     is_animating: bool,
     last_animation_frame: Option<CGRect>,
+    /// Move/resize notifications are removed for the duration of a user
+    /// drag of this window. See `Request::SetDragNotificationSilence`.
+    drag_silenced: bool,
 }
 
 struct PendingFrame {
@@ -1065,7 +1076,25 @@ impl State {
                 ));
             }
             Request::Raise(wids, token, sequence_id, quiet) => {
+                crate::sys::trace::act("raise", &wids);
                 self.raises_tx.send(RaiseRequest(wids, token, sequence_id, quiet));
+            }
+            Request::SetDragNotificationSilence(wid, silence) => {
+                let elem = match self.window_mut(wid) {
+                    Ok(window) if window.drag_silenced != silence => {
+                        window.drag_silenced = silence;
+                        Some(window.elem.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(elem) = elem {
+                    crate::sys::trace::act("drag_silence", &(wid.idx.get(), silence));
+                    if silence {
+                        self.stop_notifications_for_animation(&elem);
+                    } else {
+                        self.restart_notifications_after_animation(&elem);
+                    }
+                }
             }
         }
         Ok(false)
@@ -1146,13 +1175,13 @@ impl State {
                     return;
                 }
 
-                let txid = match self.window(wid) {
+                let (txid, window_server_id) = match self.window(wid) {
                     Ok(window) => {
                         if window.is_animating {
                             trace!(?wid, ?notif, "Ignoring notification during animation");
                             return;
                         }
-                        self.txid_for_window_state(window)
+                        (self.txid_for_window_state(window), window.window_server_id)
                     }
                     Err(err) => {
                         match err {
@@ -1166,34 +1195,69 @@ impl State {
                         return;
                     }
                 };
-                let frame = match elem.frame() {
-                    Ok(frame) => frame,
-                    // During display teardown, macOS can send AXWindowMoved after
-                    // the old AX element has been invalidated. This is not a
-                    // destruction notification. Only AXUIElementDestroyed is
-                    // authoritative for removing the app's window record; treating
-                    // this transient read failure as a destroy drops manual
-                    // workspace ownership before the window is rediscovered.
-                    Err(AxError::Ax(AXError::InvalidUIElement)) => {
-                        trace!(
-                            ?wid,
-                            ?notif,
-                            "Ignoring invalid AX element from move/resize notification"
-                        );
-                        return;
-                    }
-                    Err(AxError::Ax(AXError::CannotComplete)) => return,
-                    Err(err) => {
-                        debug!(?wid, ?err, "Failed to read frame for window");
-                        return;
-                    }
+                let mouse_state = event::get_mouse_state();
+                // While the user's button is down, take the frame from the
+                // window server instead of asking the app. A move
+                // notification arrives for every animation step of a drag
+                // the app animates itself (Warp's tab-bar drag), and a
+                // synchronous AX round-trip back into the app's main thread
+                // for each one re-enters its accessibility bridge mid-
+                // gesture — Warp's drag state glitched and the window
+                // snapped back to where the drag began. The server has the
+                // same frame without touching the app.
+                let server_frame = if mouse_state == Some(event::MouseState::Down) {
+                    window_server_id
+                        .and_then(crate::sys::window_server::live_window_frame)
+                        .filter(|frame| frame.size.width > 0.0 && frame.size.height > 0.0)
+                } else {
+                    None
                 };
+                let ax_read_started = std::time::Instant::now();
+                let used_server = server_frame.is_some();
+                let frame = match server_frame {
+                    Some(frame) => frame,
+                    None => match elem.frame() {
+                        Ok(frame) => frame,
+                        // During display teardown, macOS can send AXWindowMoved after
+                        // the old AX element has been invalidated. This is not a
+                        // destruction notification. Only AXUIElementDestroyed is
+                        // authoritative for removing the app's window record; treating
+                        // this transient read failure as a destroy drops manual
+                        // workspace ownership before the window is rediscovered.
+                        Err(AxError::Ax(AXError::InvalidUIElement)) => {
+                            trace!(
+                                ?wid,
+                                ?notif,
+                                "Ignoring invalid AX element from move/resize notification"
+                            );
+                            return;
+                        }
+                        Err(AxError::Ax(AXError::CannotComplete)) => return,
+                        Err(err) => {
+                            debug!(?wid, ?err, "Failed to read frame for window");
+                            return;
+                        }
+                    },
+                };
+                if crate::sys::trace::is_recording()
+                    && mouse_state == Some(event::MouseState::Down)
+                {
+                    crate::sys::trace::act(
+                        "ax_notif",
+                        &(
+                            wid.idx.get(),
+                            notif.name(),
+                            if used_server { "server" } else { "ax" },
+                            ax_read_started.elapsed().as_micros() as u64,
+                        ),
+                    );
+                }
                 self.send_event(Event::WindowFrameChanged(
                     wid,
                     frame,
                     txid,
                     Requested(false),
-                    event::get_mouse_state(),
+                    mouse_state,
                 ));
             }
             AxNotificationKind::WindowMiniaturized => {
@@ -1725,6 +1789,7 @@ impl State {
                 title: info.title.clone(),
                 is_animating: false,
                 last_animation_frame: None,
+                drag_silenced: false,
             },
         );
         debug_assert!(old.is_none(), "Duplicate window id {wid:?}");

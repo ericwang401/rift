@@ -287,8 +287,7 @@ pub enum Event {
     ApplicationGloballyDeactivated(pid_t),
     ApplicationMainWindowChanged(pid_t, Option<WindowId>, Quiet),
     /// Authoritative focus resolved from WindowServer's key-focus process and
-    /// the z-ordered windows on the active native space.
-    #[serde(skip)]
+    /// the z-ordered windows on the active native spaces.
     WindowServerFocusChanged(WindowId, SpaceId),
 
     WindowsDiscovered {
@@ -453,6 +452,9 @@ pub struct Reactor {
     transaction_manager: transaction_manager::TransactionManager,
     /// The modifier drag in flight, if any. See `ModifierDragState`.
     modifier_drag: Option<ModifierDragState>,
+    /// The float grab strips last pushed to the event tap, to push only
+    /// changes. See `Request::SetFloatDragStrips` (event tap).
+    last_float_strips: Vec<(u32, i32, CGRect)>,
     /// When the mouse button last came up. A focus change that follows a
     /// click is the pointer's doing; the pointer is not moved for it.
     last_mouse_up: Option<std::time::Instant>,
@@ -564,6 +566,9 @@ impl Reactor {
             drag_manager: managers::DragManager {
                 drag_state: DragState::Inactive,
                 drop_overlay_shown: false,
+                notifications_silenced: None,
+                space_sync_at: None,
+                seam_finish: None,
                 zone_candidate: None,
                 drop_preview_cache: None,
                 drag_swap_manager: crate::actor::drag_swap::DragManager::new(
@@ -598,6 +603,7 @@ impl Reactor {
             },
             transaction_manager: transaction_manager::TransactionManager::new(window_tx_store),
             modifier_drag: None,
+            last_float_strips: Vec::new(),
             last_mouse_up: None,
             focus_left_from: None,
             menu_manager: managers::MenuManager {
@@ -1324,6 +1330,7 @@ impl Reactor {
                     outcome.absorb(homing);
                 }
                 self.release_drop_pin_if_landed();
+                self.assert_seam_finish();
                 self.apply_event_outcome(outcome);
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
@@ -1395,6 +1402,8 @@ impl Reactor {
             _ => {}
         }
         self.note_explicit_window_intent(&event);
+        self.sync_drag_notification_silence();
+        self.sync_float_drag_strips();
         // Focus reported on a window that is not admitted — an app's child
         // window, such as Lightroom's filmstrip, which the window server and
         // AX both happily report as focused — is focus on the top-level
@@ -1850,7 +1859,37 @@ impl Reactor {
                 // A modifier drag ends with the button. Left set, it kept
                 // reading the window's later reports as echoes and kept
                 // mouse-follows-focus off for good.
-                self.modifier_drag = None;
+                let ended_modifier_drag = self.modifier_drag.take();
+                // A rift-driven float move (a takeover, or an alt-drag) that
+                // ends straddling the display seam needs the same finish a
+                // reported drag's drop gets: the system relocates straddling
+                // programmatic placements to a display of its own choosing.
+                if let Some(drag) = ended_modifier_drag
+                    && matches!(drag.action, crate::common::config::MouseAction::Move)
+                    && self.layout_manager.layout_engine.is_window_floating(drag.window)
+                    && let Some(state) = self.state.windows.window(drag.window)
+                {
+                    let screens: Vec<CGRect> =
+                        self.space_state.screens.iter().map(|screen| screen.frame).collect();
+                    let pointer = window_server::current_cursor_location().ok();
+                    let dropped_at = state.frame_monotonic;
+                    if crate::actor::reactor::events::drag::seam_fitted(
+                        &screens,
+                        pointer,
+                        dropped_at,
+                    )
+                    .is_some()
+                    {
+                        self.drag_manager.seam_finish = Some(managers::SeamFinish {
+                            window: drag.window,
+                            dropped_at,
+                            pointer,
+                            fitted: None,
+                            at: crate::sys::trace::now(),
+                            attempts: 0,
+                        });
+                    }
+                }
                 self.last_mouse_up = Some(crate::sys::trace::now());
                 let held = self.drag_manager.held_window.take();
                 let pending_swap = self.get_pending_drag_swap();
@@ -1913,8 +1952,9 @@ impl Reactor {
                 // far onto the next display as the user got it, and deciding
                 // by its centre sent a window the user had pulled a fifth of
                 // the way onto the other display back to where it came from.
+                let pointer = window_server::current_cursor_location().ok();
                 let pointer_space = session.as_ref().and_then(|_| {
-                    let cursor = window_server::current_cursor_location().ok()?;
+                    let cursor = pointer?;
                     self.screen_for_point(cursor).and_then(|screen| screen.space)
                 });
                 let final_space = target_space.or(pointer_space).or_else(|| {
@@ -1959,6 +1999,13 @@ impl Reactor {
                         final_space,
                         visible_spaces,
                         visible_space_centers,
+                        screens: self
+                            .space_state
+                            .screens
+                            .iter()
+                            .map(|screen| screen.frame)
+                            .collect(),
+                        pointer,
                     },
                 )?;
                 if let Some(window) = held
@@ -2012,6 +2059,7 @@ impl Reactor {
                 });
             }
             Event::MouseDragged { x, y } => {
+                self.sync_dragged_float_space();
                 let session = match &self.drag_manager.drag_state {
                     DragState::Active { session } | DragState::PendingSwap { session, .. } => {
                         Some((session.window, session.last_frame))
@@ -2184,6 +2232,13 @@ impl Reactor {
                         self.recording_manager.record = Record::new(None);
                         crate::sys::trace::stop_recording();
                     }
+                }
+                return Ok(EventOutcome::no_change());
+            }
+            Event::Command(Command::Reactor(ReactorCommand::DumpTrace { path })) => {
+                match crate::sys::trace::dump_ring(&path) {
+                    Ok(lines) => info!(?path, lines, "Dumped the flight recorder"),
+                    Err(err) => warn!(?path, %err, "Failed to dump the flight recorder"),
                 }
                 return Ok(EventOutcome::no_change());
             }
@@ -3709,6 +3764,262 @@ impl Reactor {
         for wid in windows {
             self.adopt_displaced_window(wid);
         }
+    }
+
+    /// While the user drags a floating window, the window's own move/resize
+    /// notifications are silenced at the source. An app that animates the
+    /// drag itself (Warp's tab-bar drag) posts one per animation frame, and
+    /// running its accessibility bridge mid-gesture glitched the drag — the
+    /// window snapped back to where the drag began. Evaluated on every
+    /// event, so however the drag ends, the next event restores them.
+    fn sync_drag_notification_silence(&mut self) {
+        let target = self
+            .window_in_drag()
+            .filter(|wid| self.layout_manager.layout_engine.is_window_floating(*wid));
+        let current = self.drag_manager.notifications_silenced;
+        if target == current {
+            return;
+        }
+        if let Some(prev) = current
+            && let Some(app) = self.app_manager.apps.get(&prev.pid)
+        {
+            _ = app.handle.send(Request::SetDragNotificationSilence(prev, false));
+        }
+        if let Some(wid) = target
+            && let Some(app) = self.app_manager.apps.get(&wid.pid)
+        {
+            _ = app.handle.send(Request::SetDragNotificationSilence(wid, true));
+        }
+        self.drag_manager.notifications_silenced = target;
+    }
+
+    /// Keeps the event tap's picture of the floating windows' grab strips
+    /// (title/tab bars) current, for the plain-drag takeover. Pushed only
+    /// when it changes.
+    fn sync_float_drag_strips(&mut self) {
+        const STRIP_HEIGHT: f64 = 44.0;
+        let strips: Vec<(u32, i32, CGRect)> = if self.config.settings.mouse.takeover_float_drags {
+            self.state
+                .windows
+                .iter_windows()
+                .filter(|(wid, _)| self.layout_manager.layout_engine.is_window_floating(*wid))
+                .filter_map(|(wid, state)| {
+                    let wsid = state.info.sys_id?;
+                    let frame = state.frame_monotonic;
+                    Some((
+                        wsid.as_u32(),
+                        wid.pid,
+                        CGRect::new(
+                            frame.origin,
+                            CGSize::new(frame.size.width, STRIP_HEIGHT.min(frame.size.height)),
+                        ),
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if strips == self.last_float_strips {
+            return;
+        }
+        if let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
+            _ = event_tap_tx.send(crate::actor::event_tap::Request::SetFloatDragStrips(
+                strips.clone(),
+            ));
+        }
+        self.last_float_strips = strips;
+    }
+
+    /// While the user drags a floating window across the display seam, keep
+    /// its space membership matched to the display actually holding it.
+    /// macOS relocates a window whose position has left its space's display;
+    /// for an app that animates its own drag (Warp's tab bar) that is the
+    /// vibrating fight over the seam — position bounced, app re-asserts,
+    /// repeat. A bare space-membership move has no position component, so
+    /// matching membership as the window crosses removes the trigger without
+    /// touching the drag itself.
+    fn sync_dragged_float_space(&mut self) {
+        const EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+        let Some(wid) = self.window_in_drag() else {
+            return;
+        };
+        if !self.layout_manager.layout_engine.is_window_floating(wid) {
+            return;
+        }
+        let now = crate::sys::trace::now();
+        if self
+            .drag_manager
+            .space_sync_at
+            .is_some_and(|at| now.saturating_duration_since(at) < EVERY)
+        {
+            return;
+        }
+        self.drag_manager.space_sync_at = Some(now);
+        let Some(wsid) = self.state.windows.window(wid).and_then(|window| window.info.sys_id)
+        else {
+            return;
+        };
+        let Some(live) = window_server::live_window_frame(wsid) else {
+            return;
+        };
+        let majority_space = self
+            .space_state
+            .screens
+            .iter()
+            .filter_map(|screen| {
+                let space = screen.space?;
+                let i = screen.frame.intersection(&live);
+                (i.size.width > 1.0 && i.size.height > 1.0)
+                    .then_some((space, i.size.width * i.size.height))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(space, _)| space);
+        let Some(space) = majority_space.filter(|space| self.is_space_active(*space)) else {
+            return;
+        };
+        if window_server::window_space(wsid) == Some(space) {
+            return;
+        }
+        if crate::sys::scripting_addition::move_window_to_space(wsid.as_u32(), space.get()) {
+            debug!(?wid, ?space, "syncing dragged float's space to the display under it");
+            self.note_window_sent_to_space(wsid);
+            crate::sys::trace::act("drag_space_sync", &(wsid.as_u32(), space.get()));
+        }
+    }
+
+    /// A seam-straddling drop's finish write races the system's relocation
+    /// of the straddling window; the loser of the race is overwritten. Once
+    /// the dust has settled, re-assert the finish — a frame fully on one
+    /// display is never relocated, so the second write is final.
+    fn assert_seam_finish(&mut self) {
+        let Some(finish) = self.drag_manager.seam_finish else {
+            return;
+        };
+        // A new drag supersedes the finish outright: re-asserting an old
+        // drop's frame while the user is dragging yanked the window a
+        // thousand pixels out of their hand.
+        if self.window_in_drag().is_some()
+            || crate::sys::event::get_mouse_state() == Some(crate::sys::event::MouseState::Down)
+        {
+            self.drag_manager.seam_finish = None;
+            return;
+        }
+        let now = crate::sys::trace::now();
+        if now.saturating_duration_since(finish.at) < managers::SeamFinish::SETTLE {
+            return;
+        }
+        let Some(window) = self.state.windows.window(finish.window) else {
+            self.drag_manager.seam_finish = None;
+            return;
+        };
+        // The server, not rift's own record: the system's relocation report
+        // trails rift's last write's transaction and the gate discards it,
+        // so `frame_monotonic` still shows the write that lost the race.
+        let observed = window
+            .info
+            .sys_id
+            .and_then(window_server::live_window_frame)
+            .unwrap_or(window.frame_monotonic);
+        let target = match finish.fitted {
+            None => {
+                // The watch: if the drop was left where the user put it —
+                // overhanging the seam, clipped — macOS allowed it, and
+                // there is nothing to do. Only a relocation asks for the
+                // deterministic placement.
+                let moved = (observed.origin.x - finish.dropped_at.origin.x).abs()
+                    + (observed.origin.y - finish.dropped_at.origin.y).abs()
+                    > managers::SeamFinish::TOLERANCE;
+                if !moved {
+                    self.drag_manager.seam_finish = None;
+                    return;
+                }
+                let screens: Vec<CGRect> =
+                    self.space_state.screens.iter().map(|screen| screen.frame).collect();
+                let Some(fitted) = crate::actor::reactor::events::drag::seam_fitted(
+                    &screens,
+                    finish.pointer,
+                    finish.dropped_at,
+                ) else {
+                    self.drag_manager.seam_finish = None;
+                    return;
+                };
+                debug!(
+                    window = ?finish.window,
+                    dropped_at = ?finish.dropped_at,
+                    ?observed,
+                    ?fitted,
+                    "seam drop was relocated; placing it deterministically"
+                );
+                fitted
+            }
+            Some(fitted) => {
+                // Landed means: resting on the landing display and no other
+                // — not pixel equality; the system likes to adjust a
+                // placement by a pixel or two, and chasing that would burn
+                // the attempts for nothing.
+                let display_of = |point: CGPoint| {
+                    self.space_state
+                        .screens
+                        .iter()
+                        .position(|screen| screen.frame.contains(point))
+                };
+                let foreign_overlap = self.space_state.screens.iter().any(|screen| {
+                    if screen.frame.contains(fitted.mid()) {
+                        return false;
+                    }
+                    let i = screen.frame.intersection(&observed);
+                    i.size.width > 1.0 && i.size.height > 1.0
+                });
+                let landed =
+                    !foreign_overlap && display_of(observed.mid()) == display_of(fitted.mid());
+                if landed || finish.attempts >= 2 {
+                    self.drag_manager.seam_finish = None;
+                    return;
+                }
+                debug!(
+                    window = ?finish.window,
+                    ?fitted,
+                    ?observed,
+                    "re-asserting a seam-finish the system relocated over"
+                );
+                fitted
+            }
+        };
+        // The relocation may have handed the window to the other display's
+        // space (even an inactive one); a frame write alone cannot carry it
+        // back across. Put it on the landing display's space first.
+        let landing_space = self
+            .screen_for_point(target.mid())
+            .and_then(|screen| screen.space)
+            .filter(|space| self.is_space_active(*space));
+        if let (Some(wsid), Some(space)) = (window.info.sys_id, landing_space)
+            && window_server::window_space(wsid) != Some(space)
+            && crate::sys::scripting_addition::move_window_to_space(wsid.as_u32(), space.get())
+        {
+            self.note_window_sent_to_space(wsid);
+        }
+        let transaction = match window.info.sys_id {
+            Some(wsid) => {
+                let transaction = self.transaction_manager.generate_next_txid(wsid);
+                self.transaction_manager.store_txid(wsid, transaction, target);
+                transaction
+            }
+            None => TransactionId::default(),
+        };
+        if let Some(app) = self.app_manager.apps.get(&finish.window.pid) {
+            _ = app.handle.send(Request::SetWindowFrame(
+                finish.window,
+                target,
+                transaction,
+                true,
+            ));
+        }
+        self.drag_manager.seam_finish = Some(managers::SeamFinish {
+            fitted: Some(target),
+            at: now,
+            attempts: finish.attempts + 1,
+            ..finish
+        });
     }
 
     /// The pin is released as soon as the window server agrees with it, or

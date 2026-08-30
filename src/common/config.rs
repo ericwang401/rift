@@ -518,6 +518,15 @@ pub struct MouseSettings {
     /// What a modifier + right-button drag does.
     #[serde(default)]
     pub action2: MouseAction,
+    /// Take over plain drags that grab a floating window by its top strip
+    /// (title bar / tab bar): the app never sees the drag, rift moves the
+    /// window. Stops apps that animate their own drags (Warp's tab bar)
+    /// from fighting macOS over the display seam — the vibrating,
+    /// snapping-back drag. Opt-in: it also swallows everything else a strip
+    /// drag can mean (tearing a tab out into its own window, drag-to-tile,
+    /// drag-to-menu-bar), which no heuristic can tell apart from a move.
+    #[serde(default)]
+    pub takeover_float_drags: bool,
 }
 
 impl MouseSettings {

@@ -2499,6 +2499,14 @@ impl LayoutEngine {
             wid: WindowId,
             candidate: Option<CGRect>,
             store_if_absent: bool,
+            // Emitting the frame into `positions` turns it into a write.
+            // Only a frame rift *intends* — a pending placement, a parked
+            // float being restored — may be emitted. A float followed at
+            // its own live frame is a read, and emitting it wrote the
+            // window back to an earlier sample of a frame that was still
+            // moving (a dropped window settling): the float snapping away
+            // from where the user let go of it.
+            emit: bool,
             screen: &CGRect,
             all_screens: &[CGRect],
         ) {
@@ -2517,7 +2525,9 @@ impl LayoutEngine {
             let Some(rect) = candidate.filter(usable).or_else(|| existing.filter(usable)) else {
                 return;
             };
-            positions.insert(wid, rect);
+            if emit {
+                positions.insert(wid, rect);
+            }
             if store_if_absent {
                 engine.floating_positions.store_if_absent(space, workspace_id, wid, rect);
             } else {
@@ -2603,6 +2613,11 @@ impl LayoutEngine {
                     } else {
                         live.unwrap_or(stored_position)
                     };
+                    // A write is owed only when rift wants the window
+                    // somewhere it is not: an intended placement, or a
+                    // parked float whose live frame is unusable. Following
+                    // the live frame is bookkeeping, never a write.
+                    let emit = intended || live.is_none();
                     ensure_visible_floating(
                         self,
                         &mut positions,
@@ -2611,6 +2626,7 @@ impl LayoutEngine {
                         window_id,
                         Some(candidate),
                         false,
+                        emit,
                         &screen,
                         all_screens,
                     );
@@ -2629,6 +2645,7 @@ impl LayoutEngine {
                 } else {
                     get_window_frame(wid)
                 };
+                // Seeding the store from the live frame; nothing to write.
                 ensure_visible_floating(
                     self,
                     &mut positions,
@@ -2637,14 +2654,18 @@ impl LayoutEngine {
                     wid,
                     live_frame,
                     false,
+                    false,
                     &screen,
                     all_screens,
                 );
             }
 
-            let fullscreen: Vec<(WindowId, FloatingFullscreenKind)> = positions
-                .keys()
-                .copied()
+            // From the workspace's floats, not `positions`: a float merely
+            // followed at its live frame is no longer emitted there, and a
+            // fullscreen float's frame is an intent that must stay asserted.
+            let fullscreen: Vec<(WindowId, FloatingFullscreenKind)> = self
+                .active_floating_windows_in_workspace(window_store, space)
+                .into_iter()
                 .filter_map(|w| self.floating.fullscreen_kind(w).map(|k| (w, k)))
                 .collect();
             for (w, kind) in fullscreen {
@@ -2682,6 +2703,7 @@ impl LayoutEngine {
                         workspace_id,
                         wid,
                         original_frame,
+                        true,
                         true,
                         &screen,
                         all_screens,

@@ -60,6 +60,43 @@ pub struct DragManager {
     /// after a re-tile would otherwise be invisible. See
     /// `Reactor::window_in_drag`.
     pub held_window: Option<WindowId>,
+    /// A floating window whose own move/resize notifications are silenced
+    /// while the user drags it. See `Request::SetDragNotificationSilence`.
+    pub notifications_silenced: Option<WindowId>,
+    /// Throttle for keeping a dragged float's space membership matched to
+    /// the display under it. See `Reactor::sync_dragged_float_space`.
+    pub space_sync_at: Option<std::time::Instant>,
+    /// A seam-straddling drop rift finished with a write. The write races
+    /// the system's own relocation of the straddling window; whichever
+    /// lands second wins. Re-asserted once the dust settles — a frame fully
+    /// on one display is never relocated, so the re-assert sticks.
+    pub seam_finish: Option<SeamFinish>,
+}
+
+/// See `DragManager::seam_finish`.
+#[derive(Debug, Clone, Copy)]
+pub struct SeamFinish {
+    pub window: WindowId,
+    /// Where the user let go. macOS lets a server-side drag rest overhanging
+    /// the seam (clipped at its display's edge), so a straddling drop is
+    /// only *watched*: rift steps in solely when the system or the app
+    /// relocates the window away from this.
+    pub dropped_at: objc2_core_foundation::CGRect,
+    /// Where the pointer let go, for choosing the landing display if a
+    /// correction becomes necessary.
+    pub pointer: Option<objc2_core_foundation::CGPoint>,
+    /// The correction rift wrote, once it decided one was needed.
+    pub fitted: Option<objc2_core_foundation::CGRect>,
+    pub at: std::time::Instant,
+    pub attempts: u8,
+}
+
+impl SeamFinish {
+    /// How long after the drop the placement is checked and re-asserted.
+    pub const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+    /// How far the window may drift from the drop before rift reads it as
+    /// relocated rather than settled.
+    pub const TOLERANCE: f64 = 12.0;
 }
 
 /// See `DragManager::zone_candidate`.
@@ -393,7 +430,13 @@ impl LayoutManager {
         let skip_wid = reactor
             .window_in_drag()
             .or_else(|| reactor.drag_manager.skip_layout_for_window.take())
-            .or(reactor.drag_manager.drag_swap_manager.dragged());
+            .or(reactor.drag_manager.drag_swap_manager.dragged())
+            // A window whose seam-finish is still settling: the system is
+            // mid-relocation and its live frame reads as anything — half
+            // off-screen looked "parked" and the float-restore wrote a stale
+            // stored frame over the drop (the "pseudo-tile"). The finish
+            // owns the window until it lands.
+            .or(reactor.drag_manager.seam_finish.map(|finish| finish.window));
         let mut any_frame_changed = false;
 
         let active_space = reactor.workspace_command_space();

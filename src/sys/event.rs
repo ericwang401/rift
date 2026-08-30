@@ -119,3 +119,23 @@ pub fn is_rift_synthetic_event(event: &CGEvent) -> bool {
     CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData)
         == RIFT_SYNTHETIC_EVENT_MARKER
 }
+
+/// Closes a click for an app whose drag rift is taking over: the app saw the
+/// press on its title/tab strip; this synthetic release turns it into a
+/// completed click before the drag events are consumed, so the app is never
+/// left holding half a gesture (see the swallowed-release bug). Tagged as
+/// rift-synthetic so the event tap passes it through untouched.
+pub fn post_synthetic_left_mouse_up(pid: crate::sys::app::pid_t, at: CGPoint) -> bool {
+    use objc2_core_graphics::{CGEventType, CGMouseButton};
+    let Some(up) = CGEvent::new_mouse_event(None, CGEventType::LeftMouseUp, at, CGMouseButton::Left)
+    else {
+        return false;
+    };
+    CGEvent::set_integer_value_field(
+        Some(&up),
+        CGEventField::EventSourceUserData,
+        RIFT_SYNTHETIC_EVENT_MARKER,
+    );
+    CGEvent::post_to_pid(pid, Some(&up));
+    true
+}

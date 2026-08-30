@@ -1243,6 +1243,8 @@ fn dropping_with_no_swap_still_arranges_the_window_back() {
             final_space: Some(space1),
             visible_spaces,
             visible_space_centers,
+            screens: vec![],
+            pointer: None,
         },
     )
     .unwrap();
@@ -1441,6 +1443,8 @@ fn cross_display_drag_clears_source_floating_position() {
             final_space: Some(space2),
             visible_spaces,
             visible_space_centers,
+            screens: vec![],
+            pointer: None,
         },
     )
     .unwrap();
@@ -5283,10 +5287,17 @@ fn floating_window_toggle_off_restore_previous_frame() {
     reactor.handle_test_layout_command(LayoutCommand::ToggleFullscreen);
     // Turn off
     reactor.handle_test_layout_command(LayoutCommand::ToggleFullscreen);
-    let laid_out = laid_out_frame(&mut reactor, space1, screen, wid).expect("window laid out");
+    // The restore intent was already laid out by the command's own arrange;
+    // once the window is back at the frame, a further layout owes no write.
+    let restored = reactor.state.windows.window(wid).expect("window tracked").frame_monotonic;
     assert!(
-        laid_out.same_as(floating_frame),
-        "expected restore to {floating_frame:?}, got {laid_out:?}"
+        restored.same_as(floating_frame),
+        "expected restore to {floating_frame:?}, got {restored:?}"
+    );
+    assert_eq!(
+        laid_out_frame(&mut reactor, space1, screen, wid),
+        None,
+        "no further write once the restore has landed"
     );
 }
 
@@ -5990,11 +6001,14 @@ mod floating_placement {
             .into_iter()
             .find(|(w, _)| *w == wid)
             .map(|(_, f)| f);
-        assert_eq!(placed, Some(frame), "left where it is, not centred");
-        assert_ne!(
-            placed.map(|f| f.mid()),
-            Some(screen.mid()),
-            "the old behaviour centred it"
+        assert_eq!(
+            placed, None,
+            "no write is owed: the window simply stays where it is (the old behaviour centred it)"
+        );
+        assert_eq!(
+            reactor.layout_manager.layout_engine.get_floating_position(space, workspace, wid),
+            Some(frame),
+            "the live frame seeded the store"
         );
     }
 
@@ -6044,8 +6058,13 @@ mod floating_placement {
         };
         assert_eq!(
             lay_out(&mut reactor, &|_| Some(live)),
+            None,
+            "visible: the live frame wins and following it is not a write"
+        );
+        assert_eq!(
+            reactor.layout_manager.layout_engine.get_floating_position(space, workspace, wid),
             Some(live),
-            "visible: live frame wins"
+            "the remembered frame followed the live one"
         );
 
         // Parked off-screen: the remembered frame is what brings it back.
@@ -6112,18 +6131,20 @@ mod floating_placement {
             "and held while the app has not answered"
         );
 
-        // The app answered, but with its own idea of the size.
+        // The app answered, but with its own idea of the size. The intent
+        // is spent; following the answer is bookkeeping, not a write.
         let answered = CGRect::new(CGPoint::new(420., 250.), CGSize::new(900., 400.));
-        assert_eq!(
-            lay_out(&mut reactor, answered),
-            Some(answered),
-            "the answer stands"
-        );
+        assert_eq!(lay_out(&mut reactor, answered), None, "the answer stands");
         let moved = CGRect::new(CGPoint::new(50., 50.), CGSize::new(900., 400.));
         assert_eq!(
             lay_out(&mut reactor, moved),
-            Some(moved),
+            None,
             "and so does wherever it goes next"
+        );
+        assert_eq!(
+            reactor.layout_manager.layout_engine.get_floating_position(space, workspace, wid),
+            Some(moved),
+            "the stored frame followed the window"
         );
     }
 
@@ -6176,7 +6197,162 @@ mod floating_placement {
             .into_iter()
             .find(|(w, _)| *w == wid)
             .map(|(_, f)| f);
-        assert_eq!(placed, Some(moved), "the stored frame followed the move");
+        assert_eq!(placed, None, "following the move is not a write");
+        assert_eq!(
+            reactor.layout_manager.layout_engine.get_floating_position(space, workspace, wid),
+            Some(moved),
+            "the stored frame followed the move"
+        );
+    }
+
+    /// A drop is an observation, not an intent. Storing the drop frame with
+    /// a placement intent made the drop-arrange lay the float at the frame
+    /// the *server* reported at release — stale during a tab-bar drag,
+    /// whose AX reports outrun the server frame — snapping the window back
+    /// out of the user's hands (snapping.trace).
+    #[test]
+    fn a_drop_follows_the_float_instead_of_replacing_it() {
+        let mut reactor = test_reactor();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+        reactor.add_test_app(1);
+        let wid = WindowId::new(1, 1);
+        let drag_origin = CGRect::new(CGPoint::new(570., 350.), CGSize::new(300., 200.));
+        reactor.add_test_window(wid, WindowServerId::new(101), Some(space), drag_origin);
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+        reactor.layout_manager.layout_engine.mark_window_floating(wid);
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+
+        // The drag: the session's last noted frame lags at the origin (the
+        // server never saw the tab-drag move), while the app's own reports
+        // carried the window to where the user dropped it.
+        reactor.ensure_active_drag(wid, &drag_origin);
+        let dropped_at = CGRect::new(CGPoint::new(1000., 600.), CGSize::new(300., 200.));
+        if let Some(window) = reactor.state.windows.window_mut(wid) {
+            window.frame_monotonic = dropped_at;
+        }
+
+        let (visible_spaces, visible_space_centers) = reactor.visible_spaces_for_layout(true);
+        crate::actor::reactor::events::drag::handle_mouse_up(
+            &mut reactor.state,
+            &mut reactor.layout_manager,
+            &mut reactor.drag_manager,
+            crate::actor::reactor::events::drag::MouseUpPayload {
+                pending_swap: None,
+                drop_action: None,
+                swap_space: Some(space),
+                final_space: Some(space),
+                visible_spaces,
+                visible_space_centers,
+                screens: vec![],
+                pointer: None,
+            },
+        )
+        .unwrap();
+
+        // The drop-arrange lays the float where it actually is, not at the
+        // stale frame the drop happened to store.
+        let gaps = reactor.config.settings.layout.gaps.clone();
+        let placed = reactor
+            .layout_manager
+            .layout_engine
+            .calculate_layout_with_virtual_workspaces(
+                &reactor.state.windows,
+                space,
+                screen,
+                &gaps,
+                0.0,
+                Default::default(),
+                Default::default(),
+                |q| reactor.state.windows.window(q).map(|w| w.frame_monotonic),
+                &[screen],
+            )
+            .into_iter()
+            .find(|(w, _)| *w == wid)
+            .map(|(_, f)| f);
+        assert_eq!(
+            placed, None,
+            "no write is owed: the float is already where the user left it"
+        );
+        assert_eq!(
+            reactor.layout_manager.layout_engine.get_floating_position(space, workspace, wid),
+            Some(dropped_at),
+            "and the stored position followed"
+        );
+    }
+
+    /// A float dropped straddling the display seam is finished onto the
+    /// display under the pointer. macOS does not let a programmatically
+    /// moved window rest across the seam ("Displays have Separate Spaces")
+    /// and relocates it to a display of its own choosing — the "random"
+    /// snap on releasing a tab-bar drag near the seam (snap4/snap5.trace).
+    #[test]
+    fn a_seam_straddling_drop_is_finished_onto_the_pointer_display() {
+        let mut reactor = test_reactor();
+        let top = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let bottom = CGRect::new(CGPoint::new(100., 900.), CGSize::new(1512., 948.));
+        let space = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        reactor.handle_event(space_state_event(
+            vec![top, bottom],
+            vec![Some(space), Some(space2)],
+        ));
+        reactor.add_test_app(1);
+        let wid = WindowId::new(1, 1);
+        // 650..1050 across the seam at y=900, centre still on the top display.
+        let straddling = CGRect::new(CGPoint::new(300., 650.), CGSize::new(600., 400.));
+        reactor.add_test_window(wid, WindowServerId::new(101), Some(space), straddling);
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+        reactor.layout_manager.layout_engine.mark_window_floating(wid);
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+        reactor.ensure_active_drag(wid, &straddling);
+
+        let (visible_spaces, visible_space_centers) = reactor.visible_spaces_for_layout(true);
+        let outcome = crate::actor::reactor::events::drag::handle_mouse_up(
+            &mut reactor.state,
+            &mut reactor.layout_manager,
+            &mut reactor.drag_manager,
+            crate::actor::reactor::events::drag::MouseUpPayload {
+                pending_swap: None,
+                drop_action: None,
+                swap_space: Some(space),
+                final_space: Some(space),
+                visible_spaces,
+                visible_space_centers,
+                screens: vec![top, bottom],
+                pointer: Some(CGPoint::new(500., 750.)),
+            },
+        )
+        .unwrap();
+
+        // macOS may allow the overhang (a server drag rests clipped at the
+        // seam), so the drop is watched, not corrected: no write, the
+        // stored position is the drop itself, and only a later relocation
+        // triggers the deterministic placement.
+        assert!(
+            outcome.pre_layout_window_frame_writes.is_empty(),
+            "a straddling drop is left where the user put it"
+        );
+        let finish = reactor.drag_manager.seam_finish.expect("the drop is watched");
+        assert_eq!(finish.window, wid);
+        assert!(finish.fitted.is_none(), "no correction until a relocation is seen");
+        assert_eq!(
+            reactor.layout_manager.layout_engine.get_floating_position(space, workspace, wid),
+            Some(straddling),
+            "the stored position follows the drop"
+        );
+        // The correction, when needed, lands fully on the pointer's display.
+        assert_eq!(
+            crate::actor::reactor::events::drag::seam_fitted(
+                &[top, bottom],
+                Some(CGPoint::new(500., 750.)),
+                straddling,
+            ),
+            Some(CGRect::new(CGPoint::new(300., 500.), straddling.size)),
+        );
     }
 }
 

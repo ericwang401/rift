@@ -59,19 +59,21 @@ impl HiddenWindowPlacement {
     }
 
     pub fn is_hidden(screen: CGRect, window: CGRect, other_screens: &[CGRect]) -> bool {
+        // Not visible on this screen — or any other. A window sitting on
+        // another display is elsewhere, not parked; reading it as hidden is
+        // what restored floats from stale remembered frames whenever a
+        // cross-display drag was mid-flight.
+        let visible_on = |screen: CGRect| {
+            let visible_width =
+                (window.max().x.min(screen.max().x) - window.origin.x.max(screen.origin.x)).max(0.0);
+            let visible_height =
+                (window.max().y.min(screen.max().y) - window.origin.y.max(screen.origin.y)).max(0.0);
+            visible_width > Self::VISIBLE_THRESHOLD_PX || visible_height > Self::VISIBLE_THRESHOLD_PX
+        };
         [HideCorner::BottomLeft, HideCorner::BottomRight]
             .into_iter()
             .any(|corner| Self::calculate(screen, window, corner, other_screens) == window)
-            || {
-                let visible_width = (window.max().x.min(screen.max().x)
-                    - window.origin.x.max(screen.origin.x))
-                .max(0.0);
-                let visible_height = (window.max().y.min(screen.max().y)
-                    - window.origin.y.max(screen.origin.y))
-                .max(0.0);
-                visible_width <= Self::VISIBLE_THRESHOLD_PX
-                    && visible_height <= Self::VISIBLE_THRESHOLD_PX
-            }
+            || (!visible_on(screen) && !other_screens.iter().any(|other| visible_on(*other)))
     }
 }
 
