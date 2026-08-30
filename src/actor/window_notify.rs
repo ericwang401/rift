@@ -330,8 +330,31 @@ impl WindowNotify {
                         }
 
                         let query_started = Instant::now();
-                        let space = window_server::active_space();
-                        let window = window_server::key_focused_window(space);
+                        // Resolve the key window across every display's
+                        // current space at once. Asking only on
+                        // `active_space()` resolved same-app cross-display
+                        // clicks to the window the user just *left*: the
+                        // key-focus process is unchanged, the active-display
+                        // designation lags the click, and the process's
+                        // topmost window on the stale display's space is the
+                        // sibling window.
+                        let visible = window_server::visible_spaces();
+                        let resolved = if visible.is_empty() {
+                            let space = window_server::active_space();
+                            window_server::key_focused_window(space).map(|window| (window, space))
+                        } else {
+                            window_server::key_focused_window_across(&visible).map(|window| {
+                                let window_spaces = window_server::window_spaces(
+                                    WindowServerId::new(window.idx.get()),
+                                );
+                                let space = attribute_focus_space(
+                                    &window_spaces,
+                                    &visible,
+                                    window_server::active_space,
+                                );
+                                (window, space)
+                            })
+                        };
                         let query_elapsed = query_started.elapsed();
 
                         // A wake queued during the SPI means this result may already
@@ -344,11 +367,10 @@ impl WindowNotify {
                         trace!(
                             wake_count,
                             ?query_elapsed,
-                            ?space,
-                            ?window,
+                            ?resolved,
                             "resolved coalesced WindowServer focus"
                         );
-                        if let Some(window) = window {
+                        if let Some((window, space)) = resolved {
                             events_tx.send(Event::WindowServerFocusChanged(window, space));
                         }
                         break;
@@ -359,9 +381,46 @@ impl WindowNotify {
     }
 }
 
+/// The space a resolved focus belongs to: the window's own space if it is one
+/// of the currently visible ones, else any space the window is on, else the
+/// active space (asked only when needed — it is a live query).
+fn attribute_focus_space(
+    window_spaces: &[SpaceId],
+    visible: &[SpaceId],
+    active_space: impl FnOnce() -> SpaceId,
+) -> SpaceId {
+    window_spaces
+        .iter()
+        .copied()
+        .find(|space| visible.contains(space))
+        .or_else(|| window_spaces.first().copied())
+        .unwrap_or_else(active_space)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FocusWakeSender;
+    use super::{FocusWakeSender, SpaceId, attribute_focus_space};
+
+    #[test]
+    fn focus_space_prefers_the_visible_space_the_window_is_on() {
+        let laptop = SpaceId::new(603);
+        let external = SpaceId::new(440);
+        let stale = SpaceId::new(5);
+        assert_eq!(
+            attribute_focus_space(&[external], &[external, laptop], || panic!(
+                "active_space must not be asked"
+            )),
+            external
+        );
+        // A window reported on a non-visible space (mid-transition) still
+        // resolves to its own space rather than the active display's.
+        assert_eq!(
+            attribute_focus_space(&[stale], &[external, laptop], || laptop),
+            stale
+        );
+        // No space information at all falls back to the active space.
+        assert_eq!(attribute_focus_space(&[], &[external, laptop], || laptop), laptop);
+    }
 
     #[test]
     fn focus_wakes_coalesce_to_one_signal() {

@@ -928,7 +928,7 @@ fn space_window_list_for_connection_raw(
 /// a newly materialized native tab.
 pub fn key_focused_window(space: SpaceId) -> Option<WindowId> {
     trace::observe("key_focused_window", space.get(), || {
-        key_focused_window_raw(space).map(|wid| (wid.pid, wid.idx.get()))
+        key_focused_window_raw(&[space.get()]).map(|wid| (wid.pid, wid.idx.get()))
     })
     .and_then(|(pid, idx)| {
         Some(WindowId {
@@ -938,7 +938,51 @@ pub fn key_focused_window(space: SpaceId) -> Option<WindowId> {
     })
 }
 
-fn key_focused_window_raw(space: SpaceId) -> Option<WindowId> {
+/// The key window regardless of which display holds it: the key-focus
+/// process's topmost document window across all of `spaces` in one z-ordered
+/// query.
+///
+/// Scoping the resolution to a single space chosen by `active_space()` is
+/// wrong when focus moves between two windows of the same app on different
+/// displays: the key-focus *process* does not change, WindowServer's active-
+/// display designation lags the click, and the topmost window of the process
+/// on the previous display's space is exactly the window the user just left.
+pub fn key_focused_window_across(spaces: &[SpaceId]) -> Option<WindowId> {
+    let raw: Vec<u64> = spaces.iter().map(|space| space.get()).collect();
+    trace::observe("key_focused_window_across", &raw, || {
+        key_focused_window_raw(&raw).map(|wid| (wid.pid, wid.idx.get()))
+    })
+    .and_then(|(pid, idx)| {
+        Some(WindowId {
+            pid,
+            idx: NonZeroU32::new(idx)?,
+        })
+    })
+}
+
+/// The spaces currently shown, one per display (plus fullscreen spaces).
+pub fn visible_spaces() -> Vec<SpaceId> {
+    trace::observe("visible_spaces", (), visible_spaces_raw)
+        .into_iter()
+        .map(SpaceId::new)
+        .collect()
+}
+
+fn visible_spaces_raw() -> Vec<u64> {
+    let arr = unsafe { CGSCopySpaces(*G_CONNECTION, CGSSpaceMask::ALL_VISIBLE_SPACES) };
+    let Some(arr) = NonNull::new(arr) else {
+        return Vec::new();
+    };
+    let spaces_cf: CFRetained<CFArray<CFNumber>> = unsafe { CFRetained::from_raw(arr.cast()) };
+    spaces_cf
+        .iter()
+        .filter_map(|num| num.as_i64())
+        .filter_map(|value| u64::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .collect()
+}
+
+fn key_focused_window_raw(spaces: &[u64]) -> Option<WindowId> {
     let mut psn = ProcessSerialNumber::default();
     let mut fallback = 0u8;
     if cg_ok(unsafe { SLPSGetKeyFocusProcess(&mut psn, &mut fallback) }).is_err() {
@@ -952,7 +996,7 @@ fn key_focused_window_raw(space: SpaceId) -> Option<WindowId> {
 
     let filter = WindowQueryFilter {
         owner,
-        spaces: &[space.get()],
+        spaces,
         space_list_options: 0,
         window_list_options: 0x2,
         query_flags: 0x2,
