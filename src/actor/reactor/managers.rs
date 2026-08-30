@@ -38,6 +38,18 @@ pub struct DragManager {
     /// Whether the drop overlay is on screen. It belongs to a pending drop and
     /// is taken down as soon as there is none, whichever way the drag ended.
     pub drop_overlay_shown: bool,
+    /// A drop zone the pointer has entered but not yet dwelt in. Near a zone
+    /// boundary successive pointer samples land on either side of it, and
+    /// following each one recomputed the preview and re-aimed the overlay
+    /// dozens of times a second — the flashing. A zone change is believed
+    /// only once the pointer has stayed in the new zone for a beat.
+    pub zone_candidate: Option<ZoneCandidate>,
+    /// The last preview the overlay was aimed at, keyed by what produced it.
+    /// Working out an insert region means laying out a copy of the tree,
+    /// which is far too expensive per pointer move; the region only changes
+    /// when the (dragged, target, action) triple does, so it is computed once
+    /// per triple and the overlay is only re-aimed when the answer changes.
+    pub drop_preview_cache: Option<DropPreview>,
     /// The space a just-dropped window belongs to, held until its frame has
     /// landed there. See `DropPin`.
     pub drop_pin: Option<DropPin>,
@@ -48,6 +60,31 @@ pub struct DragManager {
     /// after a re-tile would otherwise be invisible. See
     /// `Reactor::window_in_drag`.
     pub held_window: Option<WindowId>,
+}
+
+/// See `DragManager::zone_candidate`.
+#[derive(Debug, Clone, Copy)]
+pub struct ZoneCandidate {
+    pub dragged: WindowId,
+    pub target: WindowId,
+    pub action: crate::actor::drag_swap::DropAction,
+    pub since: std::time::Instant,
+}
+
+impl ZoneCandidate {
+    /// How long the pointer has to stay in a new zone before the preview
+    /// follows it there.
+    pub const DWELL: std::time::Duration = std::time::Duration::from_millis(150);
+}
+
+/// See `DragManager::drop_preview_cache`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DropPreview {
+    pub dragged: WindowId,
+    pub target: WindowId,
+    pub action: crate::actor::drag_swap::DropAction,
+    pub screen: CGRect,
+    pub region: CGRect,
 }
 
 /// A window dropped on a target hanging over a display seam has, as far as the
@@ -64,12 +101,19 @@ pub struct DropPin {
     pub window: crate::sys::window_server::WindowServerId,
     pub space: SpaceId,
     pub until: std::time::Instant,
+    /// When the window server may next be asked whether the write landed.
+    /// The pin is checked after *every* event; asking live on each of the
+    /// ~40 pointer moves a second kept a query storm running for the whole
+    /// hold after every drop.
+    pub next_probe: std::time::Instant,
 }
 
 impl DropPin {
     /// How long a frame write is given to land before the window server is
     /// believed again.
     pub const HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+    /// How often the window server is asked whether it agrees yet.
+    pub const PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
 }
 
 impl DragManager {

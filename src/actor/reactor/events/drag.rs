@@ -31,6 +31,7 @@ pub fn handle_mouse_up(
     let mut outcome = EventOutcome::layout_changed(false);
     let mut needs_layout = false;
 
+    let mut moved_by_drop = false;
     if let Some((dragged, target)) = payload.pending_swap {
         drag.skip_layout_for_window = Some(dragged);
         if state.windows.contains_window(dragged) && state.windows.contains_window(target) {
@@ -38,14 +39,49 @@ pub fn handle_mouse_up(
             // near an edge splits the target and puts the dragged window on
             // that side. A layout that cannot express the split says so, and
             // the drop falls back to the swap it would have been before.
-            let inserted = match (payload.drop_action, payload.swap_space) {
-                (Some(crate::actor::drag_swap::DropAction::Insert(direction)), Some(space)) => {
-                    trace!(?dragged, ?target, ?direction, "inserting beside the drop target");
-                    layout.layout_engine.insert_window_next_to(space, target, direction, dragged)
+            let mut handled = false;
+            if let (Some(crate::actor::drag_swap::DropAction::Insert(direction)), Some(space)) =
+                (payload.drop_action, payload.swap_space)
+            {
+                // A drop from another display: the dragged window's tree
+                // membership was frozen for the drag, so it still lives on
+                // its origin display. Move it — out of every tree, onto the
+                // target's space and workspace — before the split, so the
+                // membership the insert creates is the only one it ends up
+                // with.
+                if !layout.layout_engine.is_window_tiled(space, dragged) {
+                    let removal = layout
+                        .layout_engine
+                        .handle_event(&mut state.windows, LayoutEvent::WindowRemoved(dragged));
+                    outcome = outcome.with_layout_response(removal.response, None);
+                    if let Some(server_id) =
+                        state.windows.window(dragged).and_then(|window| window.info.sys_id)
+                    {
+                        state.windows.set_window_server_space(server_id, Some(space));
+                        state.windows.mark_window_visible(server_id);
+                    }
+                    if let Some(workspace) = layout.layout_engine.active_workspace(space)
+                        && !layout
+                            .layout_engine
+                            .virtual_workspace_manager_mut()
+                            .assign_window_to_workspace(&mut state.windows, space, dragged, workspace)
+                    {
+                        warn!(?dragged, ?workspace, "failed to assign dragged window");
+                    }
+                    moved_by_drop = true;
                 }
-                _ => false,
-            };
-            if !inserted {
+                trace!(?dragged, ?target, ?direction, "inserting beside the drop target");
+                handled =
+                    layout.layout_engine.insert_window_next_to(space, target, direction, dragged);
+                if moved_by_drop && !handled {
+                    // Already out of its old tree; a plain add on the target's
+                    // space is the honest fallback, not a swap the window can
+                    // no longer take part in.
+                    outcome = outcome.with_layout_event(LayoutEvent::WindowAdded(space, dragged));
+                    handled = true;
+                }
+            }
+            if !handled {
                 trace!(?dragged, ?target, "performing deferred drag swap");
                 let response = layout.layout_engine.handle_command(
                     &mut state.windows,
@@ -66,7 +102,12 @@ pub fn handle_mouse_up(
     };
     if let Some(session) = session {
         let window = session.window;
-        if session.origin_space != payload.final_space {
+        if moved_by_drop && Some(window) == payload.pending_swap.map(|(dragged, _)| dragged) {
+            // The drop itself moved the window between trees; only the
+            // arrange is still owed.
+            drag.skip_layout_for_window = Some(window);
+            needs_layout = true;
+        } else if session.origin_space != payload.final_space {
             if session.origin_space.is_some() {
                 // A float dragged onto another space is still a float. Plain
                 // `WindowRemoved` drops the floating mark, and the

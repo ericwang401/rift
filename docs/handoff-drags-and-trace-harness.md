@@ -133,6 +133,73 @@ Tests: `focus_change_right_after_a_click_does_not_warp`, `focus_returning_from_a
 The test helper's "unmanageable" windows are now non-standard, so the heuristic agrees with the flag
 when a window is re-judged.
 
+## Round 7: cross-display drags preview and perform the split
+
+Dragging a tile onto another display used to tear down all drop tracking the moment the window's
+space changed (`evaluate_drop_target` reset + hid on `origin_space != space`), so there was never
+an overlay — and a drop always landed as a plain add at the tree's default position.
+
+Now the display under the *pointer* supplies the drop candidates (matching round 3's rule that the
+pointer decides the drop), while the dragged window's own membership stays frozen on its origin
+tree (`membership_space`). Over a tiled window on the target display:
+
+- the edge zones preview the split (`drop_action_for` allows `Insert` cross-space when the target
+  layout can express it) and the drop performs it: the window is pulled out of its origin tree,
+  assigned to the target space/workspace, and `insert_window_next_to` puts it beside the target —
+  all synchronously in `handle_mouse_up`, before the queued removal/add events could clobber it
+  (`moved_by_drop` skips the generic cross-space move block);
+- the centre zone is *also* an insert cross-display (a cross-tree swap is not expressible): the
+  whole target is four triangles (`DragManager::edge_direction`), so the overlay never blinks out
+  over the middle and the drop lands on the side the pointer is nearest. Same-display behaviour is
+  unchanged (centre still swaps there).
+
+First live recording (`xdrag.trace`, in `tests/traces/`) replayed with 0 violations but showed the
+first cut was unusable — overlay flashing, drag stutter, centre drops landing at the tree's
+default slot. Three causes, fixed:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Stutter while dragging | `preview_insert_next_to` RON-round-trips the whole tree per pointer move; plus the pre-existing ~12 `window_spaces`/`space_is_user` queries per `MouseDragged` (11.5k Sys lines in a 40 s trace) now ran for the whole drag | preview cached per (dragged, target, action) on `DragManager::drop_preview_cache` — recomputed only when the triple changes, `Aim` sent only when the answer changes; `collect_drag_swap_candidates` no longer asks the window server where every window is (tree membership already says, one-tree law) — the per-move query storm from the open items is gone |
+| Overlay flashing | cross-display centre zone returned `None` → hide/show cycling as the pointer crossed zones | centre maps to an edge insert (above) |
+| Drop not where pointed | centre drop was a plain move to the tree's default slot | same |
+
+Second recording (`xdrag2.trace`) still stuttered and flashed. Probing the replay showed the
+sessions and drops were all correct — the report's per-drop "session None" is printed after
+teardown and lies. The remaining causes were rift's own query load and preview churn, felt
+directly in the drag because the event tap is a `HeadInsertEventTap`: every `MouseDragged`
+passes through rift's callback before the app sees it, so WindowServer contention stutters the
+user's drag itself.
+
+| Cause | Fix |
+|---|---|
+| `drop_action_for` resolved the *target's* space via `best_space_for_window_id` → a live `window_spaces` query per pointer move for the whole drag | membership (`assigned_space_for_window_id`) first; the server is only asked when there is no assignment |
+| `release_drop_pin_if_landed` ran after every event and live-queried `window_space(pin.window)` — a query per pointer move for 1.5 s after every drop | store agreement releases the pin with no query; live probes throttled to one per 200 ms (`DropPin::PROBE_EVERY`) |
+| Pointer samples straddling a zone boundary flapped the action → preview recomputed (RON round-trip) and overlay re-aimed at report rate — the flashing and the lag correlating with the preview appearing | dwell hysteresis: a zone change is believed after the pointer stays in the new zone 150 ms (`ZoneCandidate::DWELL`, `sticky_drop_action`) |
+| Crossing the gap between tiles dropped the target for a few reports → overlay blinked | 24 px grace band around the pending target's frame |
+| Drop re-read the cursor at release, so it could disagree with the last shown preview | the drop performs `drop_preview_cache`'s action — the overlay's promise, verbatim |
+
+Third recording (`xdrag3.trace`) still flashed. Probing Aim/Hide in the replay caught it exactly:
+119 Aim / 119 Hide strictly alternating per `MouseDragged`, identical region every time. The root
+cause of all three symptoms (flash, lag, wrong drops) was one line: `evaluate_drop_target` read
+the session's origin-space hint through `get_active_drag_session`, which answers only in the
+`Active` state — and a drag over a target alternates `Active ↔ PendingSwap` on every evaluation.
+Every other sample lost the hint, fell back to geometry on the drag-swap manager's noted frame
+(which lies on the *target* display mid-cross), concluded the dragged window was not tiled there,
+found no candidates, hid the overlay, and demoted the pending swap — to rebuild it all on the next
+sample (a RON preview recompute each cycle: the lag). A release landing on the wrong half of the
+cycle dropped as a plain move: the wrong positions. Fix: `current_drag_session` answers in both
+states; the space and origin hints read through it. The hardened cross-display test drives
+consecutive evaluations through the `PendingSwap` state with the noted frame on the target display.
+
+Still present, pre-existing: each mid-drag `SpaceStateChanged` triggers ~24 `WindowsDiscovered`
+(every app asked twice) with `get_window`/`live_frame` per window riding on it — ~11 discovery
+events/s during a cross-display drag. Worth taming for latency, separately.
+
+Tests: `cross_display_drag_previews_and_splits_the_target_under_the_pointer` (now also covers the
+alternation), `edge_direction_divides_the_whole_target_into_four_triangles`,
+`zone_boundary_wobble_does_not_flap_the_preview`.
+Still owed: a live re-record (overlay steady over a target, no stutter, drop matches the preview).
+
 ## The trace harness (the important deliverable)
 
 Rift can record everything the reactor sees and replay it offline, bit for bit.
@@ -215,5 +282,5 @@ debug logs (unset afterwards).
   `/tmp/rift_eric.err.log`.
 - `window_notify`/spaces-actor and event-tap threads make their own system queries; they reach the
   reactor as events, which is enough for replay but means those actors are not themselves replayed.
-- Every `MouseDragged` still triggers `window_spaces` queries for every window (visible in any
-  trace: ~20 `Sys` lines per pointer move). Not a correctness problem; worth a look for latency.
+- ~~Every `MouseDragged` still triggers `window_spaces` queries for every window~~ fixed in round
+  7: drop candidates come from tree membership, not per-move window-server queries.

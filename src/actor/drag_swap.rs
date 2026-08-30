@@ -91,6 +91,25 @@ impl DragManager {
         DropAction::Swap
     }
 
+    /// The side of `target` the cursor is on, ignoring the centre box: the
+    /// full rectangle divided into four triangles by its diagonals. For a
+    /// drop that has no swap to offer (a drag from another display), every
+    /// point over the target means an insert on some side, so the preview
+    /// never blinks out in the middle.
+    pub fn edge_direction(target: CGRect, cursor: CGPoint) -> Direction {
+        let w = target.size.width.max(f64::EPSILON);
+        let h = target.size.height.max(f64::EPSILON);
+        let nx = (cursor.x - target.origin.x) / w - 0.5;
+        let ny = (cursor.y - target.origin.y) / h - 0.5;
+        if nx.abs() >= ny.abs() {
+            if nx < 0.0 { Direction::Left } else { Direction::Right }
+        } else if ny < 0.0 {
+            Direction::Up
+        } else {
+            Direction::Down
+        }
+    }
+
     pub fn on_frame_change(
         &mut self,
         wid: WindowId,
@@ -278,6 +297,20 @@ mod tests {
             DragManager::drop_action(rect(0.0, 0.0, 0.0, 0.0), CGPoint::new(0.0, 0.0)),
             DropAction::Swap
         );
+    }
+
+    #[test]
+    fn edge_direction_divides_the_whole_target_into_four_triangles() {
+        use crate::layout_engine::Direction;
+        let target = rect(100.0, 100.0, 400.0, 400.0);
+        let at = |x: f64, y: f64| DragManager::edge_direction(target, CGPoint::new(x, y));
+
+        assert_eq!(at(300.0, 150.0), Direction::Up);
+        assert_eq!(at(450.0, 300.0), Direction::Right);
+        assert_eq!(at(300.0, 450.0), Direction::Down);
+        assert_eq!(at(150.0, 300.0), Direction::Left);
+        // The exact middle still answers something, not nothing.
+        assert_eq!(at(300.0, 300.0), Direction::Right);
     }
 
     #[test]

@@ -5420,6 +5420,128 @@ fn drop_action_needs_both_windows_in_the_layout() {
     assert_eq!(reactor.drop_action_for(stray, target, frame.mid()), None);
 }
 
+/// A window dragged onto another display, with a tiled window under the
+/// pointer there: the overlay previews the split on the target display, and
+/// the drop performs it — the dragged window leaves its origin tree and is
+/// inserted beside the target.
+#[test]
+fn cross_display_drag_previews_and_splits_the_target_under_the_pointer() {
+    use crate::actor::drag_swap::DropAction;
+    // A tree layout on both displays, so the target's side can split.
+    let settings = crate::common::config::LayoutSettings {
+        mode: LayoutMode::Bsp,
+        ..crate::common::config::LayoutSettings::default()
+    };
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &settings,
+        None,
+    ));
+    let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+    let screen2 = CGRect::new(CGPoint::new(1440., 0.), CGSize::new(1440., 900.));
+    let initial_frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(800., 600.));
+    let space1 = SpaceId::new(1);
+    let space2 = SpaceId::new(2);
+    reactor.handle_event(space_state_event(
+        vec![screen1, screen2],
+        vec![Some(space1), Some(space2)],
+    ));
+    reactor.add_test_app(1);
+    reactor.config.settings.ui.drop_overlay.enabled = true;
+
+    let dragged = WindowId::new(1, 1);
+    reactor.add_test_window(dragged, WindowServerId::new(121), Some(space1), initial_frame);
+    let space1_workspace = reactor.test_workspace(space1, 0);
+    assert!(reactor.assign_test_window_to_workspace(space1, dragged, space1_workspace));
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space1, dragged));
+
+    // A tiled window on the second display, filling it.
+    let target = WindowId::new(1, 2);
+    let target_frame = screen2;
+    reactor.add_test_window(target, WindowServerId::new(122), Some(space2), target_frame);
+    let space2_workspace = reactor.test_workspace(space2, 0);
+    assert!(reactor.assign_test_window_to_workspace(space2, target, space2_workspace));
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space2, target));
+
+    reactor.drag_manager.drag_state = DragState::Active {
+        session: DragSession {
+            window: dragged,
+            last_frame: initial_frame,
+            origin_space: Some(space1),
+            settled_space: Some(space1),
+            layout_dirty: true,
+        },
+    };
+
+    // Pointer near the target's left edge on display 2, the dragged window
+    // barely over the seam: the overlay promises the split.
+    let cursor = CGPoint::new(target_frame.origin.x + 20., target_frame.mid().y);
+    // Centred on the target display: mid-cross the drag-swap manager's noted
+    // origin frame lies there too, which is exactly the case that used to
+    // lose the origin hint on every other sample.
+    let dragged_frame = CGRect::new(
+        CGPoint::new(target_frame.origin.x + 40., 100.),
+        initial_frame.size,
+    );
+    reactor.evaluate_drop_target(dragged, dragged_frame, Some(cursor));
+    assert_eq!(reactor.get_pending_drag_swap(), Some((dragged, target)));
+    assert!(
+        reactor.drag_manager.drop_overlay_shown,
+        "an edge drop on another display's window is previewed"
+    );
+    // The next samples arrive with the state already PendingSwap; the
+    // preview must hold, not blink off on every other evaluation.
+    for _ in 0..3 {
+        reactor.evaluate_drop_target(dragged, dragged_frame, Some(cursor));
+        assert_eq!(
+            reactor.get_pending_drag_swap(),
+            Some((dragged, target)),
+            "the pending drop survives consecutive evaluations"
+        );
+        assert!(
+            reactor.drag_manager.drop_overlay_shown,
+            "the overlay stays up across consecutive evaluations"
+        );
+    }
+    assert_eq!(
+        reactor.drop_action_for(dragged, target, cursor),
+        Some(DropAction::Insert(Direction::Left))
+    );
+
+    // The middle of the target is not dead across displays: a swap between
+    // two trees does not exist, so every point over the target is an edge
+    // zone and the overlay never blinks out mid-window.
+    reactor.evaluate_drop_target(dragged, dragged_frame, Some(target_frame.mid()));
+    assert!(matches!(
+        reactor.drop_action_for(dragged, target, target_frame.mid()),
+        Some(DropAction::Insert(_))
+    ));
+    assert!(
+        reactor.drag_manager.drop_overlay_shown,
+        "the overlay stays up over the middle of a cross-display target"
+    );
+
+    // On the left edge the drop performs the promised split.
+    reactor.evaluate_drop_target(dragged, dragged_frame, Some(cursor));
+    assert!(reactor.drag_manager.drop_overlay_shown);
+    crate::sys::window_server::set_cursor_location_override(Some(cursor));
+    reactor.handle_event(Event::MouseUp);
+    crate::sys::window_server::set_cursor_location_override(None);
+
+    let engine = &reactor.layout_manager.layout_engine;
+    assert!(
+        engine.is_window_tiled(space2, dragged),
+        "the dragged window is tiled beside the target"
+    );
+    assert!(engine.is_window_tiled(space2, target));
+    assert!(
+        !engine.is_window_tiled(space1, dragged),
+        "the dragged window left its origin tree"
+    );
+    assert_eq!(reactor.assigned_space_for_window_id(dragged), Some(space2));
+    assert!(!reactor.drag_manager.drop_overlay_shown);
+}
+
 #[test]
 fn drop_overlay_is_taken_down_when_the_drag_ends_without_a_drop() {
     let (mut reactor, dragged, target, space, _frame) =
@@ -5566,6 +5688,43 @@ fn pointer_samples_during_a_drag_re_evaluate_the_drop_target() {
     reactor.handle_event(Event::MouseDragged { x: 720., y: 100. });
     assert_eq!(reactor.get_pending_drag_swap(), None);
     assert!(!reactor.drag_manager.drop_overlay_shown);
+}
+
+/// Pointer samples straddling a zone boundary must not flap the preview:
+/// the shown action follows the pointer into a new zone only after it has
+/// stayed there for a beat (`ZoneCandidate::DWELL`).
+#[test]
+fn zone_boundary_wobble_does_not_flap_the_preview() {
+    use crate::actor::drag_swap::DropAction;
+    let (mut reactor, top, bottom, _space, bottom_frame) =
+        reactor_dragging_top_of_two_stacked_windows();
+
+    // Firmly in the bottom window's left edge zone.
+    let left = CGPoint::new(bottom_frame.origin.x + 20., bottom_frame.mid().y);
+    reactor.handle_event(Event::MouseDragged { x: left.x, y: left.y });
+    assert_eq!(reactor.get_pending_drag_swap(), Some((top, bottom)));
+    let shown = reactor.drag_manager.drop_preview_cache.expect("preview shown");
+    assert_eq!(shown.action, DropAction::Insert(Direction::Left));
+
+    // A sample on the other side of the boundary (the centre, which swaps)
+    // arrives an instant later: the preview must not follow it yet.
+    let mid = bottom_frame.mid();
+    reactor.handle_event(Event::MouseDragged { x: mid.x, y: mid.y });
+    let still = reactor.drag_manager.drop_preview_cache.expect("preview kept");
+    assert_eq!(
+        still.action,
+        DropAction::Insert(Direction::Left),
+        "a single sample across the boundary must not move the preview"
+    );
+
+    // And the drop performs what the overlay shows, not the raw zone under
+    // the wobbling pointer.
+    crate::sys::window_server::set_cursor_location_override(Some(mid));
+    reactor.handle_event(Event::MouseUp);
+    crate::sys::window_server::set_cursor_location_override(None);
+    let engine = &reactor.layout_manager.layout_engine;
+    assert!(engine.is_window_tiled(_space, top));
+    assert!(engine.is_window_tiled(_space, bottom));
 }
 
 #[test]
