@@ -5542,6 +5542,71 @@ fn cross_display_drag_previews_and_splits_the_target_under_the_pointer() {
     assert!(!reactor.drag_manager.drop_overlay_shown);
 }
 
+/// A drag crossing a display seam makes the window server emit a space
+/// snapshot per flip, and each one used to answer with a full every-app AX
+/// census — ~11 discovery sweeps a second for the whole drag. The sweep is
+/// deferred while a drag is in flight and flushed once, at the drop.
+#[test]
+fn discovery_sweeps_are_deferred_while_a_drag_is_in_flight() {
+    let mut reactor = test_reactor();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+
+    let pid: pid_t = 71;
+    let (app_tx, mut app_rx) = crate::actor::channel();
+    reactor.app_manager.apps.insert(
+        pid,
+        AppState {
+            info: AppInfo {
+                bundle_id: Some("com.test.sweep".to_string()),
+                localized_name: Some("Sweep".to_string()),
+            },
+            handle: AppThreadHandle::new_for_test(app_tx),
+        },
+    );
+
+    let wid = WindowId::new(pid, 1);
+    let frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(800., 600.));
+    reactor.add_test_window(wid, WindowServerId::new(711), Some(space), frame);
+    while app_rx.try_recv().is_ok() {}
+
+    // No drag: a sweep goes out immediately.
+    reactor.check_for_new_windows();
+    assert!(
+        matches!(app_rx.try_recv(), Ok((_, Request::GetVisibleWindows))),
+        "with no drag in flight the sweep is immediate"
+    );
+
+    reactor.drag_manager.drag_state = DragState::Active {
+        session: DragSession {
+            window: wid,
+            last_frame: frame,
+            origin_space: Some(space),
+            settled_space: Some(space),
+            layout_dirty: true,
+        },
+    };
+    reactor.check_for_new_windows();
+    reactor.check_for_new_windows();
+    assert!(
+        app_rx.try_recv().is_err(),
+        "sweeps are deferred while the drag is in flight"
+    );
+
+    crate::sys::event::set_mouse_state_override(Some(crate::sys::event::MouseState::Up));
+    reactor.handle_event(Event::MouseUp);
+    crate::sys::event::set_mouse_state_override(None);
+    assert!(
+        matches!(app_rx.try_recv(), Ok((_, Request::GetVisibleWindows))),
+        "the drop flushes the one sweep that is owed"
+    );
+    assert!(
+        app_rx.try_recv().is_err(),
+        "deferred sweeps collapse into a single census"
+    );
+}
+
 #[test]
 fn drop_overlay_is_taken_down_when_the_drag_ends_without_a_drop() {
     let (mut reactor, dragged, target, space, _frame) =

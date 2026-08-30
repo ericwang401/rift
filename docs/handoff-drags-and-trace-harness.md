@@ -191,9 +191,11 @@ cycle dropped as a plain move: the wrong positions. Fix: `current_drag_session` 
 states; the space and origin hints read through it. The hardened cross-display test drives
 consecutive evaluations through the `PendingSwap` state with the noted frame on the target display.
 
-Still present, pre-existing: each mid-drag `SpaceStateChanged` triggers ~24 `WindowsDiscovered`
-(every app asked twice) with `get_window`/`live_frame` per window riding on it — ~11 discovery
-events/s during a cross-display drag. Worth taming for latency, separately.
+The discovery storm that rode on this — each mid-drag `SpaceStateChanged` answered with a full
+every-app AX census, twice (~11 `WindowsDiscovered`/s with `get_window`/`live_frame` per window) —
+is fixed: `request_visible_windows_for_apps` defers the sweep while a drag is in flight (same
+mechanism as the refresh quarantine, `pending_visible_refresh`), and `MouseUp` flushes the one
+census that is owed. Test: `discovery_sweeps_are_deferred_while_a_drag_is_in_flight`.
 
 Tests: `cross_display_drag_previews_and_splits_the_target_under_the_pointer` (now also covers the
 alternation), `edge_direction_divides_the_whole_target_into_four_triangles`,
@@ -240,10 +242,13 @@ event / on every write:
    window on, alternating within 1.5 s);
 5. a float is written a frame only on a command's behalf.
 
-Fixtures in `tests/traces/` (`user_drag5` is 13.8 MB; — decide whether to keep them in the repo):
-`seam_drops_tiled_premiere` (synthetic, 53 violations without the removal fix),
-`seam_drops_after_fix`, `user_drag` (float jump, 535 → 0), `user_drag3` (mid-drag writes),
-`user_drag4` (mid-drag second tree; replay writes match live's 14), `user_float`.
+Fixtures in `tests/traces/` (pruned after round 7 from 25 MB to ~4 MB — a recording made before a
+fix diverges where the fix changed rift's writes, so its verdict covers only the prefix, and each
+scenario is kept only in its latest recording): `seam_drops_tiled_premiere` (synthetic, 53
+violations without the removal fix), `seam_drops_after_fix`, `user_float` (floats),
+`user_altdrag2` (alt-drags, supersedes `user_altdrag`), `xdrag3` (cross-display drags, supersedes
+`user_drag`/`user_drag3`/`user_drag4`/`user_drag5`/`xdrag`/`xdrag2`; the pruned recordings live in
+the git history at `bc57386` and in `~/Downloads`).
 
 Known limits: replay is open-loop — after a fix changes rift's writes, the recorded window-server
 reactions no longer correspond; a clean replay of an old trace proves rift's handling of *those*
@@ -274,10 +279,8 @@ debug logs (unset afterwards).
 - Live validation of round 6 (build of 14:56+): alt-resize with two tiles, Preview opened through
   its picker then `sa+T`, clicks into Warp / another display's menu bar / a status-item popover.
   Anything off: record (`rift-cli execute trace start … / trace stop`), drop into `tests/traces/`.
-- `tests/traces/` is 23 MB and in git now. Fixtures recorded before a fix diverge at the point the
-  fix changed rift's writes; their verdict covers only the prefix. Re-recording on a current build
-  replaces them with recordings that do not diverge (`user_drag5`, `user_altdrag2` are the current
-  ones).
+- ~~`tests/traces/` is 23 MB and in git~~ pruned to ~4 MB after round 7 (superseded recordings
+  removed; see the fixture list above). Git history still carries the old ones.
 - Logging defaults to `rift_wm=info` (`src/common/log.rs`); `RUST_LOG` overrides. Service logs:
   `/tmp/rift_eric.err.log`.
 - `window_notify`/spaces-actor and event-tap threads make their own system queries; they reach the

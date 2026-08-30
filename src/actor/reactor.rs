@@ -1969,6 +1969,9 @@ impl Reactor {
                 if let Some((space, window)) = focused {
                     outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window));
                 }
+                // The drag is over; a refresh sweep deferred while it ran is
+                // due now, as one census instead of one per space flip.
+                self.flush_deferred_visible_refresh();
                 return Ok(outcome);
             }
             Event::MenuOpened(pid) => {
@@ -2876,7 +2879,15 @@ impl Reactor {
     }
 
     fn request_visible_windows_for_apps(&mut self, track_mission_control_refresh: bool) {
-        if self.refreshes_blocked() {
+        // A drag in flight defers the sweep too: the window server flips the
+        // dragged window between spaces as it crosses a display seam, and
+        // answering every one of those SpaceStateChanged snapshots with a
+        // full every-app AX census (twice over) was ~11 discovery events a
+        // second for the whole drag — with get_window/live_frame queries per
+        // window riding on each. Nothing in the sweep is urgent mid-drag:
+        // the dragged window is frozen in its tree, and the drop flushes the
+        // one refresh that is owed.
+        if self.refreshes_blocked() || self.window_in_drag().is_some() {
             self.defer_visible_refresh(track_mission_control_refresh);
             return;
         }
