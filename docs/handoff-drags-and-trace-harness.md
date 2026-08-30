@@ -1,7 +1,8 @@
 # Handoff: cross-display drags, floats, and the trace replay harness
 
-Branch: `feat/display-layout-restore`, uncommitted on top of `15a4651`. See "Round 2" below for
-the second pass on the cross-display flicker (2026-08-30 afternoon).
+Branch: `feat/display-layout-restore`. Everything below is committed in `3646b88` on top of
+`15a4651` (one commit; the suggested split was not done). Rounds 2–6 are the 2026-08-30 afternoon
+passes, each driven by a recording.
 Experiments that were abandoned live on `wip/drag-freeze-experiments` (reference only).
 
 ## What was wrong, in one sentence
@@ -203,12 +204,16 @@ debug logs (unset afterwards).
 
 ## Open items
 
-- User validation of the three drag/float cases on build 75040 (pid at time of writing); anything
-  left should be recorded and dropped into `tests/traces/`.
-- macOS itself hands a window to the other display's space the moment its centre crosses the
-  seam while it is still held; rift no longer acts on that mid-drag, but the handoff is visible.
-  Not rift's to fix.
-- Nothing is committed. Suggested split: (1) trace harness + persistence fixes, (2) focus fixes,
-  (3) drag/float fixes with fixtures, (4) global space indexing.
+- Live validation of round 6 (build of 14:56+): alt-resize with two tiles, Preview opened through
+  its picker then `sa+T`, clicks into Warp / another display's menu bar / a status-item popover.
+  Anything off: record (`rift-cli execute trace start … / trace stop`), drop into `tests/traces/`.
+- `tests/traces/` is 23 MB and in git now. Fixtures recorded before a fix diverge at the point the
+  fix changed rift's writes; their verdict covers only the prefix. Re-recording on a current build
+  replaces them with recordings that do not diverge (`user_drag5`, `user_altdrag2` are the current
+  ones).
+- Logging defaults to `rift_wm=info` (`src/common/log.rs`); `RUST_LOG` overrides. Service logs:
+  `/tmp/rift_eric.err.log`.
 - `window_notify`/spaces-actor and event-tap threads make their own system queries; they reach the
   reactor as events, which is enough for replay but means those actors are not themselves replayed.
+- Every `MouseDragged` still triggers `window_spaces` queries for every window (visible in any
+  trace: ~20 `Sys` lines per pointer move). Not a correctness problem; worth a look for latency.
