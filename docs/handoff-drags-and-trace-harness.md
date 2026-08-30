@@ -287,3 +287,65 @@ debug logs (unset afterwards).
   reactor as events, which is enough for replay but means those actors are not themselves replayed.
 - ~~Every `MouseDragged` still triggers `window_spaces` queries for every window~~ fixed in round
   7: drop candidates come from tree membership, not per-move window-server queries.
+
+## Round 8 (2026-08-30 evening): the "float snaps randomly" hunt, and the flight recorder
+
+Symptom: the floating Warp window "snapped randomly" on release of a tab-bar drag; titlebar
+drags were fine. Root cause (verified with rift fully stopped): **macOS relocates a
+programmatically moved window that ends up straddling the display seam** ("Displays have
+Separate Spaces" — a window rests on one display). Warp animates its tab drag itself, so a
+seam drop is a programmatic placement and the system bounces it; server-side titlebar drags
+are exempt. Fixes along the way, each real on its own:
+
+| Fix | Where |
+|---|---|
+| Same-app focus resolved one click behind (sa+T toggled the sibling): resolver asked `key_focused_window(active_space())`, and the active-display designation lags; resolve across all visible spaces instead | `window_notify.rs`, `window_server::key_focused_window_across`/`visible_spaces` |
+| A drop stored the float's frame **with a placement intent**, and the next drop-arrange asserted the stale intent — `follow_floating_position`, not `store_floating_position` | `events/drag.rs` |
+| A float laid out at its own live frame could still become a *write*, racing mid-arrange live-frame drift — float positions are emitted only for intents (pending placement, un-parking) | `engine.rs` `calculate_layout_with_virtual_workspaces` |
+| Mid-drag frame reports read the window server, not `elem.frame()` (no AX round-trips into the app during its own drag) | `app.rs` moved/resized handler |
+| A dragged float's move/resize AX notifications are silenced for the drag (`SetDragNotificationSilence`) — Warp's AX bridge running per animation frame glitched its gesture | `app.rs`, reactor `sync_drag_notification_silence` |
+| A seam-straddling float drop is **finished**: nudged minimally onto the display holding most of it (display-frame gaps accounted for), via a pre-layout write; replay invariant 5 exempts drop writes (`recent_drop`) | `events/drag.rs`, `replay.rs` |
+
+Tooling (the important deliverable):
+
+- **Flight recorder**: rift always records into a 32MB in-memory ring; `rift-cli execute
+  trace dump <path>` writes the recent history *after* a bug happened — no `trace start`
+  needed. Dumps begin with a `Flight` line and are for reading, not replay.
+- **`Act` lines** (`trace::act`): every rift thread records what it does — event-tap
+  consumed events and slow (>1ms) callbacks, app-actor AX notifications with source and
+  latency, raises, warps, EUI flips, drag silences, and all off-reactor system queries
+  (focus resolver, window-notify). Replay ignores them; old traces load unchanged.
+- `WindowServerFocusChanged` is serializable now (it was `serde(skip)` — recordings were
+  blind to focus, and the round-1 bug class was invisible to the harness).
+- `rift.rs` gained `RIFT_KEEP_WM_BRIDGE=1` to skip nulling the window-management-bridge
+  delegate (A/B'd during the hunt; the null was exonerated and remains the default).
+
+Caveat learned the hard way: synthetic CGEvent drags with modifier flags latch the synthetic
+HID modifier state — post explicit `FlagsChanged` before/after, or every later synthetic drag
+becomes a rift modifier-drag and poisons the experiment.
+
+### Round 8 addendum: the final seam-drop policy
+
+The first cut (nudge minimally onto the majority display, judged from the release-moment
+frame) was wrong twice over: the release frame lags the hand (the app is mid-spring), so the
+majority flips on animation phase — drops landed 842 px apart from one try to the next — and
+the finish write *races* the system's own relocation, so whichever lands second won.
+
+Final policy (`events/drag.rs` + `reactor.rs::assert_seam_finish`):
+
+- The **pointer's display** keeps the window (the hand is the only honest witness); the frame
+  is clamped fully into it.
+- The finish is armed whenever a float drop is not resting on the pointer's display —
+  covering both race orders (still straddling, or already relocated by the system).
+- 250 ms after the drop the placement is verified against the **window server** (the
+  relocation report trails rift's txid and the transaction gate discards it, so
+  `frame_monotonic` lies), the window is SA-moved to the landing display's space if the
+  system stranded it elsewhere (it can even land on an *inactive* space), and the frame is
+  re-asserted — a frame fully on one display is never relocated, so this write is final.
+  Two attempts max (`managers::SeamFinish`).
+- Replay: invariant 5 exempts drop-finish writes; post-divergence unanswered questions no
+  longer fail a fixture (new queries against old recordings are expected there).
+
+Mid-drag flicker over the seam is Warp fighting macOS (programmatic straddling moves bounced
+per animation frame) — reproduced with rift stopped; rift cannot fix it, only the resting
+place.
