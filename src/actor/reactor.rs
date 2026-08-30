@@ -4510,6 +4510,17 @@ impl Reactor {
         if self.state.windows.window(wid).is_some_and(|window| window.is_admitted()) {
             return wid;
         }
+        // Only a window rift is tracking can be somebody's child. A window
+        // rift has never seen (its creation was missed — Preview's second
+        // document briefly has no window-server record at birth) must pass
+        // through unmapped: remapping it glued focus, and every
+        // focused-window command, onto an arbitrary admitted sibling — and
+        // the remap made `contains_window` succeed, skipping the discovery
+        // that would have admitted the real window. Unknown means unknown:
+        // the caller falls back to discovery and commands become no-ops.
+        if self.state.windows.window(wid).is_none() {
+            return wid;
+        }
         let child = self.live_frame_for(wid);
         let mut candidates: Vec<(WindowId, CGRect)> = self
             .state

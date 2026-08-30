@@ -6361,6 +6361,44 @@ mod admission {
 
     use super::*;
 
+    /// Focus on a window rift has never seen (its creation was missed) must
+    /// not be rewritten onto an admitted sibling: sa+T on a fresh Preview
+    /// document toggled the *previous* document, because the unknown window
+    /// was "rooted" to it and the discovery that would have admitted the
+    /// real window was skipped (preview-toggle.trace).
+    #[test]
+    fn focus_on_an_untracked_window_never_remaps_to_a_sibling() {
+        let mut reactor = test_reactor();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+        let space = SpaceId::new(1);
+        reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+        reactor.add_test_app(1);
+        let sibling = WindowId::new(1, 1);
+        let frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(1200., 700.));
+        reactor.add_test_window(sibling, WindowServerId::new(101), Some(space), frame);
+        let workspace = reactor.test_workspace(space, 0);
+        assert!(reactor.assign_test_window_to_workspace(space, sibling, workspace));
+        reactor.send_layout_event(LayoutEvent::WindowAdded(space, sibling));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+
+        // The window server resolves focus to a window rift never tracked.
+        let unknown = WindowId::new(1, 999);
+        reactor.handle_event(Event::WindowServerFocusChanged(unknown, space));
+        assert_eq!(
+            reactor.main_window(),
+            Some(unknown),
+            "focus stays on the unknown window, not an admitted sibling"
+        );
+
+        // A focused-window command is a no-op, never a toggle of the sibling.
+        reactor.handle_test_layout_command(LayoutCommand::ToggleWindowFloating);
+        assert!(
+            !reactor.layout_manager.layout_engine.is_window_floating(sibling),
+            "the admitted sibling must not be toggled in the unknown window's stead"
+        );
+    }
+
     /// A non-standard AX window (an app's panel) dragged with the mouse
     /// must not end up in a layout when the drag ends.
     #[test]
