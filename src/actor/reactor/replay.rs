@@ -209,6 +209,15 @@ fn read_trace_with_handle(path: &Path, handle: AppThreadHandle) -> anyhow::Resul
             out.push(TraceLine::Sys(serde_json::from_str(rest)?));
         } else if let Some(rest) = line.strip_prefix("Sys") {
             out.push(TraceLine::Sys(ron::de::from_str(rest)?));
+        } else if line.starts_with("Act ") {
+            // Off-reactor activity notes (event tap, app actors, resolver):
+            // for humans reading the trace, inert on replay.
+            continue;
+        } else if line.starts_with("Flight ") {
+            anyhow::bail!(
+                "this is a flight-recorder dump (`rift-cli execute trace dump`): it has no \
+                 state header and is for reading, not replay"
+            );
         } else {
             out.push(TraceLine::Event {
                 ms: 0,
@@ -284,7 +293,12 @@ pub struct ReplayReport {
 
 impl ReplayReport {
     pub fn is_clean(&self) -> bool {
-        self.violations.is_empty() && self.misses.is_empty()
+        // Once the replay has diverged from the recording, the code under
+        // test is off the recorded script; questions the recording never
+        // heard (a new query added since the fixture was recorded) are
+        // expected there, and are reported rather than failed — the same
+        // treatment post-divergence violations get.
+        self.violations.is_empty() && (self.misses.is_empty() || self.diverged.is_some())
     }
 
     fn violation(&mut self, text: String) {
@@ -674,6 +688,11 @@ struct Checker {
     /// Bumped by every button release and every command — the only things
     /// that may legitimately put a window on another display.
     epoch: usize,
+    /// The windows a drop just released and the event index of the release.
+    /// The drop itself may write the dragged float once — a seam-straddling
+    /// drop is finished onto one display — and invariant 5 must not read
+    /// that as rift moving a float on its own.
+    recent_drop: Option<(std::collections::HashSet<WindowId>, usize)>,
 }
 
 impl Checker {
@@ -712,6 +731,7 @@ impl Checker {
         self.epoch += 1;
         let mut moved = std::mem::take(&mut self.moved_by_user);
         moved.extend(reactor.window_in_drag());
+        self.recent_drop = Some((moved.clone(), self.index));
         for write in writes {
             if moved.contains(&write.window) {
                 report.violation(format!(
@@ -749,8 +769,17 @@ impl Checker {
         //    a centring — which is what "my float jumped" always was.
         let floating = reactor.layout_manager.layout_engine.is_window_floating(write.window);
         let commanded = self.last_command.is_some_and(|at| write.event_index <= at + 2);
+        let dropped = self
+            .recent_drop
+            .as_ref()
+            .is_some_and(|(set, at)| set.contains(&write.window) && write.event_index <= at + 2)
+            || reactor.drag_manager.seam_finish.is_some_and(|finish| {
+                finish.window == write.window
+                    && finish.fitted.unwrap_or(finish.dropped_at).same_as(write.frame)
+            });
         if floating
             && !commanded
+            && !dropped
             && self
                 .reported
                 .get(&write.window)

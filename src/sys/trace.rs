@@ -68,6 +68,47 @@ enum Mode {
 }
 
 static MODE: Mutex<Mode> = Mutex::new(Mode::Off);
+/// Fast-path flag: instrumentation is live, either into a file recording or
+/// the always-on flight-recorder ring. True from startup — the ring runs
+/// for the whole session so a bug can be reproduced FIRST and dumped AFTER
+/// (`rift-cli execute trace dump`), instead of hoping it happens again with
+/// a recording running.
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The flight recorder: the most recent trace lines, capped by bytes. Lines
+/// carry the same format as a file recording, with `ms` relative to process
+/// start.
+static RING: Mutex<RingBuf> = Mutex::new(RingBuf { lines: std::collections::VecDeque::new(), bytes: 0 });
+const RING_CAP_BYTES: usize = 32 * 1024 * 1024;
+
+struct RingBuf {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn process_elapsed_ms() -> u64 {
+    PROCESS_START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Writes the ring's contents to `path`, newest history last. The dump is
+/// for reading, not replay: it has no state header, and its first line says
+/// so.
+pub fn dump_ring(path: &std::path::Path) -> std::io::Result<usize> {
+    let ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = File::create(path)?;
+    writeln!(
+        file,
+        "Flight {{\"dumped_at_ms\":{},\"lines\":{}}}",
+        process_elapsed_ms(),
+        ring.lines.len()
+    )?;
+    for line in &ring.lines {
+        writeln!(file, "{line}")?;
+    }
+    Ok(ring.lines.len())
+}
 
 thread_local! {
     static REACTOR_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -86,42 +127,75 @@ fn on_reactor_thread() -> bool {
 /// Begins writing a trace to `file`. The caller writes the header lines
 /// through `write_line` before any event.
 pub fn start_recording(file: File) {
-    let mut mode = MODE.lock().unwrap();
+    let mut mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
     *mode = Mode::Record { file, started: Instant::now() };
+    RECORDING.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub fn stop_recording() {
-    let mut mode = MODE.lock().unwrap();
+    let mut mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
     if matches!(*mode, Mode::Record { .. }) {
         *mode = Mode::Off;
     }
+    // The flight-recorder ring keeps running.
+    RECORDING.store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub fn is_recording() -> bool {
-    matches!(*MODE.lock().unwrap(), Mode::Record { .. })
+    RECORDING.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Milliseconds since the recording started; 0 when not recording. On
-/// replay, the timestamp of the line being replayed.
+/// Records activity from any rift thread — the event tap's decisions, the
+/// app actors' accessibility traffic, raises, warps. `Act` lines are
+/// documentation for a human (and the replay report); replay ignores them,
+/// so instrumentation can never destabilize answer matching. Cheap when not
+/// recording: one atomic load.
+pub fn act<D: Serialize>(kind: &str, detail: &D) {
+    if !is_recording() {
+        return;
+    }
+    let thread = std::thread::current();
+    let src = thread.name().unwrap_or("?").to_string();
+    let detail = serde_json::to_string(detail).unwrap_or_default();
+    let ms = elapsed_ms();
+    write_line(&format!(
+        "Act {{\"ms\":{ms},\"src\":{:?},\"kind\":{kind:?},\"detail\":{detail}}}",
+        src
+    ));
+}
+
+/// Milliseconds since the recording started (process start for the flight
+/// ring). On replay, the timestamp of the line being replayed.
 pub fn elapsed_ms() -> u64 {
-    match &*MODE.lock().unwrap() {
+    match &*MODE.lock().unwrap_or_else(|e| e.into_inner()) {
         Mode::Record { started, .. } => started.elapsed().as_millis() as u64,
         Mode::Replay { now_ms, .. } => *now_ms,
-        Mode::Off => 0,
+        Mode::Off => process_elapsed_ms(),
     }
 }
 
-/// Writes one raw line to the recording, if any.
+/// Writes one raw line: to the file recording when one is running, else to
+/// the flight-recorder ring.
 pub fn write_line(line: &str) {
-    if let Mode::Record { file, .. } = &mut *MODE.lock().unwrap() {
+    if let Mode::Record { file, .. } = &mut *MODE.lock().unwrap_or_else(|e| e.into_inner()) {
         let _ = writeln!(file, "{line}");
+        return;
+    }
+    let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+    ring.bytes += line.len();
+    ring.lines.push_back(line.to_string());
+    while ring.bytes > RING_CAP_BYTES {
+        let Some(evicted) = ring.lines.pop_front() else {
+            break;
+        };
+        ring.bytes -= evicted.len();
     }
 }
 
 /// The reactor's clock. Real time when live; the recorded time on replay,
 /// so holds and grace periods elapse exactly as they did.
 pub fn now() -> Instant {
-    match &*MODE.lock().unwrap() {
+    match &*MODE.lock().unwrap_or_else(|e| e.into_inner()) {
         Mode::Replay { thread, base, now_ms, .. } if *thread == std::thread::current().id() => {
             *base + Duration::from_millis(*now_ms)
         }
@@ -141,10 +215,24 @@ where
     T: Serialize + DeserializeOwned,
 {
     if !on_reactor_thread() {
+        // Off-reactor system queries (the focus resolver, window-notify,
+        // the event tap) used to vanish from recordings entirely — whole
+        // debugging sessions were spent inferring what those threads did.
+        // Record them as replay-inert `Act` lines instead.
+        if is_recording() {
+            let answer = compute();
+            #[derive(Serialize)]
+            struct OffThreadQuery<'a, K: Serialize, T: Serialize> {
+                key: &'a K,
+                answer: &'a T,
+            }
+            act(kind, &OffThreadQuery { key: &key, answer: &answer });
+            return answer;
+        }
         return compute();
     }
     let key_ron = serde_json::to_string(&key).unwrap_or_default();
-    let mut mode = MODE.lock().unwrap();
+    let mut mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
     if let Mode::Replay { thread, .. } = &*mode
         && *thread != std::thread::current().id()
     {
@@ -153,10 +241,24 @@ where
     }
     match &mut *mode {
         Mode::Off => {
+            // No file recording running: the answer still goes to the
+            // flight-recorder ring, so a retroactive dump carries the same
+            // Sys history a live recording would have.
+            let ms = process_elapsed_ms();
             drop(mode);
-            compute()
+            let answer = compute();
+            let line = SysLine {
+                ms,
+                kind: kind.to_string(),
+                key: key_ron,
+                answer: serde_json::to_string(&answer).unwrap_or_default(),
+            };
+            if let Ok(json) = serde_json::to_string(&line) {
+                write_line(&format!("Sys {json}"));
+            }
+            answer
         }
-        Mode::Record { file, started } => {
+        Mode::Record { file: _, started } => {
             let ms = started.elapsed().as_millis() as u64;
             drop(mode);
             let answer = compute();
@@ -231,7 +333,7 @@ where
 /// Puts the process into replay mode with these recorded answers.
 pub fn begin_replay(answers: Vec<SysLine>) {
     mark_reactor_thread();
-    let mut mode = MODE.lock().unwrap();
+    let mut mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
     *mode = Mode::Replay {
         thread: std::thread::current().id(),
         answers: answers.into_iter().fold(
@@ -251,14 +353,14 @@ pub fn begin_replay(answers: Vec<SysLine>) {
 
 /// Advances replayed time to the timestamp of the line about to be replayed.
 pub fn replay_set_now(ms: u64) {
-    if let Mode::Replay { now_ms, .. } = &mut *MODE.lock().unwrap() {
+    if let Mode::Replay { now_ms, .. } = &mut *MODE.lock().unwrap_or_else(|e| e.into_inner()) {
         *now_ms = ms;
     }
 }
 
 /// Ends replay mode, returning the questions the recording could not answer.
 pub fn end_replay() -> (Vec<String>, Vec<String>) {
-    let mut mode = MODE.lock().unwrap();
+    let mut mode = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let result = match &mut *mode {
         Mode::Replay { misses, drifts, .. } => (std::mem::take(misses), std::mem::take(drifts)),
         _ => (Vec::new(), Vec::new()),

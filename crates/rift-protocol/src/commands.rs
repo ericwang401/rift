@@ -104,6 +104,12 @@ pub enum ReactorCommand {
     RecordTrace {
         path: Option<PathBuf>,
     },
+    /// Dump the always-on flight recorder — the last minutes of everything
+    /// the reactor saw and every thread did — to a file, retroactively. No
+    /// `RecordTrace` needs to have been started: reproduce first, dump after.
+    DumpTrace {
+        path: PathBuf,
+    },
     Serialize,
     SaveLayout {
         path: PathBuf,

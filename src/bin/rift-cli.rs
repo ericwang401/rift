@@ -231,6 +231,9 @@ enum TraceCommands {
     Start { path: PathBuf },
     /// Stop recording
     Stop,
+    /// Dump the always-on flight recorder (the last minutes of everything
+    /// rift saw and did) to PATH — retroactively, no Start needed
+    Dump { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -708,17 +711,23 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
         ExecuteCommands::Debug => {
             CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Debug))
         }
-        ExecuteCommands::Trace { trace_cmd } => {
-            let path = match trace_cmd {
-                TraceCommands::Start { path } => {
-                    Some(std::path::absolute(path).map_err(|e| e.to_string())?)
-                }
-                TraceCommands::Stop => None,
-            };
-            CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::RecordTrace {
-                path,
-            }))
-        }
+        ExecuteCommands::Trace { trace_cmd } => match trace_cmd {
+            TraceCommands::Start { path } => {
+                let path = Some(std::path::absolute(path).map_err(|e| e.to_string())?);
+                CliCommand::Reactor(reactor::Command::Reactor(
+                    reactor::ReactorCommand::RecordTrace { path },
+                ))
+            }
+            TraceCommands::Stop => CliCommand::Reactor(reactor::Command::Reactor(
+                reactor::ReactorCommand::RecordTrace { path: None },
+            )),
+            TraceCommands::Dump { path } => {
+                let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+                CliCommand::Reactor(reactor::Command::Reactor(
+                    reactor::ReactorCommand::DumpTrace { path },
+                ))
+            }
+        },
         ExecuteCommands::Serialize => {
             CliCommand::Reactor(reactor::Command::Reactor(reactor::ReactorCommand::Serialize))
         }
