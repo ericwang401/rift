@@ -21,6 +21,7 @@ use crate::model::{
     AppRuleEffects, AppRuleEngine, AppRuleResult, FloatingPositionStore, WindowRuleContext,
     WindowStore,
 };
+use crate::sys::geometry::SameAs;
 use crate::sys::screen::SpaceId;
 
 mod persistence;
@@ -166,6 +167,34 @@ pub struct LayoutEngine {
     persistence: PersistenceState,
     /// Set only while a master-file startup restore is waiting for the first display snapshot.
     startup_restore_pending: bool,
+    /// Floats whose stored frame is a placement rift itself decided on —
+    /// a re-float, a fullscreen toggle-off, a restore — and has not yet
+    /// been seen to take effect. For these the stored frame is laid out;
+    /// for every other visible float the live frame is the truth.
+    pending_float_placement: HashMap<WindowId, PendingPlacement>,
+}
+
+/// A float placement rift decided on, waiting for the app to act on it. It
+/// is done as soon as the window's live frame changes at all from what it was
+/// when the placement was made — the app answered, whether or not with the
+/// exact frame asked for (many refuse a size) — or after a grace period if
+/// the app never answers. Waiting for an exact match kept re-issuing
+/// placements to apps that never match, which pinned their windows in place.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingPlacement {
+    seen_live: Option<CGRect>,
+    since: std::time::Instant,
+}
+
+impl PendingPlacement {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    pub(crate) fn new() -> Self {
+        Self {
+            seen_live: None,
+            since: std::time::Instant::now(),
+        }
+    }
 }
 
 pub(crate) struct WorkspaceLayoutQuerySnapshot {
@@ -1078,6 +1107,7 @@ impl LayoutEngine {
         }
         self.window_layout_constraints.remove(&wid);
         self.observed_min_sizes.remove(&wid);
+        self.pending_float_placement.remove(&wid);
 
         if let Some(space) = removal.active_space {
             self.broadcast_windows_changed(window_store, space);
@@ -1453,6 +1483,7 @@ impl LayoutEngine {
             display_last_space: HashMap::default(),
             persistence: PersistenceState::default(),
             startup_restore_pending: false,
+            pending_float_placement: HashMap::default(),
         }
     }
 
@@ -1902,6 +1933,7 @@ impl LayoutEngine {
                                 options.size,
                             );
                             self.floating_positions.store(space, ws_id, wid, frame);
+                            self.pending_float_placement.insert(wid, PendingPlacement::new());
                         }
                     } else {
                         debug!(
@@ -1931,6 +1963,8 @@ impl LayoutEngine {
             };
             if self.floating.fullscreen_kind(wid) == Some(target) {
                 self.floating.set_fullscreen(wid, None);
+                // Back to the frame saved when fullscreen was entered.
+                self.pending_float_placement.insert(wid, PendingPlacement::new());
             } else {
                 // Only save the pre-fullscreen frame when switching from a non-fullscreen state,
                 // and _not_ when switching between fullscreen kinds.
@@ -2460,13 +2494,57 @@ impl LayoutEngine {
                         window_id,
                     ) == Some(active_workspace_id)
                 {
+                    // A visible float is where it is: its live frame is the
+                    // truth and the stored one follows it. The stored frame
+                    // is only for a float that was parked off-screen (a
+                    // hidden workspace) and needs its place back. Laying a
+                    // visible float out at a remembered frame is what wrote
+                    // windows back to wherever rift last happened to see
+                    // them, mid-drag or otherwise.
+                    let live = get_window_frame(window_id).filter(|rect| {
+                        !self.virtual_workspace_manager.is_hidden_position_multi(
+                            &screen,
+                            rect,
+                            None,
+                            all_screens,
+                        )
+                    });
+                    let raw_live = get_window_frame(window_id);
+                    let intended = match self.pending_float_placement.get_mut(&window_id) {
+                        Some(pending) => {
+                            let answered = match (pending.seen_live, raw_live) {
+                                (Some(seen), Some(now)) => !now.same_as(seen),
+                                _ => false,
+                            };
+                            let arrived =
+                                raw_live.is_some_and(|rect| rect.same_as(stored_position));
+                            if answered
+                                || arrived
+                                || pending.since.elapsed() > PendingPlacement::GRACE
+                            {
+                                self.pending_float_placement.remove(&window_id);
+                                false
+                            } else {
+                                if pending.seen_live.is_none() {
+                                    pending.seen_live = raw_live;
+                                }
+                                true
+                            }
+                        }
+                        None => false,
+                    };
+                    let candidate = if intended {
+                        stored_position
+                    } else {
+                        live.unwrap_or(stored_position)
+                    };
                     ensure_visible_floating(
                         self,
                         &mut positions,
                         space,
                         active_workspace_id,
                         window_id,
-                        Some(stored_position),
+                        Some(candidate),
                         false,
                         &screen,
                         all_screens,
@@ -2476,15 +2554,25 @@ impl LayoutEngine {
                 }
             }
 
+            // A float with no stored frame for this workspace — just
+            // launched, or assigned to a workspace that was recreated —
+            // stays where it is. It used to be centred outright without
+            // its actual frame ever being looked at, which is what snapped
+            // unmanaged windows to the middle of the screen out of nowhere.
             let floating_windows = self.active_floating_windows_in_workspace(window_store, space);
             for wid in floating_windows {
+                let live_frame = if positions.contains_key(&wid) {
+                    None
+                } else {
+                    get_window_frame(wid)
+                };
                 ensure_visible_floating(
                     self,
                     &mut positions,
                     space,
                     active_workspace_id,
                     wid,
-                    None,
+                    live_frame,
                     false,
                     &screen,
                     all_screens,
@@ -3482,6 +3570,20 @@ impl LayoutEngine {
         frame: CGRect,
     ) {
         self.floating_positions.store(space, workspace, window, frame);
+        self.pending_float_placement.insert(window, PendingPlacement::new());
+    }
+
+    /// Record where a float has moved to on its own — no placement intent,
+    /// the window is simply there now. Clears any intent that was pending.
+    pub fn follow_floating_position(
+        &mut self,
+        space: SpaceId,
+        workspace: VirtualWorkspaceId,
+        window: WindowId,
+        frame: CGRect,
+    ) {
+        self.floating_positions.store(space, workspace, window, frame);
+        self.pending_float_placement.remove(&window);
     }
 
     pub fn get_floating_position(
@@ -3531,6 +3633,9 @@ impl LayoutEngine {
         self.floating_positions.transfer_window_identity(from, to);
         self.floating.transfer_window_identity(from, to);
         self.transfer_persisted_window_identity(from, to);
+        if let Some(pending) = self.pending_float_placement.remove(&from) {
+            self.pending_float_placement.insert(to, pending);
+        }
         if let Some(constraints) = self.window_layout_constraints.remove(&from) {
             self.window_layout_constraints.insert(to, constraints);
         }

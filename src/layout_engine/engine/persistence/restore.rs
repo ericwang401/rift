@@ -622,6 +622,11 @@ impl LayoutEngine {
 
     /// Install all state participating in workspace ownership as one operation.
     fn install_workspace_restore_state(&mut self, state: WorkspaceRestoreState) {
+        // Restored floating frames are placements to carry out.
+        for (window, _) in &state.floating_positions {
+            self.pending_float_placement
+                .insert(*window, crate::layout_engine::engine::PendingPlacement::new());
+        }
         for window in state.replaced_windows {
             self.floating.remove_floating(window);
             self.persistence.forget_window(window);

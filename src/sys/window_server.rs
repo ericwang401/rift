@@ -711,6 +711,34 @@ pub fn is_point_occluded_by_external_window(mut point: CGPoint) -> bool {
 #[cfg(test)]
 thread_local! {
     static TEST_CURSOR_LOCATION_OVERRIDE: RefCell<Option<CGPoint>> = const { RefCell::new(None) };
+    static TEST_LIVE_FRAME_OVERRIDE: RefCell<HashMap<u32, CGRect>> = RefCell::new(HashMap::default());
+}
+
+#[cfg(test)]
+pub fn set_live_frame_override(id: WindowServerId, frame: Option<CGRect>) {
+    TEST_LIVE_FRAME_OVERRIDE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        match frame {
+            Some(frame) => {
+                map.insert(id.as_u32(), frame);
+            }
+            None => {
+                map.remove(&id.as_u32());
+            }
+        }
+    });
+}
+
+/// The window's frame as the window server has it right now. Under test only
+/// frames set with `set_live_frame_override` exist; the synthetic records
+/// `get_window` fabricates for tests are not frames anyone should lay out by.
+pub fn live_window_frame(id: WindowServerId) -> Option<CGRect> {
+    #[cfg(test)]
+    {
+        return TEST_LIVE_FRAME_OVERRIDE.with(|cell| cell.borrow().get(&id.as_u32()).copied());
+    }
+    #[allow(unreachable_code)]
+    get_window(id).map(|info| info.frame)
 }
 
 #[cfg(test)]

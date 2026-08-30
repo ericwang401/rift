@@ -371,6 +371,28 @@ pub fn handle_window_frame_changed(
         }
     } else {
         drag.skip_layout_for_window = Some(wid);
+        // A float moved or resized by something other than a drag — the app
+        // itself, a keyboard move, an app whose accessibility never reports
+        // the drag (Lightroom) — is now where it is. Its stored frame must
+        // follow, or the next arrange puts it back where it used to be.
+        if old_space == new_space
+            && let Some(space) = new_space
+            && layout.layout_engine.is_window_floating(wid)
+            && let Some(workspace) = layout
+                .layout_engine
+                .virtual_workspace_manager()
+                .workspace_for_window(&state.windows, space, wid)
+        {
+            // Some apps' accessibility reports lag or are plain wrong about
+            // the main window (Lightroom); the window server is the truth.
+            let frame = server_id
+                .and_then(crate::sys::window_server::live_window_frame)
+                .unwrap_or(new_frame);
+            if let Some(window) = state.windows.window_mut(wid) {
+                window.frame_monotonic = frame;
+            }
+            layout.layout_engine.follow_floating_position(space, workspace, wid, frame);
+        }
         if old_space != new_space {
             if pending_target_space.is_some()
                 && assigned_space == pending_target_space

@@ -287,6 +287,11 @@ impl LayoutManager {
                 .layout_manager
                 .layout_engine
                 .update_space_display(space, display_uuid_opt.clone());
+            // Floats are laid out where the window server says they are.
+            // Rift's own record lags for apps that do not report their main
+            // window moving (Lightroom), and laying a float out at a stale
+            // record wrote it back to wherever rift last saw it.
+            reactor.refresh_floating_frames_from_window_server();
             let mut layout =
                 reactor.layout_manager.layout_engine.calculate_layout_with_virtual_workspaces(
                     &reactor.state.windows,

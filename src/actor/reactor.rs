@@ -102,7 +102,7 @@ use crate::model::tx_store::WindowTxStore;
 use crate::model::{AppRuleResult, RiftState};
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
-use crate::sys::geometry::{CGRectDef, CGRectExt};
+use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs};
 pub use crate::sys::screen::ScreenInfo;
 use crate::sys::screen::{SpaceId, order_visible_spaces_by_position};
 use crate::sys::window_server::{
@@ -1250,6 +1250,24 @@ impl Reactor {
             _ => {}
         }
         self.note_explicit_window_intent(&event);
+        // Focus reported on a window that is not admitted — an app's child
+        // window, such as Lightroom's filmstrip, which the window server and
+        // AX both happily report as focused — is focus on the top-level
+        // window around it, as far as anything downstream is concerned:
+        // layout focus, the main-window tracker, commands, the pointer.
+        let event = match event {
+            Event::WindowServerFocusChanged(window, space) => {
+                Event::WindowServerFocusChanged(self.admitted_root_for(window), space)
+            }
+            Event::ApplicationMainWindowChanged(pid, Some(window), quiet) => {
+                Event::ApplicationMainWindowChanged(
+                    pid,
+                    Some(self.admitted_root_for(window)),
+                    quiet,
+                )
+            }
+            other => other,
+        };
 
         let should_update_notifications = Self::should_update_notifications(&event);
         let duplicate_global_activation = matches!(
@@ -3193,6 +3211,10 @@ impl Reactor {
     /// progress, Mission Control is up, or the change is loginwindow replaying
     /// activations after a wake.
     fn follow_focus_with_mouse(&mut self, window: WindowId, outcome: &mut EventOutcome) {
+        // The window server can report focus on a child window — Lightroom's
+        // filmstrip, a sheet — which is not what the user sees as "the
+        // window". Aim at the app's admitted top-level window around it.
+        let window = self.admitted_root_for(window);
         if !self.mouse_follows_focus_allowed_for(window)
             || self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input
             || self.is_mission_control_active()
@@ -3691,8 +3713,70 @@ impl Reactor {
         self.state.windows.is_window_server_id_native_fullscreen_suspended(wsid)
     }
 
+    /// The window `wid` stands for: itself when it is an admitted top-level
+    /// window, otherwise the same app's admitted root window whose frame
+    /// contains it (or, failing that, the largest one).
+    fn admitted_root_for(&self, wid: WindowId) -> WindowId {
+        if self.state.windows.window(wid).is_some_and(|window| window.is_admitted()) {
+            return wid;
+        }
+        let child = self.live_frame_for(wid);
+        let mut candidates: Vec<(WindowId, CGRect)> = self
+            .state
+            .windows
+            .iter_windows()
+            .filter(|(other, state)| other.pid == wid.pid && *other != wid && state.is_admitted())
+            .filter_map(|(other, _)| self.live_frame_for(other).map(|frame| (other, frame)))
+            .collect();
+        if let Some(child) = child
+            && let Some((parent, _)) =
+                candidates.iter().find(|(_, frame)| frame.contains(child.mid()))
+        {
+            return *parent;
+        }
+        candidates.sort_by(|(_, a), (_, b)| {
+            (b.size.width * b.size.height).total_cmp(&(a.size.width * a.size.height))
+        });
+        candidates.first().map(|(parent, _)| *parent).unwrap_or(wid)
+    }
+
+    /// Bring rift's frame record for every floating window in line with the
+    /// window server before a layout pass. See the arrange in `managers.rs`.
+    pub(crate) fn refresh_floating_frames_from_window_server(&mut self) {
+        let floats: Vec<(WindowId, WindowServerId)> = self
+            .state
+            .windows
+            .iter_windows()
+            .filter(|(wid, _)| self.layout_manager.layout_engine.is_window_floating(*wid))
+            .filter_map(|(wid, state)| state.info.sys_id.map(|wsid| (wid, wsid)))
+            .collect();
+        for (wid, wsid) in floats {
+            if let Some(frame) = window_server::live_window_frame(wsid)
+                && let Some(window) = self.state.windows.window_mut(wid)
+                && !window.frame_monotonic.same_as(frame)
+            {
+                window.frame_monotonic = frame;
+            }
+        }
+    }
+
+    /// The window's frame as the window server has it, falling back to
+    /// rift's own record. Some apps (Lightroom) never report their main
+    /// window moving over accessibility, so the record goes stale; anything
+    /// aimed at the window — the pointer, above all — must use the truth.
+    fn live_frame_for(&self, wid: WindowId) -> Option<CGRect> {
+        let window = self.state.windows.window(wid)?;
+        Some(
+            window
+                .info
+                .sys_id
+                .and_then(window_server::live_window_frame)
+                .unwrap_or(window.frame_monotonic),
+        )
+    }
+
     fn window_center_on_known_screen(&self, wid: WindowId) -> Option<CGPoint> {
-        let window_center = self.state.windows.window(wid)?.frame_monotonic.mid();
+        let window_center = self.live_frame_for(wid)?.mid();
         self.screen_for_point(window_center).map(|_| window_center)
     }
 
@@ -3923,9 +4007,9 @@ impl Reactor {
         // are already hovering should not move your hand, and it matters most
         // when stepping through a stack: every window there has the same frame,
         // so each step would otherwise yank the cursor back to the middle.
-        if let Some(window) = self.state.windows.window(wid)
+        if let Some(frame) = self.live_frame_for(wid)
             && let Ok(cursor) = window_server::current_cursor_location()
-            && window.frame_monotonic.contains(cursor)
+            && frame.contains(cursor)
         {
             return false;
         }
@@ -4003,6 +4087,23 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        // Nothing that is not admitted goes into a layout, whichever path asks.
+        // Discovery checks this, but the drag-end and cross-space paths did
+        // not: Lightroom reports a drag of its main window as frame changes
+        // on one of its *panels* (a non-standard AX window), so the panel got
+        // a drag session, was added to the tree on mouse-up, and every
+        // arrange from then on shoved Lightroom's panels around and wrote the
+        // real window's stale frame back.
+        if let LayoutEvent::WindowAdded(space, wid) = &event
+            && self.state.windows.window(*wid).is_some_and(|window| !window.is_admitted())
+        {
+            debug!(
+                ?wid,
+                space = space.get(),
+                "Refusing to add a window that is not admitted"
+            );
+            return;
+        }
         if matches!(event, LayoutEvent::WindowRemovedPreserveFloating(_)) {
             self.capture_pre_churn_layout();
         }
