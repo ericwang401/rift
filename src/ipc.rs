@@ -290,8 +290,13 @@ fn handle_reactor_command(
     reactor: &mut reactor::Reactor,
     command: crate::model::reactor::Command,
 ) -> Vec<u8> {
-    reactor.handle_ipc_command(command);
-    encode_success("Command executed successfully")
+    match reactor.handle_ipc_command(command) {
+        Ok(()) => encode_success("Command executed successfully"),
+        // A command that did nothing has to say so. Reporting success for a
+        // space command with the scripting addition unloaded is the failure
+        // mode that sends you looking everywhere but at the addition.
+        Err(message) => encode_error(serde_json::json!({ "message": message })),
+    }
 }
 
 #[derive(Clone)]

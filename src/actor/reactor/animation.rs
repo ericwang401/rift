@@ -78,9 +78,7 @@ impl AnimatedWindow {
 }
 
 impl AnimationManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     pub async fn run(mut rx: Receiver) {
         let mut manager = Self::new();
@@ -448,9 +446,7 @@ impl ActiveAnimation {
         self.next_frame += 1;
     }
 
-    fn is_complete(&self) -> bool {
-        self.next_frame > self.animation.frames
-    }
+    fn is_complete(&self) -> bool { self.next_frame > self.animation.frames }
 
     fn current_frames(&self) -> Vec<(WindowId, CGRect)> {
         let frame = self.next_frame.saturating_sub(1);
@@ -513,13 +509,9 @@ impl Animation {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.windows.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.windows.is_empty() }
 
-    fn begin(&self) {
-        self.begin_windows_not_in(&[]);
-    }
+    fn begin(&self) { self.begin_windows_not_in(&[]); }
 
     fn begin_windows_not_in(&self, skip: &[WindowId]) {
         for window in &self.windows {
@@ -606,9 +598,7 @@ impl Animation {
         }
     }
 
-    fn skip_to_end_and_end(self) {
-        self.finish_all();
-    }
+    fn skip_to_end_and_end(self) { self.finish_all(); }
 }
 
 fn get_frame(a: CGRect, b: CGRect, t: f64) -> CGRect {
@@ -633,9 +623,7 @@ fn ease(t: f64) -> f64 {
     }
 }
 
-fn blend(a: f64, b: f64, s: f64) -> f64 {
-    (1.0 - s) * a + s * b
-}
+fn blend(a: f64, b: f64, s: f64) -> f64 { (1.0 - s) * a + s * b }
 
 #[cfg(test)]
 mod tests {
@@ -647,9 +635,7 @@ mod tests {
         CGRect::new(CGPoint::new(origin_x, origin_y), CGSize::new(width, height))
     }
 
-    fn config() -> Config {
-        Config::default()
-    }
+    fn config() -> Config { Config::default() }
 
     fn animation(handle: &AppThreadHandle, wid: WindowId, from: CGRect, to: CGRect) -> Animation {
         let mut animation = Animation::new(config());

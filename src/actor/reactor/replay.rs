@@ -55,15 +55,11 @@ impl Record {
     }
 
     #[cfg(test)]
-    pub fn new_for_test(temp: NamedTempFile) -> Self {
-        Self { file: None, temp: Some(temp) }
-    }
+    pub fn new_for_test(temp: NamedTempFile) -> Self { Self { file: None, temp: Some(temp) } }
 
     #[cfg(test)]
     #[allow(unused)]
-    pub(super) fn temp(&mut self) -> Option<&mut NamedTempFile> {
-        self.temp.as_mut()
-    }
+    pub(super) fn temp(&mut self) -> Option<&mut NamedTempFile> { self.temp.as_mut() }
 
     fn file(&mut self) -> Option<&mut File> {
         #[cfg(test)]
@@ -769,11 +765,10 @@ impl Checker {
         //    a centring — which is what "my float jumped" always was.
         let floating = reactor.layout_manager.layout_engine.is_window_floating(write.window);
         let commanded = self.last_command.is_some_and(|at| write.event_index <= at + 2);
-        let dropped = self
-            .recent_drop
-            .as_ref()
-            .is_some_and(|(set, at)| set.contains(&write.window) && write.event_index <= at + 2)
-            || reactor.drag_manager.seam_finish.is_some_and(|finish| {
+        let dropped =
+            self.recent_drop.as_ref().is_some_and(|(set, at)| {
+                set.contains(&write.window) && write.event_index <= at + 2
+            }) || reactor.drag_manager.seam_finish.is_some_and(|finish| {
                 finish.window == write.window
                     && finish.fitted.unwrap_or(finish.dropped_at).same_as(write.frame)
             });

@@ -20,15 +20,15 @@ _default:
     @just --list --unsorted
 
 # Build, install over the running service's binaries, restart. The iteration loop.
-dev: (_build profile)
-    @just _install {{profile}}
-    @just restart
-    @echo "rift $(rift --version 2>/dev/null || echo '(no --version)') is live"
+#
+# These chain through dependencies rather than nested `just` calls: a nested
+# call is a fresh invocation and would not carry a `formula=` override, so
+# `just formula=rift dev` would build one thing and install into another.
+dev: (_build profile) (_install profile) restart
+    @echo "rift is live"
 
 # Same, but a full optimized build — what a release ships.
-install: (_build "release")
-    @just _install release
-    @just restart
+install: (_build "release") (_install "release") restart
 
 _build profile:
     cargo build --profile {{profile}} --bins

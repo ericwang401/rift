@@ -25,9 +25,7 @@ pub struct AppManager {
 }
 
 impl AppManager {
-    pub fn new() -> Self {
-        AppManager { apps: HashMap::default() }
-    }
+    pub fn new() -> Self { AppManager { apps: HashMap::default() } }
 }
 
 /// Manages drag operations and window swapping
@@ -154,21 +152,13 @@ impl DropPin {
 }
 
 impl DragManager {
-    pub fn reset(&mut self) {
-        self.drag_swap_manager.reset();
-    }
+    pub fn reset(&mut self) { self.drag_swap_manager.reset(); }
 
-    pub fn last_target(&self) -> Option<WindowId> {
-        self.drag_swap_manager.last_target()
-    }
+    pub fn last_target(&self) -> Option<WindowId> { self.drag_swap_manager.last_target() }
 
-    pub fn dragged(&self) -> Option<WindowId> {
-        self.drag_swap_manager.dragged()
-    }
+    pub fn dragged(&self) -> Option<WindowId> { self.drag_swap_manager.dragged() }
 
-    pub fn origin_frame(&self) -> Option<CGRect> {
-        self.drag_swap_manager.origin_frame()
-    }
+    pub fn origin_frame(&self) -> Option<CGRect> { self.drag_swap_manager.origin_frame() }
 
     pub fn update_config(&mut self, config: WindowSnappingSettings) {
         self.drag_swap_manager.update_config(config);
@@ -263,9 +253,7 @@ impl RefreshQuarantineManager {
         }
     }
 
-    pub fn blocks_refreshes(&self) -> bool {
-        self.state() != RefreshQuarantineState::Ready
-    }
+    pub fn blocks_refreshes(&self) -> bool { self.state() != RefreshQuarantineState::Ready }
 }
 
 /// Manages communication channels to other actors

@@ -39,9 +39,7 @@ struct FullscreenSlot {
 }
 
 impl FullscreenSlots {
-    pub(super) fn forget(&mut self, window: WindowId) {
-        self.slots.remove(&window);
-    }
+    pub(super) fn forget(&mut self, window: WindowId) { self.slots.remove(&window); }
 }
 
 impl Reactor {
@@ -67,15 +65,12 @@ impl Reactor {
                 return;
             }
         };
-        self.fullscreen_slots.slots.insert(
-            window,
-            FullscreenSlot {
-                space,
-                snapshot,
-                digest_after_removal: None,
-                anchor,
-            },
-        );
+        self.fullscreen_slots.slots.insert(window, FullscreenSlot {
+            space,
+            snapshot,
+            digest_after_removal: None,
+            anchor,
+        });
     }
 
     /// Called right after that removal has been applied.

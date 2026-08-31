@@ -128,17 +128,11 @@ pub struct ReactorHandle {
 }
 
 impl ReactorHandle {
-    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self {
-        Self { sender, queries }
-    }
+    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self { Self { sender, queries } }
 
-    pub fn sender(&self) -> Sender {
-        self.sender.clone()
-    }
+    pub fn sender(&self) -> Sender { self.sender.clone() }
 
-    pub fn send(&self, event: Event) {
-        self.sender.send(event)
-    }
+    pub fn send(&self, event: Event) { self.sender.send(event) }
 
     pub fn try_send(
         &self,
@@ -151,9 +145,7 @@ impl ReactorHandle {
 impl std::ops::Deref for ReactorHandle {
     type Target = ReactorQueryHandle;
 
-    fn deref(&self) -> &Self::Target {
-        &self.queries
-    }
+    fn deref(&self) -> &Self::Target { &self.queries }
 }
 
 use crate::model::server::RuntimeWindowData;
@@ -435,6 +427,13 @@ pub enum Event {
     ConfigUpdated(Config),
 }
 
+/// What to say when the scripting addition is not answering. The addition is
+/// the only route macOS 26 leaves for these three, so naming it — and the
+/// command that loads it — is the whole of the useful advice.
+const SA_REQUIRED_CREATE: &str = "creating a space needs the scripting addition; run `sudo rift sa load` (`rift sa status` to check)";
+const SA_REQUIRED_DESTROY: &str = "destroying a space needs the scripting addition; run `sudo rift sa load` (`rift sa status` to check)";
+const SA_REQUIRED_MOVE: &str = "moving a window to a space needs the scripting addition; run `sudo rift sa load` (`rift sa status` to check)";
+
 pub struct Reactor {
     pub config: Config,
     pub one_space: bool,
@@ -472,6 +471,10 @@ pub struct Reactor {
     display_archive: display_archive::DisplayArchive,
     fullscreen_slots: fullscreen_slots::FullscreenSlots,
     pub animation_tx: Option<AnimationSender>,
+    /// Why the command now being handled could not be carried out, if it
+    /// could not. Set by `fail_command` and drained by `handle_ipc_command`,
+    /// so a command that does nothing says so instead of reporting success.
+    command_error: Option<String>,
     #[cfg(test)]
     pub(crate) test_mouse_warps: Vec<CGPoint>,
 }
@@ -500,6 +503,11 @@ fn targets_focused_window(command: &layout::LayoutCommand) -> bool {
 }
 
 impl Reactor {
+    /// How long after a click a focus change is still taken to be its
+    /// consequence: the app activates on mouse-down, and the reports of it
+    /// reach rift up to a few hundred milliseconds later.
+    const CLICK_FOCUS_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
     pub fn spawn(
         config: Config,
         layout_engine: LayoutEngine,
@@ -557,6 +565,7 @@ impl Reactor {
         let reactor = Reactor {
             config: config.clone(),
             one_space,
+            command_error: None,
             app_manager: managers::AppManager::new(),
             layout_manager: managers::LayoutManager { layout_engine },
             state: RiftState::default(),
@@ -648,9 +657,7 @@ impl Reactor {
         }
     }
 
-    fn is_space_active(&self, space: SpaceId) -> bool {
-        self.active_spaces.contains(&space)
-    }
+    fn is_space_active(&self, space: SpaceId) -> bool { self.active_spaces.contains(&space) }
 
     fn iter_active_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
         self.active_spaces.iter().copied()
@@ -672,9 +679,7 @@ impl Reactor {
         }
     }
 
-    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> {
-        self.space_state.screens.clone()
-    }
+    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> { self.space_state.screens.clone() }
 
     fn display_uuids_for_current_screens(&self) -> Vec<Option<String>> {
         self.space_state
@@ -1173,8 +1178,28 @@ impl Reactor {
         self.state.windows.debug_assert_invariants();
     }
 
-    pub(crate) fn handle_ipc_command(&mut self, command: Command) {
+    /// Runs one command from the CLI, reporting why it did nothing if it did.
+    ///
+    /// Most commands cannot fail in a way the caller can act on. The ones that
+    /// can are the three that need the scripting addition: without it there is
+    /// no way to move a window between spaces or to create or destroy one, and
+    /// a CLI that answers "Command executed successfully" to a command that
+    /// did nothing is the worst of the failure modes -- it sends you looking
+    /// anywhere but at the addition.
+    pub(crate) fn handle_ipc_command(&mut self, command: Command) -> Result<(), String> {
+        self.command_error = None;
         self.handle_loop_event(Event::Command(command));
+        match self.command_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Records why the command in flight could not be carried out.
+    fn fail_command(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        warn!("{message}");
+        self.command_error = Some(message);
     }
 
     fn note_windowserver_activity(event: &Event) {
@@ -1251,9 +1276,7 @@ impl Reactor {
         self.refresh_quarantine_manager.state()
     }
 
-    fn refreshes_blocked(&self) -> bool {
-        self.refresh_quarantine_manager.blocks_refreshes()
-    }
+    fn refreshes_blocked(&self) -> bool { self.refresh_quarantine_manager.blocks_refreshes() }
 
     fn defer_visible_refresh(&mut self, track_mission_control_refresh: bool) {
         self.refresh_quarantine_manager.pending_visible_refresh = true;
@@ -1326,9 +1349,7 @@ impl Reactor {
                         }
                         None => self.focus_left_from = previously_focused_window,
                     }
-                } else if was_mouse_up
-                    && let Some(focused_window) = focused_window
-                {
+                } else if was_mouse_up && let Some(focused_window) = focused_window {
                     self.follow_dock_click_with_mouse(focused_window, &mut outcome);
                 }
                 if let Some(homing) = self.advance_display_homing() {
@@ -1879,9 +1900,7 @@ impl Reactor {
                     let pointer = window_server::current_cursor_location().ok();
                     let dropped_at = state.frame_monotonic;
                     if crate::actor::reactor::events::drag::seam_fitted(
-                        &screens,
-                        pointer,
-                        dropped_at,
+                        &screens, pointer, dropped_at,
                     )
                     .is_some()
                     {
@@ -2327,7 +2346,7 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::DestroySpace)) => {
                 let active = crate::sys::space_switch::active_space();
                 if !crate::sys::scripting_addition::destroy_space(active.get()) {
-                    warn!("Destroying a space needs the scripting addition (run `sudo rift sa load`)");
+                    self.fail_command(SA_REQUIRED_DESTROY);
                 }
                 return Ok(EventOutcome::default());
             }
@@ -3424,14 +3443,11 @@ impl Reactor {
                     .windows
                     .get_window_server_info(wsid)
                     .or_else(|| window_server::get_window(wsid));
-                (
-                    wsid,
-                    window_discovery::StaleWindowObservation {
-                        info,
-                        suitable: window_server::app_window_suitability(wsid),
-                        ordered_in: window_server::window_ordered_in(wsid),
-                    },
-                )
+                (wsid, window_discovery::StaleWindowObservation {
+                    info,
+                    suitable: window_server::app_window_suitability(wsid),
+                    ordered_in: window_server::window_ordered_in(wsid),
+                })
             })
             .collect();
         let stale_snapshot = window_discovery::StaleCleanupSnapshot {
@@ -3921,7 +3937,11 @@ impl Reactor {
             return;
         }
         if crate::sys::scripting_addition::move_window_to_space(wsid.as_u32(), space.get()) {
-            debug!(?wid, ?space, "syncing dragged float's space to the display under it");
+            debug!(
+                ?wid,
+                ?space,
+                "syncing dragged float's space to the display under it"
+            );
             self.note_window_sent_to_space(wsid);
             crate::sys::trace::act("drag_space_sync", &(wsid.as_u32(), space.get()));
         }
@@ -4006,10 +4026,7 @@ impl Reactor {
                 // placement by a pixel or two, and chasing that would burn
                 // the attempts for nothing.
                 let display_of = |point: CGPoint| {
-                    self.space_state
-                        .screens
-                        .iter()
-                        .position(|screen| screen.frame.contains(point))
+                    self.space_state.screens.iter().position(|screen| screen.frame.contains(point))
                 };
                 let foreign_overlap = self.space_state.screens.iter().any(|screen| {
                     if screen.frame.contains(fitted.mid()) {
@@ -4055,12 +4072,9 @@ impl Reactor {
             None => TransactionId::default(),
         };
         if let Some(app) = self.app_manager.apps.get(&finish.window.pid) {
-            _ = app.handle.send(Request::SetWindowFrame(
-                finish.window,
-                target,
-                transaction,
-                true,
-            ));
+            _ = app
+                .handle
+                .send(Request::SetWindowFrame(finish.window, target, transaction, true));
         }
         self.drag_manager.seam_finish = Some(managers::SeamFinish {
             fitted: Some(target),
@@ -4794,7 +4808,7 @@ impl Reactor {
         let before = space_switch::spaces_on_active_display().unwrap_or_default();
 
         if !scripting_addition::create_space(active.get()) {
-            warn!("Creating a space needs the scripting addition (run `sudo rift sa load`)");
+            self.fail_command(SA_REQUIRED_CREATE);
             return;
         }
 
@@ -4803,7 +4817,7 @@ impl Reactor {
             .into_iter()
             .find(|space| !before.contains(space))
         else {
-            warn!("Created a space but could not find it on the display");
+            self.fail_command("created a space but could not find it on the display");
             return;
         };
 
@@ -4825,17 +4839,17 @@ impl Reactor {
     /// the model by hand.
     fn move_focused_window_to_space(&mut self, index: usize, follow: bool) {
         let Some(space) = crate::sys::space_switch::space_at_index(index) else {
-            debug!(index, "No macOS space at that index");
+            self.fail_command(format!("there is no macOS space {index}"));
             return;
         };
         let Some(wid) = self.main_window().or_else(|| self.window_id_under_cursor()) else {
-            debug!("No window to move");
+            self.fail_command("there is no focused window to move");
             return;
         };
         let Some(window_server_id) =
             self.state.windows.window(wid).and_then(|window| window.info.sys_id)
         else {
-            warn!(?wid, "Cannot move a window with no window-server id to a space");
+            self.fail_command("that window has no window-server id, so it cannot be moved");
             return;
         };
 
@@ -4843,11 +4857,7 @@ impl Reactor {
             window_server_id.as_u32(),
             space.get(),
         ) {
-            warn!(
-                ?wid,
-                ?space,
-                "Moving a window to a space needs the scripting addition (run `sudo rift sa load`)"
-            );
+            self.fail_command(SA_REQUIRED_MOVE);
             return;
         }
         self.note_window_sent_to_space(window_server_id);
@@ -4860,11 +4870,6 @@ impl Reactor {
             };
         }
     }
-
-    /// How long after a click a focus change is still taken to be its
-    /// consequence: the app activates on mouse-down, and the reports of it
-    /// reach rift up to a few hundred milliseconds later.
-    const CLICK_FOCUS_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
     /// Whether the pointer is what changed focus: the button is down, or
     /// only just came up. Clicking into a window, clicking the menu bar of
@@ -5824,9 +5829,7 @@ impl Reactor {
         }
         Some(DropAction::Insert(match action {
             DropAction::Insert(direction) => direction,
-            DropAction::Swap => {
-                crate::actor::drag_swap::DragManager::edge_direction(frame, cursor)
-            }
+            DropAction::Swap => crate::actor::drag_swap::DragManager::edge_direction(frame, cursor),
         }))
     }
 
@@ -6051,12 +6054,12 @@ impl Reactor {
         // A window that is not in the layout has no place to trade or split
         // from, so nothing is a target for it; an empty candidate list clears
         // any target it was given earlier.
-        let candidates =
-            if self.layout_manager.layout_engine.is_window_tiled(membership_space, wid) {
-                self.collect_drag_swap_candidates(wid, space)
-            } else {
-                Vec::new()
-            };
+        let candidates = if self.layout_manager.layout_engine.is_window_tiled(membership_space, wid)
+        {
+            self.collect_drag_swap_candidates(wid, space)
+        } else {
+            Vec::new()
+        };
 
         let previous_pending = self.get_pending_drag_swap();
         let active_target = match cursor {
@@ -6074,13 +6077,9 @@ impl Reactor {
                         if pending_wid != wid {
                             return None;
                         }
-                        let (_, frame) =
-                            candidates.iter().find(|(other, _)| *other == target)?;
+                        let (_, frame) = candidates.iter().find(|(other, _)| *other == target)?;
                         let near = CGRect::new(
-                            CGPoint::new(
-                                frame.origin.x - GAP_GRACE,
-                                frame.origin.y - GAP_GRACE,
-                            ),
+                            CGPoint::new(frame.origin.x - GAP_GRACE, frame.origin.y - GAP_GRACE),
                             CGSize::new(
                                 frame.size.width + 2.0 * GAP_GRACE,
                                 frame.size.height + 2.0 * GAP_GRACE,
@@ -6441,9 +6440,7 @@ impl Reactor {
     // Uses the same "pending refresh" path as Mission Control recovery so a bulk
     // visibility rediscovery can reconcile tracked windows without treating a
     // transient empty AX window list as authoritative removal.
-    fn force_refresh_all_windows(&mut self) {
-        self.request_visible_windows_for_apps(true);
-    }
+    fn force_refresh_all_windows(&mut self) { self.request_visible_windows_for_apps(true); }
 
     fn has_user_space_context(&self) -> bool {
         self.raw_command_space().is_some_and(|space| !self.is_fullscreen_space(space))
@@ -6462,9 +6459,7 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn main_window(&self) -> Option<WindowId> {
-        self.main_window_tracker.main_window()
-    }
+    pub(crate) fn main_window(&self) -> Option<WindowId> { self.main_window_tracker.main_window() }
 
     fn main_window_space(&self) -> Option<SpaceId> {
         // TODO: Optimize this with a cache or something.
@@ -6483,9 +6478,7 @@ impl Reactor {
         (self.workspace_command_space() == Some(space)).then_some((space, window))
     }
 
-    fn raw_command_space(&self) -> Option<SpaceId> {
-        self.space_state.command_space
-    }
+    fn raw_command_space(&self) -> Option<SpaceId> { self.space_state.command_space }
 
     fn active_display_space(&self) -> Option<SpaceId> {
         self.raw_command_space()

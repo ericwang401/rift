@@ -1,8 +1,6 @@
 use objc2_core_foundation::{CGPoint, CGRect};
 use tracing::{trace, warn};
 
-use crate::sys::geometry::CGRectExt;
-
 use crate::actor::app::WindowId;
 use crate::actor::reactor::events::EventOutcome;
 use crate::actor::reactor::managers::{DragManager, LayoutManager};
@@ -10,6 +8,7 @@ use crate::actor::reactor::{DragState, LayoutEvent};
 use crate::common::collections::HashMap;
 use crate::layout_engine::LayoutCommand;
 use crate::model::RiftState;
+use crate::sys::geometry::CGRectExt;
 use crate::sys::screen::SpaceId;
 
 #[derive(Debug, Clone)]
@@ -70,7 +69,12 @@ pub fn handle_mouse_up(
                         && !layout
                             .layout_engine
                             .virtual_workspace_manager_mut()
-                            .assign_window_to_workspace(&mut state.windows, space, dragged, workspace)
+                            .assign_window_to_workspace(
+                                &mut state.windows,
+                                space,
+                                dragged,
+                                workspace,
+                            )
                     {
                         warn!(?dragged, ?workspace, "failed to assign dragged window");
                     }
@@ -256,15 +260,16 @@ pub(crate) fn seam_fitted(
             0.0
         }
     };
-    let landing = pointer
-        .and_then(|p| screens.iter().copied().find(|s| s.contains(p)))
-        .or_else(|| {
-            screens
-                .iter()
-                .copied()
-                .max_by(|a, b| overlap_area(a, &frame).total_cmp(&overlap_area(b, &frame)))
-                .filter(|screen| overlap_area(screen, &frame) > 0.0)
-        })?;
+    let landing =
+        pointer
+            .and_then(|p| screens.iter().copied().find(|s| s.contains(p)))
+            .or_else(|| {
+                screens
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| overlap_area(a, &frame).total_cmp(&overlap_area(b, &frame)))
+                    .filter(|screen| overlap_area(screen, &frame) > 0.0)
+            })?;
     let straddles = screens
         .iter()
         .any(|other| *other != landing && overlap_area(other, &frame) > 0.0);
@@ -293,8 +298,18 @@ pub(crate) fn seam_fitted(
             ),
         ];
         if let Some(&(target, horizontal)) = targets.iter().min_by(|(a, ah), (b, bh)| {
-            let da = (a - if *ah { fitted.origin.x } else { fitted.origin.y }).abs();
-            let db = (b - if *bh { fitted.origin.x } else { fitted.origin.y }).abs();
+            let da = (a - if *ah {
+                fitted.origin.x
+            } else {
+                fitted.origin.y
+            })
+            .abs();
+            let db = (b - if *bh {
+                fitted.origin.x
+            } else {
+                fitted.origin.y
+            })
+            .abs();
             da.total_cmp(&db)
         }) {
             if horizontal {
@@ -306,4 +321,3 @@ pub(crate) fn seam_fitted(
     }
     Some(fitted)
 }
-

@@ -23,14 +23,11 @@ impl MainWindowTracker {
             &Event::ApplicationLaunched {
                 pid, is_frontmost, main_window, ..
             } => {
-                self.apps.insert(
-                    pid,
-                    AppState {
-                        is_frontmost,
-                        frontmost_is_quiet: Quiet::No,
-                        main_window,
-                    },
-                );
+                self.apps.insert(pid, AppState {
+                    is_frontmost,
+                    frontmost_is_quiet: Quiet::No,
+                    main_window,
+                });
                 (pid, Quiet::No)
             }
             &Event::ApplicationThreadTerminated(pid) => {
@@ -103,9 +100,7 @@ impl MainWindowTracker {
 
     /// The app the window server says is in front, whether or not any of
     /// its windows is known.
-    pub fn global_frontmost(&self) -> Option<pid_t> {
-        self.global_frontmost
-    }
+    pub fn global_frontmost(&self) -> Option<pid_t> { self.global_frontmost }
 
     pub fn main_window(&self) -> Option<WindowId> {
         let Some(pid) = self.global_frontmost else {
@@ -128,19 +123,14 @@ impl MainWindowTracker {
     /// activation events directly.
     #[cfg(test)]
     pub(crate) fn register_app_for_test(&mut self, pid: pid_t) {
-        self.apps.insert(
-            pid,
-            AppState {
-                is_frontmost: false,
-                frontmost_is_quiet: Quiet::No,
-                main_window: None,
-            },
-        );
+        self.apps.insert(pid, AppState {
+            is_frontmost: false,
+            frontmost_is_quiet: Quiet::No,
+            main_window: None,
+        });
     }
 
-    pub fn is_globally_frontmost(&self, pid: pid_t) -> bool {
-        self.global_frontmost == Some(pid)
-    }
+    pub fn is_globally_frontmost(&self, pid: pid_t) -> bool { self.global_frontmost == Some(pid) }
 }
 
 #[cfg(test)]
@@ -160,14 +150,11 @@ mod tests {
         let stale_window = WindowId::new(7, 3);
         let mut tracker = MainWindowTracker::default();
         tracker.global_frontmost = Some(7);
-        tracker.apps.insert(
-            7,
-            AppState {
-                is_frontmost: true,
-                frontmost_is_quiet: Quiet::No,
-                main_window: Some(ax_window),
-            },
-        );
+        tracker.apps.insert(7, AppState {
+            is_frontmost: true,
+            frontmost_is_quiet: Quiet::No,
+            main_window: Some(ax_window),
+        });
 
         assert_eq!(tracker.main_window(), Some(ax_window));
         assert_eq!(

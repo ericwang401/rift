@@ -10,9 +10,7 @@ use crate::sys::window_server::WindowServerId;
 pub struct TransactionId(u32);
 
 impl TransactionId {
-    pub fn next(self) -> Self {
-        Self(self.0.wrapping_add(1))
-    }
+    pub fn next(self) -> Self { Self(self.0.wrapping_add(1)) }
 }
 
 /// Manages window transaction IDs and their associated target frames.
@@ -22,9 +20,7 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
-    pub fn new(store: WindowTxStore) -> Self {
-        Self { store }
-    }
+    pub fn new(store: WindowTxStore) -> Self { Self { store } }
 
     /// Stores a transaction ID for a window with its target frame.
     pub fn store_txid(&self, wsid: WindowServerId, txid: TransactionId, target: CGRect) {
@@ -33,23 +29,17 @@ impl TransactionManager {
 
     /// Updates multiple transaction ID entries.
     pub fn update_txid_entries<I>(&self, entries: I)
-    where
-        I: IntoIterator<Item = (WindowServerId, TransactionId, CGRect)>,
-    {
+    where I: IntoIterator<Item = (WindowServerId, TransactionId, CGRect)> {
         for (wsid, txid, target) in entries {
             self.store.insert(wsid, txid, target);
         }
     }
 
     /// Removes the transaction ID entry for a window.
-    pub fn remove_for_window(&self, wsid: WindowServerId) {
-        self.store.remove(&wsid);
-    }
+    pub fn remove_for_window(&self, wsid: WindowServerId) { self.store.remove(&wsid); }
 
     /// Clears the pending target for a window while preserving its last txid.
-    pub fn clear_target_for_window(&self, wsid: WindowServerId) {
-        self.store.clear_target(&wsid);
-    }
+    pub fn clear_target_for_window(&self, wsid: WindowServerId) { self.store.clear_target(&wsid); }
 
     /// Generates the next transaction ID for a window.
     pub fn generate_next_txid(&self, wsid: WindowServerId) -> TransactionId {

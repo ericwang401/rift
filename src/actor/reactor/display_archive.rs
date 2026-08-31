@@ -35,8 +35,7 @@ use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::DisplacedWindows;
 use crate::layout_engine::{RestoreRequest, RestoreScope, RestoreSource};
 use crate::sys::dispatch::DispatchExt;
-use crate::sys::screen::ScreenInfo;
-use crate::sys::screen::SpaceId;
+use crate::sys::screen::{ScreenInfo, SpaceId};
 use crate::sys::scripting_addition;
 use crate::sys::window_server::WindowServerId;
 
@@ -112,13 +111,9 @@ struct Homing {
 }
 
 impl DisplayArchive {
-    pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
+    pub(super) fn is_empty(&self) -> bool { self.entries.is_empty() }
 
-    pub(super) fn has(&self, display_uuid: &str) -> bool {
-        self.entries.contains_key(display_uuid)
-    }
+    pub(super) fn has(&self, display_uuid: &str) -> bool { self.entries.contains_key(display_uuid) }
 
     pub(super) fn is_homing(&self, display_uuid: &str) -> bool {
         self.entries.get(display_uuid).is_some_and(|entry| entry.homing.is_some())
@@ -147,21 +142,15 @@ impl DisplayArchive {
         self.pre_churn.as_ref().filter(|pre| pre.taken.elapsed() < PRE_CHURN_TTL)
     }
 
-    fn any_homing(&self) -> bool {
-        self.entries.values().any(|entry| entry.homing.is_some())
-    }
+    fn any_homing(&self) -> bool { self.entries.values().any(|entry| entry.homing.is_some()) }
 }
 
 /// Fallback `cgdisplay-N` ids are not identities: N is reassigned on every
 /// reconnect, so a layout filed under one could never be found again.
-fn is_stable_display_uuid(uuid: &str) -> bool {
-    !uuid.starts_with("cgdisplay-")
-}
+fn is_stable_display_uuid(uuid: &str) -> bool { !uuid.starts_with("cgdisplay-") }
 
 impl Reactor {
-    fn display_archive_enabled(&self) -> bool {
-        self.config.settings.restore_display_layouts
-    }
+    fn display_archive_enabled(&self) -> bool { self.config.settings.restore_display_layouts }
 
     /// An explicit command or drop on a displaced window while its display is
     /// away is a claim on it for the display it is on: it is no longer sent
@@ -366,18 +355,15 @@ impl Reactor {
             windows = ?windows.iter().map(|window| (window.wid, window.was_tiled)).collect::<Vec<_>>(),
             "Display departed; archived its layout"
         );
-        self.display_archive.entries.insert(
-            uuid.clone(),
-            ArchivedDisplay {
-                space,
-                snapshot,
-                windows,
-                settled: false,
-                parked_on: None,
-                waiting_for: None,
-                homing: None,
-            },
-        );
+        self.display_archive.entries.insert(uuid.clone(), ArchivedDisplay {
+            space,
+            snapshot,
+            windows,
+            settled: false,
+            parked_on: None,
+            waiting_for: None,
+            homing: None,
+        });
         match taken_over_by {
             None => self.displace_archived_windows(&uuid),
             Some(survivor) => {
@@ -427,18 +413,15 @@ impl Reactor {
             windows = ?windows.iter().map(|window| window.wid).collect::<Vec<_>>(),
             "Survivor's own space was destroyed by the takeover; archived its layout until the other display is back"
         );
-        self.display_archive.entries.insert(
-            survivor.to_string(),
-            ArchivedDisplay {
-                space: lost,
-                snapshot,
-                windows,
-                settled: true,
-                parked_on: None,
-                waiting_for: Some(departed.to_string()),
-                homing: None,
-            },
-        );
+        self.display_archive.entries.insert(survivor.to_string(), ArchivedDisplay {
+            space: lost,
+            snapshot,
+            windows,
+            settled: true,
+            parked_on: None,
+            waiting_for: Some(departed.to_string()),
+            homing: None,
+        });
     }
 
     /// The space a surviving display should go back to when it has been
