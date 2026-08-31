@@ -3895,6 +3895,14 @@ impl Reactor {
         let Some(finish) = self.drag_manager.seam_finish else {
             return;
         };
+        // A finish belongs to a float. Toggled back into the tree
+        // mid-settle, the arrange owns the window's frame; a surviving
+        // watch would read the tile write as the system relocating the
+        // drop and re-assert the drop frame over the tiling.
+        if !self.layout_manager.layout_engine.is_window_floating(finish.window) {
+            self.drag_manager.seam_finish = None;
+            return;
+        }
         // A new drag supersedes the finish outright: re-asserting an old
         // drop's frame while the user is dragging yanked the window a
         // thousand pixels out of their hand.

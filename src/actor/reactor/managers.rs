@@ -435,8 +435,18 @@ impl LayoutManager {
             // mid-relocation and its live frame reads as anything — half
             // off-screen looked "parked" and the float-restore wrote a stale
             // stored frame over the drop (the "pseudo-tile"). The finish
-            // owns the window until it lands.
-            .or(reactor.drag_manager.seam_finish.map(|finish| finish.window));
+            // owns the window until it lands — but only while it is still a
+            // float. Toggled back into the tree mid-settle, the arrange owns
+            // its frame: skipping it here left the tree split around a
+            // window that never moved (the toggle that "creates the space
+            // but doesn't move the window").
+            .or(reactor
+                .drag_manager
+                .seam_finish
+                .filter(|finish| {
+                    reactor.layout_manager.layout_engine.is_window_floating(finish.window)
+                })
+                .map(|finish| finish.window));
         let mut any_frame_changed = false;
 
         let active_space = reactor.workspace_command_space();
