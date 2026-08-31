@@ -19,6 +19,13 @@ Entries describe this fork's changes relative to
   the service and the scripting addition, and driving a running instance.
   `rift-cli` keeps working unchanged — it is a second entry point into the same
   code, not a second implementation.
+- **`rift status`** reports whether the window manager is running, whether
+  launchd is keeping it alive, and whether the scripting addition inside Dock is
+  loaded and healthy — each probed separately so the output says which one to
+  fix. It round-trips a real query rather than only looking the Mach service up,
+  so "running but not answering" is distinguishable from "not running". `--json`
+  for scripts; the exit status follows the window manager alone, since rift runs
+  without the scripting addition.
 
 ### Fixed
 
@@ -29,6 +36,10 @@ Entries describe this fork's changes relative to
 - `rift service install` wrote a plist pointing at whichever `rift` came first
   on `$PATH` rather than the one being run, so `rift service start` from a dev
   build would install and restart Homebrew's rift instead.
+- `rift status`'s launchd check looks for the Homebrew labels as well as rift's
+  own, because `brew services` starts rift under `homebrew.mxcl.rift`, not the
+  `git.acsandmann.rift` that `rift service` manages. Checking only the latter
+  reports a perfectly healthy Homebrew install as "not installed".
 - `just fmt` reformatted the whole crate whenever a change touched a module
   root such as `src/lib.rs`: rustfmt follows `mod` declarations, so naming one
   file pulled in every file below it — the wholesale reformat the recipe exists
