@@ -71,14 +71,21 @@ release with notes taken from `CHANGELOG.md`. Publishing that draft fires
 
 ## Architecture (orientation, not exhaustive)
 
-- `src/bin/rift.rs` — entry point, CLI, actor wiring.
+- `src/bin/rift.rs` — entry point and actor wiring. With no subcommand it runs
+  the window manager; the subcommands are one-shots that exit without starting
+  it.
+- `src/cli.rs` — the client command tree (`query`, `execute`, `subscribe`) and
+  its dispatch. Both binaries parse and run it, so `rift query windows` and
+  `rift-cli query windows` are the same code. `src/bin/rift-cli.rs` is a thin
+  second entry point kept for existing scripts and installs.
 - `src/actor/` — the actors: `reactor` is the core, with `app`, `spaces`,
   `drag_swap`, `wm_controller` and friends around it.
 - `src/layout_engine/` — the tree and the layout systems (bsp, stack, scrolling,
   traditional, master-stack).
 - `src/model/` — window/space state that outlives a single event.
 - `src/sys/` — the macOS edge: accessibility, SkyLight, events, screens.
-- `crates/rift-protocol`, `crates/rift-client` — the IPC surface `rift-cli` uses.
+- `crates/rift-protocol`, `crates/rift-client` — the IPC surface, for the CLI
+  and for anything else that wants to drive rift.
 
 ### The scripting addition
 

@@ -19,6 +19,7 @@ use rift_wm::actor::spaces::SpacesActor;
 use rift_wm::actor::stack_line::StackLine;
 use rift_wm::actor::window_notify as window_notify_actor;
 use rift_wm::actor::wm_controller::{self, WmController};
+use rift_wm::cli::{self, ClientCommand};
 use rift_wm::common::config::{Config, config_file, restore_file};
 use rift_wm::common::log;
 use rift_wm::common::util::execute_startup_commands;
@@ -40,6 +41,13 @@ use tokio::join;
 embed_plist::embed_info_plist!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/Info.plist"));
 
 #[derive(Parser)]
+#[command(name = "rift")]
+#[command(about = "The rift tiling window manager")]
+#[command(
+    long_about = "The rift tiling window manager.\n\nWith no subcommand rift runs the window \
+manager itself, which is how launchd starts it. The subcommands are one-shots: they manage the \
+service and the scripting addition, or talk to an already-running rift."
+)]
 struct Cli {
     /// Only run the window manager on the current space.
     #[arg(long)]
@@ -88,6 +96,11 @@ enum Commands {
         #[command(subcommand)]
         sa: SaCommands,
     },
+    // Flattened rather than nested, so these read as `rift query windows`
+    // rather than `rift client query windows` -- the same spelling `rift-cli`
+    // has always had.
+    #[command(flatten)]
+    Client(ClientCommand),
 }
 
 /// this is okay because there is no recovery mechanism for actors
@@ -102,13 +115,19 @@ fn main() {
     sigpipe::reset();
     let opt = Cli::parse();
 
-    // Both of these are one-shot administrative commands: they never start the
-    // window manager, and their exit status is what the caller acts on.
+    // Every subcommand is a one-shot: none of them starts the window manager,
+    // and their exit status is what the caller acts on. The client subcommands
+    // report themselves, so they never come back.
+    if let Some(Commands::Client(command)) = opt.command {
+        cli::run(command);
+    }
+
     let one_shot = match &opt.command {
         Some(Commands::Service { service }) => {
             Some(handle_service_command(service).map(String::from))
         }
         Some(Commands::Sa { sa }) => Some(handle_sa_command(sa)),
+        Some(Commands::Client(_)) => unreachable!("client commands exit above"),
         None => None,
     };
 

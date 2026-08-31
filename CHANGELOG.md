@@ -11,8 +11,21 @@ Entries describe this fork's changes relative to
 
 ## [Unreleased]
 
+### Added
+
+- **`rift` now accepts every `rift-cli` subcommand**: `rift query windows`,
+  `rift execute …` and `rift subscribe …` work exactly as their `rift-cli`
+  spellings do, so the one binary covers running the window manager, managing
+  the service and the scripting addition, and driving a running instance.
+  `rift-cli` keeps working unchanged — it is a second entry point into the same
+  code, not a second implementation.
+
 ### Fixed
 
+- `rift-cli service …` printed "service commands have been moved to the `rift`
+  binary" and exited 0 without doing anything, so a script could not tell the
+  difference between starting the service and not starting it. The subcommands
+  work again.
 - `just fmt` reformatted the whole crate whenever a change touched a module
   root such as `src/lib.rs`: rustfmt follows `mod` declarations, so naming one
   file pulled in every file below it — the wholesale reformat the recipe exists
