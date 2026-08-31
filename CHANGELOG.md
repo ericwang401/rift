@@ -27,6 +27,15 @@ Entries describe this fork's changes relative to
   for scripts; the exit status follows the window manager alone, since rift runs
   without the scripting addition.
 
+### Deprecated
+
+- **`rift-cli` is deprecated** in favour of `rift`, which now takes the same
+  subcommands. It still works and still ships; the documentation and the
+  `run_on_start` examples in `rift.default.toml` now say `rift`. Run by hand it
+  prints a deprecation notice, and only then — the notice is suppressed unless
+  stderr is a terminal, so `run_on_start`, `subscribe cli` and hotkeys stay
+  silent.
+
 ### Fixed
 
 - `rift-cli service …` printed "service commands have been moved to the `rift`

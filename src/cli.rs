@@ -152,7 +152,7 @@ pub enum ExecuteCommands {
     },
     /// Serialize and print runtime state
     Serialize,
-    /// this command is deprecated, use `rift-cli execute space toggle-activated`
+    /// this command is deprecated, use `rift execute space toggle-activated`
     #[deprecated]
     ToggleSpaceActivated,
     /// Show timing metrics
@@ -198,8 +198,8 @@ pub enum WindowCommands {
     /// - Pass a signed floating value: positive to grow, negative to shrink.
     /// - The value is a fraction of the current size (e.g. `0.05` = 5%).
     /// Examples:
-    ///   rift-cli execute window resize-by --amount 0.05    # grow by 5%
-    ///   rift-cli execute window resize-by --amount -0.10   # shrink by 10%
+    ///   rift execute window resize-by --amount 0.05    # grow by 5%
+    ///   rift execute window resize-by --amount -0.10   # shrink by 10%
     ResizeBy { amount: f64 },
     /// Close a window as if Command-W was pressed
     Close {
@@ -418,7 +418,7 @@ pub enum ConfigCommands {
     },
 
     /// Generic set: set an arbitrary config key (dot-separated path) to a JSON value.
-    /// Example: rift-cli execute config set --key settings.animate --value true
+    /// Example: rift execute config set --key settings.animate --value true
     Set {
         /// Dot-separated key path (e.g. settings.animate or settings.layout.gaps.outer.top)
         key: String,
@@ -729,7 +729,7 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
         }
         #[allow(deprecated)]
         ExecuteCommands::ToggleSpaceActivated => {
-            eprintln!("this command is deprecated, use `rift-cli execute space toggle-activated`");
+            eprintln!("this command is deprecated, use `rift execute space toggle-activated`");
             CliCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::ToggleSpaceActivated,
             ))

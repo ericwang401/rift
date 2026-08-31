@@ -77,7 +77,8 @@ release with notes taken from `CHANGELOG.md`. Publishing that draft fires
 - `src/cli.rs` — the client command tree (`query`, `execute`, `subscribe`) and
   its dispatch. Both binaries parse and run it, so `rift query windows` and
   `rift-cli query windows` are the same code. `src/bin/rift-cli.rs` is a thin
-  second entry point kept for existing scripts and installs.
+  second entry point, deprecated and kept only so existing scripts and installs
+  keep working — document `rift` everywhere.
 - `src/actor/` — the actors: `reactor` is the core, with `app`, `spaces`,
   `drag_swap`, `wm_controller` and friends around it.
 - `src/layout_engine/` — the tree and the layout systems (bsp, stack, scrolling,

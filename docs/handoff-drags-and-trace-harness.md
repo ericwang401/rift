@@ -81,7 +81,7 @@ A unit test covers the hold: `window_that_changes_space_with_the_button_down_is_
 
 **Validation that is still owed:** a live re-record on the new build. Drag a tile between displays a
 few times (both directions, drop with the window's centre on either side of the seam), a float
-across, and `sa+T` a couple of times; `rift-cli execute trace start ~/Downloads/drag5.trace` …
+across, and `sa+T` a couple of times; `rift execute trace start ~/Downloads/drag5.trace` …
 `trace stop`; copy into `tests/traces/`; `cargo test --lib recorded_traces_replay_cleanly -- --nocapture`.
 A recording made on the fixed build should not diverge at all, and its verdict then covers the
 whole session.
@@ -208,9 +208,9 @@ Rift can record everything the reactor sees and replay it offline, bit for bit.
 
 Record on the running instance:
 
-    rift-cli execute trace start ~/Downloads/name.trace
+    rift execute trace start ~/Downloads/name.trace
     ... reproduce ...
-    rift-cli execute trace stop
+    rift execute trace stop
 
 Drop the file into `tests/traces/`; `cargo test --lib recorded_traces_replay_cleanly` replays every
 `*.trace` there (`-- --nocapture` prints the report: requests, writes, state trajectory, drops,
@@ -278,7 +278,7 @@ debug logs (unset afterwards).
 
 - Live validation of round 6 (build of 14:56+): alt-resize with two tiles, Preview opened through
   its picker then `sa+T`, clicks into Warp / another display's menu bar / a status-item popover.
-  Anything off: record (`rift-cli execute trace start … / trace stop`), drop into `tests/traces/`.
+  Anything off: record (`rift execute trace start … / trace stop`), drop into `tests/traces/`.
 - ~~`tests/traces/` is 23 MB and in git~~ pruned to ~4 MB after round 7 (superseded recordings
   removed; see the fixture list above). Git history still carries the old ones.
 - Logging defaults to `rift_wm=info` (`src/common/log.rs`); `RUST_LOG` overrides. Service logs:
@@ -308,7 +308,7 @@ are exempt. Fixes along the way, each real on its own:
 
 Tooling (the important deliverable):
 
-- **Flight recorder**: rift always records into a 32MB in-memory ring; `rift-cli execute
+- **Flight recorder**: rift always records into a 32MB in-memory ring; `rift execute
   trace dump <path>` writes the recent history *after* a bug happened — no `trace start`
   needed. Dumps begin with a `Flight` line and are for reading, not replay.
 - **`Act` lines** (`trace::act`): every rift thread records what it does — event-tap

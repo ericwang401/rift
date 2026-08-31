@@ -5,6 +5,7 @@
 //! second entry point into the same code, not a second implementation: the
 //! command tree lives in [`rift_wm::cli`].
 
+use std::io::IsTerminal;
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -34,8 +35,25 @@ enum Commands {
     Client(ClientCommand),
 }
 
+/// Tells whoever typed this that `rift` is the name now.
+///
+/// Only when a terminal is listening. rift itself runs these strings from
+/// `run_on_start`, from `subscribe cli` on every workspace and window change,
+/// and from hotkeys — a deprecation line on each of those would be far worse
+/// than the deprecation it announces, and it would land in logs, in sketchybar
+/// pipes and in anything parsing stderr.
+fn announce_deprecation() {
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "rift-cli: `rift` now takes these subcommands directly (`rift query windows`); \
+rift-cli is deprecated and will be removed in a future release."
+        );
+    }
+}
+
 fn main() {
     sigpipe::reset();
+    announce_deprecation();
 
     match Cli::parse().command {
         Commands::Service { service } => match handle_service_command(&service) {
