@@ -26,6 +26,9 @@ Entries describe this fork's changes relative to
   binary" and exited 0 without doing anything, so a script could not tell the
   difference between starting the service and not starting it. The subcommands
   work again.
+- `rift service install` wrote a plist pointing at whichever `rift` came first
+  on `$PATH` rather than the one being run, so `rift service start` from a dev
+  build would install and restart Homebrew's rift instead.
 - `just fmt` reformatted the whole crate whenever a change touched a module
   root such as `src/lib.rs`: rustfmt follows `mod` declarations, so naming one
   file pulled in every file below it — the wholesale reformat the recipe exists
