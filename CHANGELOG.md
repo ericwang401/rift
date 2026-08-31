@@ -11,6 +11,15 @@ Entries describe this fork's changes relative to
 
 ## [Unreleased]
 
+### Fixed
+
+- `rift-cli execute` reported `Command executed successfully` for every
+  command, including the three that need the scripting addition and do nothing
+  without it. They now print why they could not run and exit non-zero.
+- `just dev` / `just install` ignored a `formula=` override, because they
+  chained through nested `just` calls rather than dependencies — building one
+  thing and installing into another.
+
 ## [0.5.3-plus.1] - 2026-08-31
 
 First tagged release of the fork, against upstream `v0.5.3`.
