@@ -5877,6 +5877,107 @@ mod mouse_follows_focus {
         crate::sys::window_server::set_cursor_location_override(None);
     }
 
+    /// A click on a Dock tile is a click, but it is the one that means "take
+    /// me there": the pointer is on the Dock, and the window it summons is
+    /// somewhere else entirely.
+    #[test]
+    fn focus_change_from_a_dock_click_warps() {
+        let (_apps, mut reactor, _a, b) = two_apps_focused_on_first();
+        crate::sys::window_server::set_pointer_over_dock_override(true);
+        reactor.handle_event(Event::MouseUp);
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        reactor.handle_event(Event::ApplicationActivated(2, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(b));
+        let b_center = reactor.live_frame_for(b).unwrap().mid();
+        assert_eq!(
+            reactor.test_mouse_warps,
+            vec![b_center],
+            "a Dock click takes the pointer to the window it summoned"
+        );
+        crate::sys::window_server::set_pointer_over_dock_override(false);
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// Clicking the tile of the app that is already in front changes no
+    /// focus at all, so nothing else in the reactor would move the pointer.
+    /// The click still means "take me there".
+    #[test]
+    fn a_dock_click_on_the_app_already_in_front_warps() {
+        let (_apps, mut reactor, a, _b) = two_apps_focused_on_first();
+        reactor.app_manager.apps.get_mut(&1).unwrap().info.localized_name =
+            Some("One".to_string());
+        crate::sys::window_server::set_pointer_over_dock_override(true);
+        crate::sys::axuielement::set_dock_application_tile_override(Some("One"));
+        crate::sys::event::set_last_mouse_up_was_left_override(Some(true));
+
+        reactor.handle_event(Event::MouseUp);
+
+        let a_center = reactor.live_frame_for(a).unwrap().mid();
+        assert_eq!(
+            reactor.test_mouse_warps,
+            vec![a_center],
+            "the tile of the front app still sends the pointer to its window"
+        );
+        crate::sys::event::set_last_mouse_up_was_left_override(None);
+        crate::sys::axuielement::set_dock_application_tile_override(None);
+        crate::sys::window_server::set_pointer_over_dock_override(false);
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// A stack, the Trash, and the right button all leave something open
+    /// under the pointer. None of them is a request to go anywhere.
+    #[test]
+    fn a_dock_click_that_opens_something_under_the_pointer_does_not_warp() {
+        let (_apps, mut reactor, _a, _b) = two_apps_focused_on_first();
+        reactor.app_manager.apps.get_mut(&1).unwrap().info.localized_name =
+            Some("One".to_string());
+        crate::sys::window_server::set_pointer_over_dock_override(true);
+        crate::sys::event::set_last_mouse_up_was_left_override(Some(true));
+
+        // The Downloads stack: not an application tile, so no title at all.
+        crate::sys::axuielement::set_dock_application_tile_override(None);
+        reactor.handle_event(Event::MouseUp);
+        assert!(
+            reactor.test_mouse_warps.is_empty(),
+            "a stack opens a fan where the pointer is"
+        );
+
+        // The front app's own tile, right-clicked: a menu, not a request.
+        crate::sys::axuielement::set_dock_application_tile_override(Some("One"));
+        crate::sys::event::set_last_mouse_up_was_left_override(Some(false));
+        reactor.handle_event(Event::MouseUp);
+        assert!(
+            reactor.test_mouse_warps.is_empty(),
+            "the right button opens a menu the pointer has to stay in"
+        );
+
+        crate::sys::event::set_last_mouse_up_was_left_override(None);
+        crate::sys::axuielement::set_dock_application_tile_override(None);
+        crate::sys::window_server::set_pointer_over_dock_override(false);
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// Dragging a file onto a tile activates the app the same way, with the
+    /// button still down. Warping then would drop the file on the way.
+    #[test]
+    fn a_drag_onto_a_dock_tile_does_not_warp() {
+        let (_apps, mut reactor, _a, b) = two_apps_focused_on_first();
+        crate::sys::window_server::set_pointer_over_dock_override(true);
+        crate::sys::event::set_mouse_state_override(Some(crate::sys::event::MouseState::Down));
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        reactor.handle_event(Event::ApplicationActivated(2, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(b));
+        assert!(
+            reactor.test_mouse_warps.is_empty(),
+            "a drag held over a Dock tile keeps the pointer"
+        );
+        crate::sys::event::set_mouse_state_override(None);
+        crate::sys::window_server::set_pointer_over_dock_override(false);
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
     /// Focus that leaves for something rift has no window for (a status-item
     /// popover, a menu) and comes straight back is the user finishing with
     /// that, not choosing the window again: no warp.

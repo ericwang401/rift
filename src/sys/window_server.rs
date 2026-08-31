@@ -797,6 +797,65 @@ pub fn window_under_cursor() -> Option<WindowServerId> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static TEST_POINTER_OVER_DOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes `pointer_is_over_dock` answer `value` on this thread, for tests.
+#[cfg(test)]
+pub fn set_pointer_over_dock_override(value: bool) {
+    TEST_POINTER_OVER_DOCK.with(|cell| cell.set(value));
+}
+
+/// Whether the pointer sits on the Dock: a tile, the trash, a stack, or one of
+/// the menus the Dock puts up over them.
+///
+/// The Dock owns every one of those windows, so the only question is who owns
+/// the window under the pointer. `kCGWindowOwnerName` is the process's own
+/// name rather than a localized title, so the comparison holds in every
+/// language.
+pub fn pointer_is_over_dock() -> bool {
+    #[cfg(test)]
+    return TEST_POINTER_OVER_DOCK.with(|cell| cell.get());
+    #[cfg(not(test))]
+    {
+        let Ok(point) = current_cursor_location() else {
+            return false;
+        };
+        point_is_on_dock(point)
+    }
+}
+
+/// Whether `point` lies on the Dock, by the same test.
+pub fn point_is_on_dock(point: CGPoint) -> bool {
+    #[cfg(test)]
+    {
+        let _ = point;
+        return TEST_POINTER_OVER_DOCK.with(|cell| cell.get());
+    }
+    #[cfg(not(test))]
+    {
+        let Some(id) = get_window_at_point(point) else {
+            return false;
+        };
+        window_owner_name(id).is_some_and(|owner| owner == "Dock")
+    }
+}
+
+/// The name of the process owning a window, as the window server reports it.
+#[cfg(not(test))]
+fn window_owner_name(id: WindowServerId) -> Option<String> {
+    trace::observe("window_owner", id.as_u32(), || {
+        get_windows_raw::<CFDictionary<CFString, CFType>>(
+            CGWindowListOption::OptionIncludingWindow,
+            id.as_u32(),
+        )
+        .iter()
+        .find_map(|window| get_string(&window, unsafe { kCGWindowOwnerName }))
+    })
+}
+
+#[cfg(test)]
 pub fn window_level(wid: u32) -> Option<NSWindowLevel> {
     trace::observe("window_level", wid, || Some(0i64)).map(|level| level as NSWindowLevel)
 }

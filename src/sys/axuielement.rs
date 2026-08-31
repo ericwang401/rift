@@ -17,6 +17,49 @@ use crate::sys::skylight::_AXUIElementCreateWithRemoteToken;
 
 pub const AX_WINDOW_ROLE: &str = "AXWindow";
 pub const AX_STANDARD_WINDOW_SUBROLE: &str = "AXStandardWindow";
+pub const AX_APPLICATION_DOCK_ITEM_SUBROLE: &str = "AXApplicationDockItem";
+
+/// How long the Dock gets to answer a tile question. This is asked on the
+/// reactor thread, where a wedged Dock must not take the window manager down
+/// with it.
+const DOCK_QUERY_TIMEOUT: f32 = 0.1;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DOCK_TILE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes `dock_application_tile_at` answer `title` on this thread, for tests.
+#[cfg(test)]
+pub fn set_dock_application_tile_override(title: Option<&str>) {
+    TEST_DOCK_TILE.with(|cell| *cell.borrow_mut() = title.map(ToString::to_string));
+}
+
+/// The name of the application whose Dock tile sits at `point`.
+///
+/// Everything else the Dock holds answers `None`. A folder stack and the Trash
+/// open a fan right where the pointer is, and a minimized window's tile
+/// restores a window that arrives with a focus change of its own; none of them
+/// is a request to send the pointer somewhere else.
+pub fn dock_application_tile_at(point: CGPoint) -> Option<String> {
+    #[cfg(test)]
+    {
+        let _ = point;
+        return TEST_DOCK_TILE.with(|cell| cell.borrow().clone());
+    }
+    #[cfg(not(test))]
+    crate::sys::trace::observe("dock_tile", crate::sys::trace::point_to(point), || {
+        let dock = AXUIElement::application(crate::sys::app::dock_pid()?);
+        dock.set_messaging_timeout(DOCK_QUERY_TIMEOUT);
+        let tile = dock.element_at_position(point)?;
+        tile.set_messaging_timeout(DOCK_QUERY_TIMEOUT);
+        if tile.subrole().ok()? != AX_APPLICATION_DOCK_ITEM_SUBROLE {
+            return None;
+        }
+        tile.title().ok()
+    })
+}
 
 #[derive(Clone)]
 pub struct AXUIElement {
@@ -322,12 +365,18 @@ impl AXUIElement {
         self.is_settable("AXSize")
     }
 
-    #[allow(unused)]
-    pub fn element_at_position(point: CGPoint) -> Option<Self> {
+    /// How long this element's application gets to answer before we give up
+    /// on it.
+    pub fn set_messaging_timeout(&self, seconds: f32) {
+        let _ = unsafe { self.inner.set_messaging_timeout(seconds) };
+    }
+
+    /// The element this application draws at `point`.
+    pub fn element_at_position(&self, point: CGPoint) -> Option<Self> {
         let mut out_ptr: *const RawAXUIElement = std::ptr::null();
         let status = unsafe {
             RawAXUIElement::copy_element_at_position(
-                &*RawAXUIElement::new_system_wide(),
+                &self.inner,
                 point.x as f32,
                 point.y as f32,
                 std::ptr::NonNull::new_unchecked(&mut out_ptr),

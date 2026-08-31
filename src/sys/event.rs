@@ -1,5 +1,5 @@
 use std::convert::TryFrom;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{
@@ -50,6 +50,35 @@ impl TryFrom<u8> for MouseState {
 
 pub fn set_mouse_state(state: MouseState) {
     MOUSE_STATE.store(state.into(), Ordering::Relaxed);
+}
+
+static LAST_MOUSE_UP_WAS_LEFT: AtomicBool = AtomicBool::new(false);
+
+/// Remembers which button a release was of. The left button is the one that
+/// asks to go somewhere; the right one opens a menu, and a menu is a place the
+/// pointer has to stay.
+pub fn set_last_mouse_up_was_left(left: bool) {
+    LAST_MOUSE_UP_WAS_LEFT.store(left, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LAST_MOUSE_UP_WAS_LEFT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes `last_mouse_up_was_left` answer `left` on this thread, for tests.
+#[cfg(test)]
+pub fn set_last_mouse_up_was_left_override(left: Option<bool>) {
+    TEST_LAST_MOUSE_UP_WAS_LEFT.with(|cell| cell.set(left));
+}
+
+pub fn last_mouse_up_was_left() -> bool {
+    #[cfg(test)]
+    if let Some(left) = TEST_LAST_MOUSE_UP_WAS_LEFT.with(|cell| cell.get()) {
+        return left;
+    }
+    LAST_MOUSE_UP_WAS_LEFT.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

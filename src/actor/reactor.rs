@@ -1305,6 +1305,7 @@ impl Reactor {
     #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
     fn handle_event(&mut self, event: Event) {
         let previously_focused_window = self.main_window();
+        let was_mouse_up = matches!(event, Event::MouseUp);
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {
                 let focused_window = self.main_window();
@@ -1325,6 +1326,10 @@ impl Reactor {
                         }
                         None => self.focus_left_from = previously_focused_window,
                     }
+                } else if was_mouse_up
+                    && let Some(focused_window) = focused_window
+                {
+                    self.follow_dock_click_with_mouse(focused_window, &mut outcome);
                 }
                 if let Some(homing) = self.advance_display_homing() {
                     outcome.absorb(homing);
@@ -3615,6 +3620,41 @@ impl Reactor {
         }
     }
 
+    /// A click on the Dock tile of the app that is already in front changes
+    /// no focus, so nothing above moves the pointer — but it is the same
+    /// request every other Dock click makes: take me to that window.
+    ///
+    /// Only the left button, and only an application's tile. The right button
+    /// opens a menu, a stack or the Trash opens a fan, and both are places the
+    /// pointer has to stay.
+    fn follow_dock_click_with_mouse(&mut self, window: WindowId, outcome: &mut EventOutcome) {
+        if !crate::sys::event::last_mouse_up_was_left() {
+            return;
+        }
+        let Ok(cursor) = window_server::current_cursor_location() else {
+            return;
+        };
+        // The cheap question first: the Dock is asked about a tile only for a
+        // click that landed on it.
+        if !window_server::point_is_on_dock(cursor) {
+            return;
+        }
+        let Some(tile) = crate::sys::axuielement::dock_application_tile_at(cursor) else {
+            return;
+        };
+        // Any other app's tile is about to activate that app, and the focus
+        // change it makes carries the pointer over on its own.
+        let front = self
+            .app_manager
+            .apps
+            .get(&window.pid)
+            .and_then(|app| app.info.localized_name.as_deref());
+        if front != Some(tile.as_str()) {
+            return;
+        }
+        self.follow_focus_with_mouse(window, outcome);
+    }
+
     /// A command aimed at the focused window acts on the layout engine's
     /// focused window, which only ever tracks admitted windows. When the
     /// window actually in front is one rift does not manage (Premiere's
@@ -4839,21 +4879,39 @@ impl Reactor {
             })
     }
 
+    /// yabai skips the warp when the pointer already sits inside the window
+    /// being focused (window_manager_center_mouse). Focusing something you
+    /// are already hovering should not move your hand, and it matters most
+    /// when stepping through a stack: every window there has the same frame,
+    /// so each step would otherwise yank the cursor back to the middle.
+    fn pointer_is_inside(&self, wid: WindowId) -> bool {
+        self.live_frame_for(wid).is_some_and(|frame| {
+            window_server::current_cursor_location().is_ok_and(|cursor| frame.contains(cursor))
+        })
+    }
+
+    /// A click on a Dock tile is the one click that means the opposite of
+    /// both gates above: the pointer is on the Dock, the window it summons is
+    /// somewhere else entirely, and arriving there is the whole of the
+    /// request. So this click, alone among clicks, still warps — and so does
+    /// a Dock click onto a window the auto-hidden Dock happens to sit over.
+    ///
+    /// Only once the button is up. Dragging a file onto a tile activates the
+    /// app too, and yanking the pointer off the Dock mid-drag would drop the
+    /// file somewhere the user never aimed at.
+    fn click_landed_on_the_dock(&self) -> bool {
+        crate::sys::event::get_mouse_state() != Some(crate::sys::event::MouseState::Down)
+            && window_server::pointer_is_over_dock()
+    }
+
     fn mouse_follows_focus_allowed_for(&self, wid: WindowId) -> bool {
         if !self.config.settings.mouse_follows_focus {
             return false;
         }
-        if self.focus_change_is_pointer_driven() {
-            return false;
-        }
-        // yabai skips the warp when the pointer already sits inside the window
-        // being focused (window_manager_center_mouse). Focusing something you
-        // are already hovering should not move your hand, and it matters most
-        // when stepping through a stack: every window there has the same frame,
-        // so each step would otherwise yank the cursor back to the middle.
-        if let Some(frame) = self.live_frame_for(wid)
-            && let Ok(cursor) = window_server::current_cursor_location()
-            && frame.contains(cursor)
+        // Both of these say the same thing: the pointer is already where the
+        // user put it, so leave it there.
+        if (self.focus_change_is_pointer_driven() || self.pointer_is_inside(wid))
+            && !self.click_landed_on_the_dock()
         {
             return false;
         }

@@ -325,6 +325,28 @@ pub fn is_bundle_running(bundle_id: &str) -> bool {
         .is_empty()
 }
 
+static DOCK_PID: Lazy<Mutex<Option<pid_t>>> = Lazy::new(|| Mutex::new(None));
+
+/// The Dock's process id.
+///
+/// Cached: the answer is a Launch Services query and only changes when the
+/// Dock is relaunched, which the liveness check catches.
+pub fn dock_pid() -> Option<pid_t> {
+    let mut cached = DOCK_PID.lock();
+    if let Some(pid) = *cached
+        && unsafe { nix::libc::kill(pid, 0) } == 0
+    {
+        return Some(pid);
+    }
+    *cached = NSRunningApplication::runningApplicationsWithBundleIdentifier(ns_string!(
+        "com.apple.dock"
+    ))
+    .to_vec()
+    .first()
+    .map(|app| app.pid());
+    *cached
+}
+
 pub trait NSRunningApplicationExt {
     fn with_process_id(pid: pid_t) -> Option<Retained<Self>>;
     fn pid(&self) -> pid_t;
