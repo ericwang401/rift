@@ -4,7 +4,7 @@ Guidance for AI agents and new contributors working in this repository.
 
 ## What this repo is
 
-A personal fork of [acsandmann/rift](https://github.com/acsandmann/rift), a
+A fork of [acsandmann/rift](https://github.com/acsandmann/rift), a
 tiling window manager for macOS. Rust; one binary (`rift`) plus a CLI
 (`rift-cli`), distributed as signed and notarized releases through
 [performave/homebrew-tap](https://github.com/performave/homebrew-tap) as
@@ -12,7 +12,7 @@ tiling window manager for macOS. Rust; one binary (`rift`) plus a CLI
 
 ### Remotes
 
-- `origin` → `ericwang401/rift` (this fork; push here)
+- `origin` → `performave/rift-plus` (this fork; push here)
 - `upstream` → `acsandmann/rift` (pull new releases and tags from here)
 
 ```bash

@@ -1,11 +1,12 @@
 name: Bug report
 description: Something rift does wrong, or stops doing
+type: Bug
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        This is a personal fork. If the same thing happens on
+        If the same thing happens on
         [upstream rift](https://github.com/acsandmann/rift), report it there —
         it reaches more people and comes back here on the next rebase.
 

@@ -58,5 +58,5 @@ First tagged release of the fork, against upstream `v0.5.3`.
   creation.
 - The release profile ships unstripped, so crash reports symbolicate.
 
-[Unreleased]: https://github.com/ericwang401/rift/compare/v0.5.3-plus.1...HEAD
-[0.5.3-plus.1]: https://github.com/ericwang401/rift/compare/v0.5.3...v0.5.3-plus.1
+[Unreleased]: https://github.com/performave/rift-plus/compare/v0.5.3-plus.1...HEAD
+[0.5.3-plus.1]: https://github.com/performave/rift-plus/compare/v0.5.3...v0.5.3-plus.1

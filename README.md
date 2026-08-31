@@ -5,8 +5,8 @@
   <img src="assets/demo.gif" alt="Rift demo" />
 
   <p>
-    <a href="https://github.com/ericwang401/rift/actions/workflows/test.yml">
-      <img src="https://img.shields.io/github/actions/workflow/status/ericwang401/rift/test.yml?style=flat-square" alt="Rust CI Status" />
+    <a href="https://github.com/performave/rift-plus/actions/workflows/test.yml">
+      <img src="https://img.shields.io/github/actions/workflow/status/performave/rift-plus/test.yml?style=flat-square" alt="Rust CI Status" />
     </a>
     <a href="https://github.com/acsandmann/rift/commits/main">
       <img src="https://img.shields.io/github/last-commit/acsandmann/rift?style=flat-square" alt="Last Commit" />

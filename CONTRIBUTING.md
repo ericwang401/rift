@@ -1,6 +1,6 @@
 # Contributing
 
-This is a personal fork of [acsandmann/rift](https://github.com/acsandmann/rift).
+This is a fork of [acsandmann/rift](https://github.com/acsandmann/rift).
 Upstream is where general rift improvements belong; what lives here is the set of
 patches this fork carries on top, kept small and focused so rebasing onto a new
 upstream release stays cheap.
@@ -67,7 +67,7 @@ it, and links onward. A README that grows into a manual stops being read.
 ## Branches
 
 `main` is pushed to directly; there is no ruleset requiring pull requests, since
-this is a single-maintainer fork and rebases onto upstream would fight one. CI
+this is a small fork and rebases onto upstream would fight one. CI
 still runs on every push, and a red `test` workflow is a real failure. If this
 ever becomes a shared repository, requiring a PR and a green `test` check on
 `main` is the change to make.

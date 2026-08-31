@@ -276,16 +276,16 @@ enum SpaceCommands {
     ToggleActivated,
     /// Switch to a macOS space by number (1-based), instantly and without the slide animation
     SwitchTo { index: usize },
-    /// Move the focused window to a macOS space by number (1-based). Needs yabai's scripting addition
+    /// Move the focused window to a macOS space by number (1-based). Needs the scripting addition (`rift sa load`)
     MoveWindow {
         index: usize,
         /// Switch to the destination space after moving the window.
         #[arg(long)]
         follow: bool,
     },
-    /// Create a space on the active display. Needs yabai's scripting addition
+    /// Create a space on the active display. Needs the scripting addition (`rift sa load`)
     Create,
-    /// Destroy the active space. Needs yabai's scripting addition
+    /// Destroy the active space. Needs the scripting addition (`rift sa load`)
     Destroy,
     /// Switch to an adjacent macOS space (Mission Control spaces, not virtual workspaces)
     Switch {

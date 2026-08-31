@@ -2327,7 +2327,7 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::DestroySpace)) => {
                 let active = crate::sys::space_switch::active_space();
                 if !crate::sys::scripting_addition::destroy_space(active.get()) {
-                    warn!("Destroying a space needs yabai's scripting addition");
+                    warn!("Destroying a space needs the scripting addition (run `sudo rift sa load`)");
                 }
                 return Ok(EventOutcome::default());
             }
@@ -4794,7 +4794,7 @@ impl Reactor {
         let before = space_switch::spaces_on_active_display().unwrap_or_default();
 
         if !scripting_addition::create_space(active.get()) {
-            warn!("Creating a space needs yabai's scripting addition");
+            warn!("Creating a space needs the scripting addition (run `sudo rift sa load`)");
             return;
         }
 
@@ -4819,7 +4819,7 @@ impl Reactor {
 
     /// Moves the focused window to a macOS space by 1-based index.
     ///
-    /// Goes through yabai's scripting addition, because macOS 26 leaves no
+    /// Goes through rift's scripting addition, because macOS 26 leaves no
     /// unprivileged way to do it — see `sys::scripting_addition`. The window
     /// server tells rift where the window went, so nothing here has to update
     /// the model by hand.
@@ -4846,7 +4846,7 @@ impl Reactor {
             warn!(
                 ?wid,
                 ?space,
-                "Moving a window to a space needs yabai's scripting addition"
+                "Moving a window to a space needs the scripting addition (run `sudo rift sa load`)"
             );
             return;
         }

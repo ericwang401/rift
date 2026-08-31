@@ -444,11 +444,11 @@ pub enum SpaceSwitchMethod {
     Auto,
     /// Post a synthetic dock swipe at a velocity that makes the window server
     /// skip its slide. Needs no elevated privileges, and is the only option on
-    /// a machine without yabai's scripting addition. Because it drives the
+    /// a machine without the scripting addition. Because it drives the
     /// Dock's real swipe machinery, a single frame of movement is visible.
     #[default]
     Gesture,
-    /// Ask yabai's scripting addition to switch, which teleports with no
+    /// Ask the scripting addition to switch, which teleports with no
     /// animation at all. Requires the addition (and so the SIP configuration it
     /// needs); falls back to `Gesture` when it is not loaded. Issuing many
     /// switches in rapid succession can leave Dock settling on a different
