@@ -79,19 +79,24 @@ test:
     cargo test
 
 # Format only the files you changed (never --all; see AGENTS.md).
+#
+# --skip-children is what keeps that promise. rustfmt follows `mod`
+# declarations, so formatting a module root reformats everything below it:
+# touching src/lib.rs reformats the entire crate, which is the wholesale
+# reformat AGENTS.md forbids.
 fmt:
     #!/usr/bin/env bash
     set -euo pipefail
     files=$(git diff --name-only --diff-filter=d HEAD -- '*.rs'; git ls-files -o --exclude-standard -- '*.rs')
     [ -z "$files" ] && { echo "nothing to format"; exit 0; }
-    echo "$files" | sort -u | xargs rustfmt +nightly --edition 2024
+    echo "$files" | sort -u | xargs rustfmt +nightly --edition 2024 --unstable-features --skip-children
 
 fmt-check:
     #!/usr/bin/env bash
     set -euo pipefail
     files=$(git diff --name-only --diff-filter=d HEAD -- '*.rs'; git ls-files -o --exclude-standard -- '*.rs')
     [ -z "$files" ] && exit 0
-    echo "$files" | sort -u | xargs rustfmt +nightly --edition 2024 --check
+    echo "$files" | sort -u | xargs rustfmt +nightly --edition 2024 --unstable-features --skip-children --check
 
 # --------------------------------------------------------------------------
 # Releasing. See docs/releasing.md; the workflow does the building.

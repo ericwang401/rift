@@ -13,6 +13,10 @@ Entries describe this fork's changes relative to
 
 ### Fixed
 
+- `just fmt` reformatted the whole crate whenever a change touched a module
+  root such as `src/lib.rs`: rustfmt follows `mod` declarations, so naming one
+  file pulled in every file below it — the wholesale reformat the recipe exists
+  to prevent. It and the CI check now pass `--skip-children`.
 - `rift-cli execute` reported `Command executed successfully` for every
   command, including the three that need the scripting addition and do nothing
   without it. They now print why they could not run and exit non-zero.

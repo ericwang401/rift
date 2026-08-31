@@ -55,6 +55,9 @@ jobs:
       # files to make CI green would destroy the ability to rebase onto
       # upstream. So this gate holds new work to the standard without
       # relitigating the old: only files this push or PR actually touched.
+      #
+      # --skip-children is part of that: rustfmt follows `mod` declarations, so
+      # without it a one-line change to src/lib.rs drags the whole crate in.
       - name: Check formatting of changed files
         run: |
           set -euo pipefail
@@ -76,4 +79,4 @@ jobs:
           fi
 
           echo "$files"
-          echo "$files" | xargs rustfmt +nightly --edition 2024 --check
+          echo "$files" | xargs rustfmt +nightly --edition 2024 --unstable-features --skip-children --check
