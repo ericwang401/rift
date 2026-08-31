@@ -4510,15 +4510,22 @@ impl Reactor {
         if self.state.windows.window(wid).is_some_and(|window| window.is_admitted()) {
             return wid;
         }
-        // Only a window rift is tracking can be somebody's child. A window
-        // rift has never seen (its creation was missed — Preview's second
-        // document briefly has no window-server record at birth) must pass
-        // through unmapped: remapping it glued focus, and every
-        // focused-window command, onto an arbitrary admitted sibling — and
-        // the remap made `contains_window` succeed, skipping the discovery
-        // that would have admitted the real window. Unknown means unknown:
-        // the caller falls back to discovery and commands become no-ops.
-        if self.state.windows.window(wid).is_none() {
+        // The child→root remap is only for windows that can actually BE a
+        // child: tracked, and not themselves a root standard window
+        // (Lightroom's filmstrip panel). Everything else passes through
+        // unmapped — a window rift has never seen, and a top-level window
+        // that merely is not admitted yet (Preview's second document,
+        // rejected at birth on a transient layer). Remapping those glued
+        // focus, and every focused-window command, onto an arbitrary
+        // admitted sibling — sa+T on the fresh document toggled the
+        // previous one — and poisoned the readmission path's candidate,
+        // so the real window was never judged again either.
+        let is_possible_child = self
+            .state
+            .windows
+            .window(wid)
+            .is_some_and(|window| !(window.info.is_root && window.info.is_standard));
+        if !is_possible_child {
             return wid;
         }
         let child = self.live_frame_for(wid);
