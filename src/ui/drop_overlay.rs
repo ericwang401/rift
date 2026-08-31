@@ -20,6 +20,7 @@
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
+use objc2::runtime::AnyClass;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSGlassEffectView, NSGlassEffectViewStyle, NSPanel, NSScreen,
@@ -72,6 +73,18 @@ pub struct DropOverlayWindow {
 
 impl DropOverlayWindow {
     pub fn new(screen: CGRect, config: DropOverlayConfig, mtm: MainThreadMarker) -> Option<Self> {
+        // NSGlassEffectView is macOS 26+, and it is the only thing in rift that
+        // needs Tahoe. objc2 resolves classes by name at run time, so an older
+        // system gets here fine and would then panic on `alloc` -- which, since
+        // actors are supervised and a panicking actor takes the process with
+        // it, would turn an opt-in cosmetic setting into a crash loop. Returning
+        // None is a case every caller already handles: no overlay, drags still
+        // work, everything else is unaffected.
+        if AnyClass::get(c"NSGlassEffectView").is_none() {
+            warn!("drop overlay needs macOS 26 (NSGlassEffectView); not showing one");
+            return None;
+        }
+
         // Panels live in Cocoa coordinates, which run y-up from the bottom of
         // the main display; window frames run y-down from its top.
         let converter = main_screen_converter(mtm)?;
