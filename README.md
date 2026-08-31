@@ -5,8 +5,8 @@
   <img src="assets/demo.gif" alt="Rift demo" />
 
   <p>
-    <a href="https://github.com/acsandmann/rift/actions/workflows/rust.yml">
-      <img src="https://img.shields.io/github/actions/workflow/status/acsandmann/rift/rust.yml?style=flat-square" alt="Rust CI Status" />
+    <a href="https://github.com/ericwang401/rift/actions/workflows/test.yml">
+      <img src="https://img.shields.io/github/actions/workflow/status/ericwang401/rift/test.yml?style=flat-square" alt="Rust CI Status" />
     </a>
     <a href="https://github.com/acsandmann/rift/commits/main">
       <img src="https://img.shields.io/github/last-commit/acsandmann/rift?style=flat-square" alt="Last Commit" />
@@ -43,6 +43,29 @@
   - Signals can be sent on startup, workspace switches, and when the windows within a workspace change. These signals can be sent via a command(cli) or through a mach connection
 - Does **not** require disabling SIP
 - Works with “Displays have separate Spaces” enabled (unlike all other major WMs)
+
+## This fork
+
+`rift-plus` is a fork of [acsandmann/rift](https://github.com/acsandmann/rift)
+carrying extra patches — most visibly, it ships its own scripting addition, so
+moving windows between spaces works without yabai installed. Releases are
+Developer ID signed and notarized.
+
+```sh
+brew install performave/tap/rift-plus
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for what it adds over upstream.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/development.md](docs/development.md) | building, and the local dev loop |
+| [docs/scripting-addition.md](docs/scripting-addition.md) | what it is, what it needs, and why |
+| [docs/releasing.md](docs/releasing.md) | cutting a release |
+| [docs/ci-setup.md](docs/ci-setup.md) | one-time signing and notarization secrets |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | commits, changelog, versioning |
 
 ## Quick Start
 Get up and running via the wiki:
