@@ -5438,6 +5438,7 @@ fn drop_action_needs_both_windows_in_the_layout() {
 #[test]
 fn cross_display_drag_previews_and_splits_the_target_under_the_pointer() {
     use crate::actor::drag_swap::DropAction;
+    use crate::sys::window_server::set_window_spaces_override;
     // A tree layout on both displays, so the target's side can split.
     let settings = crate::common::config::LayoutSettings {
         mode: LayoutMode::Bsp,
@@ -5473,6 +5474,14 @@ fn cross_display_drag_previews_and_splits_the_target_under_the_pointer() {
     let space2_workspace = reactor.test_workspace(space2, 0);
     assert!(reactor.assign_test_window_to_workspace(space2, target, space2_workspace));
     reactor.send_layout_event(LayoutEvent::WindowAdded(space2, target));
+
+    // The drop resolves the target's space through `window_spaces`, which falls
+    // through to the *live* window server for any id without an override. These
+    // two ids exist on the developer's machine as often as not, so without this
+    // the drop lands in whatever real space the host reports -- a different one
+    // per run, and never `space2`.
+    set_window_spaces_override(WindowServerId::new(121), Some(vec![space1.get()]));
+    set_window_spaces_override(WindowServerId::new(122), Some(vec![space2.get()]));
 
     reactor.drag_manager.drag_state = DragState::Active {
         session: DragSession {
@@ -5551,6 +5560,10 @@ fn cross_display_drag_previews_and_splits_the_target_under_the_pointer() {
     );
     assert_eq!(reactor.assigned_space_for_window_id(dragged), Some(space2));
     assert!(!reactor.drag_manager.drop_overlay_shown);
+
+    for wsid in [121, 122] {
+        set_window_spaces_override(WindowServerId::new(wsid), None);
+    }
 }
 
 /// A drag crossing a display seam makes the window server emit a space
