@@ -28,6 +28,7 @@ use rift_wm::model::tx_store::WindowTxStore;
 use rift_wm::sys::accessibility::ensure_accessibility_permission;
 use rift_wm::sys::executor::Executor;
 use rift_wm::sys::mach::init_window_sub_level_server_port;
+use rift_wm::sys::osax::{SaCommands, handle_sa_command};
 use rift_wm::sys::screen::{CoordinateConverter, displays_have_separate_spaces};
 use rift_wm::sys::service::{ServiceCommands, handle_service_command};
 use rift_wm::sys::skylight::{
@@ -82,6 +83,11 @@ enum Commands {
         #[command(subcommand)]
         service: ServiceCommands,
     },
+    /// Manage the scripting addition rift injects into Dock
+    Sa {
+        #[command(subcommand)]
+        sa: SaCommands,
+    },
 }
 
 /// this is okay because there is no recovery mechanism for actors
@@ -96,14 +102,24 @@ fn main() {
     sigpipe::reset();
     let opt = Cli::parse();
 
-    if let Some(Commands::Service { service }) = &opt.command {
-        match handle_service_command(service) {
+    // Both of these are one-shot administrative commands: they never start the
+    // window manager, and their exit status is what the caller acts on.
+    let one_shot = match &opt.command {
+        Some(Commands::Service { service }) => {
+            Some(handle_service_command(service).map(String::from))
+        }
+        Some(Commands::Sa { sa }) => Some(handle_sa_command(sa)),
+        None => None,
+    };
+
+    if let Some(result) = one_shot {
+        match result {
             Ok(msg) => {
                 println!("{}", msg);
                 process::exit(0);
             }
             Err(e) => {
-                eprintln!("{}", e);
+                eprintln!("rift: {}", e);
                 process::exit(1);
             }
         }

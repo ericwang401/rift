@@ -99,6 +99,12 @@ displaced_windows = "float"
 #   "rift-cli subscribe cli --event windows_changed --command sh --args -c --args 'sketchybar --trigger rift_windows_changed RIFT_WORKSPACE_NAME=\"$RIFT_WORKSPACE_NAME\" RIFT_WINDOW_COUNT=\"$RIFT_WINDOW_COUNT\"'"
 # ]
 
+# The scripting addition (see docs/scripting-addition.md) has to be re-injected
+# into Dock after every reboot and every Dock restart, and injecting needs root.
+# Install the passwordless rule once with `sudo rift sa install-sudoers`, then
+# let rift load it on start:
+# run_on_start = ["sudo rift sa load"]
+
 run_on_start = []
 
 # Hot Reloading

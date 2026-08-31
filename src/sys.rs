@@ -21,6 +21,7 @@ pub mod haptics;
 pub mod hotkey;
 pub mod mach;
 pub mod observer;
+pub mod osax;
 pub mod power;
 pub mod process;
 pub mod run_loop;
