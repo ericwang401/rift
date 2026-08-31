@@ -1,0 +1,75 @@
+name: tap
+
+# Point the Homebrew formula at a release once it is actually published.
+#
+# This is split out of release.yml on purpose: that workflow leaves a *draft*,
+# and a draft's asset URL 404s for anyone but you. Bumping the formula before
+# publishing would hand `brew` a download that does not exist yet. Publishing
+# the draft is what fires this.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to point the formula at
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bump the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; skipping the tap bump."
+            echo "Set it, or edit Formula/rift-plus.rb by hand (docs/releasing.md)."
+            exit 0
+          fi
+
+          TAP_REPO="performave/homebrew-tap"
+          FORMULA="Formula/rift-plus.rb"
+          VERSION="${RELEASE_TAG#v}"
+          ASSET="rift-plus-universal-macos-${VERSION}.tar.gz"
+
+          # Take the hash from the checksum file the release workflow attached,
+          # rather than recomputing it -- if the two ever disagree, that is a
+          # tampered or half-uploaded asset and the formula should not move.
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${ASSET}" --pattern "${ASSET}.sha256" --dir dl
+          ( cd dl && shasum -a 256 -c "${ASSET}.sha256" )
+          SHA256="$(cut -d' ' -f1 < "dl/${ASSET}.sha256")"
+
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cd tap
+
+          # The url interpolates #{version}, so only these two fields move.
+          sed -i -E \
+            -e "s|^  version \".*\"|  version \"${VERSION}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" \
+            "${FORMULA}"
+
+          grep -E '^  (version|sha256) ' "${FORMULA}"
+
+          if git diff --quiet -- "${FORMULA}"; then
+            echo "Formula already up to date; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "rift-plus ${VERSION}"
+          git push

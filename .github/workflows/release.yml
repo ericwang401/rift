@@ -1,121 +1,236 @@
 name: release
 
+# Build, Developer ID sign, notarize, and stage a rift-plus release as a draft.
+#
+# Triggers on a tag like `v0.5.3-plus.1`. Runs on a macOS runner, imports the
+# Developer ID Application certificate into a throwaway keychain, builds a
+# universal (x86_64 + arm64) binary, signs it with the hardened runtime,
+# notarizes it with notarytool, and opens a **draft** GitHub Release with the
+# archive attached. Publishing that draft is what bumps the Homebrew tap
+# (see tap.yml).
+#
+# One-time secret setup: docs/ci-setup.md. The names match the yabai-plus repo
+# so the same values work for both.
+
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build, e.g. v0.5.3-plus.1
+        required: true
 
 permissions:
-  contents: write
+  contents: write # needed to create the GitHub Release
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
-  build-and-publish:
+  release:
     runs-on: macos-14
-    env:
-      CARGO_TERM_COLOR: always
-      ASSET_BASENAME: rift-universal-macos
-      TAP_REPO: acsandmann/homebrew-tap
-      TAP_FILE_PATH: Formula/rift.rb
     steps:
-      - name: Checkout source
+      # Everything downstream is named from this tag, so a malformed one has to
+      # stop the run here rather than produce an archive nobody can install.
+      - name: Validate the tag is semver
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+
+          # Guard the easy mistakes explicitly, because the bare regex failure
+          # below reads as "malformed" without saying what to fix.
+          case "$TAG" in
+            vv*) echo "::error::tag '$TAG' has a doubled 'v' prefix"; exit 1 ;;
+            v*)  ;;
+            *)   echo "::error::tag '$TAG' must start with 'v'"; exit 1 ;;
+          esac
+
+          VERSION="${TAG#v}"
+          # semver.org's own grammar, with the optional build-metadata part.
+          SEMVER='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! printf '%s' "$VERSION" | grep -Eq "$SEMVER"; then
+            echo "::error::'$VERSION' is not valid semver (expected e.g. 0.5.3-plus.1)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${VERSION}"
+
+      - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
+
+      # A tag that disagrees with the metadata would ship a binary whose
+      # --version contradicts the formula that installed it. Check the lockfile
+      # too: `cargo build` rewrites it, so a bumped Cargo.toml with a stale
+      # Cargo.lock means the bump was never committed properly.
+      - name: Check project metadata matches the tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+
+          CARGO_VERSION="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::Cargo.toml says ${CARGO_VERSION}, tag says ${VERSION}"
+            exit 1
+          fi
+
+          LOCK_VERSION="$(awk '
+            /^name = "rift-wm"$/ { found = 1; next }
+            found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }
+          ' Cargo.lock)"
+          if [ "$LOCK_VERSION" != "$VERSION" ]; then
+            echo "::error::Cargo.lock says ${LOCK_VERSION}, tag says ${VERSION} -- run 'just bump' and commit the lockfile"
+            exit 1
+          fi
+
+          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section"
+            exit 1
+          fi
 
       - name: Install Rust + targets
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Show toolchain
-        run: |
-          rustc -V
-          cargo -V
-          rustup target list --installed
-          sw_vers
+      - name: Import Apple signing certificate
+        # Creates a temporary keychain, imports the Developer ID cert, and sets
+        # the key partition list so codesign works non-interactively -- the
+        # usual failure when this is done by hand on recent runners.
+        uses: apple-actions/import-codesign-certs@v7.0.0
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
-      - name: Build release for both targets (both bins)
+      - name: Build (universal)
         run: |
           set -euxo pipefail
-          # Build arm64
-          RUSTFLAGS="-C target-cpu=native" cargo build --release --locked --bins --target aarch64-apple-darwin
-          # Build x86_64
-          RUSTFLAGS="-C target-cpu=native" cargo build --release --locked --bins --target x86_64-apple-darwin
+          # No -C target-cpu=native: the runner's CPU is not the user's, and a
+          # binary that traps on an unsupported instruction is worse than a
+          # slightly slower one.
+          cargo build --release --locked --bins --target aarch64-apple-darwin
+          cargo build --release --locked --bins --target x86_64-apple-darwin
 
-      - name: Create universal binaries with lipo
-        run: |
-          set -euxo pipefail
           mkdir -p dist
+          for bin in rift rift-cli; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/${bin}" \
+              "target/x86_64-apple-darwin/release/${bin}" \
+              -output "dist/${bin}"
+          done
+          # Deliberately not stripped: the release profile keeps debuginfo so
+          # crash reports symbolicate.
 
-          # Combine rift
-          lipo -create \
-            target/aarch64-apple-darwin/release/rift \
-            target/x86_64-apple-darwin/release/rift \
-            -output dist/rift
-
-          # Combine rift-cli
-          lipo -create \
-            target/aarch64-apple-darwin/release/rift-cli \
-            target/x86_64-apple-darwin/release/rift-cli \
-            -output dist/rift-cli
-
-          # Optional: strip symbols to reduce size
-          strip -x dist/rift dist/rift-cli
-
-      - name: Package tarball
-        id: pkg
+      # Hardened runtime is safe here even though rift injects into Dock: the
+      # loader and payload are written to /Library/ScriptingAdditions at
+      # `rift sa load` time and ad-hoc signed separately. Never hardened-sign
+      # those two -- they run inside Dock.
+      - name: Codesign (hardened runtime)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          set -euxo pipefail
-          TAG="${GITHUB_REF_NAME}"      # e.g. v1.2.3 or 1.2.3
-          VERSION="${TAG#v}"            # strip leading 'v' if present
-          ASSET="${ASSET_BASENAME}-${VERSION}.tar.gz"
+          set -euo pipefail
+          for bin in rift rift-cli; do
+            codesign --force --timestamp --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" "dist/${bin}"
+            codesign --verify --strict --verbose=2 "dist/${bin}"
+          done
 
-          tar -C dist -czf "${ASSET}" rift rift-cli
-          sha256=$(shasum -a 256 "${ASSET}" | awk '{print $1}')
+      - name: Prepare App Store Connect API key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$API_KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
 
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Notarize
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          # notarytool needs a zip/pkg/dmg; bare Mach-O files cannot be
+          # submitted directly. Both binaries go up in one submission.
+          ditto -c -k --keepParent dist "$RUNNER_TEMP/rift-notarize.zip"
+
+          xcrun notarytool submit "$RUNNER_TEMP/rift-notarize.zip" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          # A standalone CLI binary cannot be stapled; Gatekeeper checks the
+          # notarization ticket online on first run, which is sufficient.
+
+      - name: Assemble archive
+        id: archive
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ASSET="rift-plus-universal-macos-${VERSION}.tar.gz"
+
+          # The formula installs this into pkgshare and its caveats point at it.
+          cp rift.default.toml dist/
+
+          tar -C dist -czf "${ASSET}" rift rift-cli rift.default.toml
+          SHA256="$(shasum -a 256 "${ASSET}" | cut -d' ' -f1)"
+          printf '%s  %s\n' "${SHA256}" "${ASSET}" > "${ASSET}.sha256"
+
           echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
-          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          echo "checksum=${ASSET}.sha256" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "Built ${ASSET}  sha256=${SHA256}"
 
-      - name: Upload asset to the release
+      - name: Extract release notes from the changelog
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+
+          # Everything between this version's heading and the next "## ".
+          awk -v h="## [${VERSION}]" '
+            index($0, h) == 1 { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md | sed '/./,$!d' > "$NOTES_FILE"
+
+          if [ -s "$NOTES_FILE" ]; then
+            cat "$NOTES_FILE"
+            echo "file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "No changelog section found; falling back to generated notes."
+            echo "file=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.pkg.outputs.asset }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: |
+            ${{ steps.archive.outputs.asset }}
+            ${{ steps.archive.outputs.checksum }}
+          body_path: ${{ steps.notes.outputs.file }}
+          generate_release_notes: ${{ steps.notes.outputs.file == '' }}
 
-      - name: Checkout tap repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.TAP_REPO }}
-          path: tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }} # PAT with repo:push to the tap
-
-      - name: Update formula version & sha256
+      - name: Summary
         run: |
-          set -euxo pipefail
-          VERSION="${{ steps.pkg.outputs.version }}"
-          SHA256="${{ steps.pkg.outputs.sha256 }}"
-          FORMULA="tap/${TAP_FILE_PATH}"
-
-          # Update version "..."
-          /usr/bin/sed -i '' -E \
-            "s/^[[:space:]]*version[[:space:]]+\"[^\"]*\"/  version \"${VERSION}\"/" \
-            "${FORMULA}" || true
-
-          # Update sha256 "..."
-          /usr/bin/sed -i '' -E \
-            "s/^[[:space:]]*sha256[[:space:]]+\"[^\"]*\"/  sha256 \"${SHA256}\"/" \
-            "${FORMULA}"
-
-          echo "Updated ${FORMULA}: version=${VERSION}, sha256=${SHA256}"
-          echo "---- Formula preview ----"
-          sed -n '1,120p' "${FORMULA}"
-
-      - name: Commit & push formula update
-        run: |
-          set -euxo pipefail
-          git -C tap config user.name "github-actions[bot]"
-          git -C tap config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C tap add "${TAP_FILE_PATH}"
-          git -C tap commit -m "chore(formula): rift ${{ steps.pkg.outputs.version }} (universal) - sha256 ${{ steps.pkg.outputs.sha256 }}"
-          git -C tap push origin HEAD
+          {
+            echo "### Draft release ${RELEASE_TAG} is ready"
+            echo
+            echo '`sha256`: `${{ steps.archive.outputs.sha256 }}`'
+            echo
+            echo "Review it in the Releases tab and publish. Publishing bumps"
+            echo "\`Formula/rift-plus.rb\` in the tap (see tap.yml)."
+          } >> "$GITHUB_STEP_SUMMARY"

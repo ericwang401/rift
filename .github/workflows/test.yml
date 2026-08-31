@@ -1,0 +1,79 @@
+name: test
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-C debuginfo=0"
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo check` also compiles build.rs, which drives `xcrun clang` over
+      # src/osax for arm64e -- so a broken payload or loader fails here rather
+      # than at release time.
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+  format:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      # Deliberately not `--all`. The tree inherited from upstream does not
+      # satisfy current nightly rustfmt, and reformatting a hundred untouched
+      # files to make CI green would destroy the ability to rebase onto
+      # upstream. So this gate holds new work to the standard without
+      # relitigating the old: only files this push or PR actually touched.
+      - name: Check formatting of changed files
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # A new branch reports an all-zero "before"; nothing to diff against.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "no base commit to diff against; skipping"
+            exit 0
+          fi
+
+          files="$(git diff --name-only --diff-filter=d "$base" HEAD -- '*.rs')"
+          if [ -z "$files" ]; then
+            echo "no Rust files changed"
+            exit 0
+          fi
+
+          echo "$files"
+          echo "$files" | xargs rustfmt +nightly --edition 2024 --check

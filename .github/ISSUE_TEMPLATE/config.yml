@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Upstream rift
+    url: https://github.com/acsandmann/rift/issues
+    about: >-
+      This is a fork. If the behaviour also happens on upstream rift, report it
+      there instead — it will reach more people and come back here on rebase.

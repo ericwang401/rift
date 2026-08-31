@@ -1,0 +1,67 @@
+name: Bug report
+description: Something rift does wrong, or stops doing
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a personal fork. If the same thing happens on
+        [upstream rift](https://github.com/acsandmann/rift), report it there —
+        it reaches more people and comes back here on the next rebase.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >-
+        The window-manager cases that matter are usually about arrangement, so
+        say how many displays, how many spaces, which apps, and what you did.
+      placeholder: |
+        1. Two displays, laptop + external
+        2. Focus a window on the external, Alt+Shift+...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: rift version
+      description: "`rift --version`, or the commit if you built it yourself."
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      description: "`sw_vers -productVersion`"
+    validations:
+      required: true
+
+  - type: textarea
+    id: sa
+    attributes:
+      label: Scripting addition
+      description: >-
+        Output of `rift sa status`. Moving windows between spaces and
+        creating/destroying them depend on it, so this is the first thing to
+        check for anything space-related.
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Anything relevant from `/tmp/rift_$USER.err.log` and
+        `/tmp/rift_$USER.out.log`.
+      render: text
