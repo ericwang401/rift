@@ -5038,6 +5038,23 @@ impl Reactor {
             LayoutEvent::WindowRemovedPreserveFloating(window) => Some(*window),
             _ => None,
         };
+        // A window coming back from native fullscreen is put into the tree by
+        // whichever path notices it first, and none of them knows where it
+        // used to sit. Read the slot off the addition, remembering how the
+        // tree looked before it: that is what says whether the whole layout
+        // can go back as it was.
+        let reinstate_slot_for = match &event {
+            LayoutEvent::WindowAdded(space, window)
+                if self.has_fullscreen_slot(*window, *space) =>
+            {
+                Some((
+                    *window,
+                    *space,
+                    self.fullscreen_slot_is_untouched(*window, *space),
+                ))
+            }
+            _ => None,
+        };
         let focus_changed = matches!(
             &event,
             LayoutEvent::WindowFocused(_, window)
@@ -5059,6 +5076,11 @@ impl Reactor {
             self.seal_fullscreen_slot(window);
         }
         let mut response = layout_outcome.response;
+        if let Some((window, space, untouched)) = reinstate_slot_for
+            && self.reinstate_fullscreen_slot(window, space, untouched)
+        {
+            response.changed = true;
+        }
         let (placements, resizes, workspace_focus) = layout_outcome.app_rules.into_parts();
         self.apply_app_rule_placements(placements);
         self.apply_app_rule_resizes(resizes);

@@ -15,6 +15,14 @@
 //!   re-inserted next to its old neighbour on the same side with its old
 //!   share, or, if that neighbour is gone too, wherever it would otherwise
 //!   have landed.
+//!
+//! The slot is read from the addition that puts the window back in the tree,
+//! not from the event that announces the return. The window server says the
+//! window is home again before it says the display has left the fullscreen
+//! space, so the restoration that reads the exit is skipped for a space that
+//! is not active yet, and the window is added back a moment later by whichever
+//! path notices it next. Hanging the slot off the addition means every one of
+//! those paths puts the window back where it was.
 
 use tracing::{debug, info, warn};
 
@@ -91,24 +99,52 @@ impl Reactor {
         }
     }
 
-    /// The window is back on `space`. Reinstate its slot and add it to the
-    /// layout; returns whether the active layout changed, like
+    /// The window is back on `space`. Adding it to the layout is what
+    /// reinstates its slot, in `reinstate_fullscreen_slot`; returns whether
+    /// the active layout changed, like
     /// `restore_window_to_active_layout_if_visible`.
     pub(super) fn restore_window_to_layout_after_fullscreen(
         &mut self,
         window: WindowId,
         space: SpaceId,
     ) -> bool {
+        self.restore_window_to_active_layout_if_visible(window, space)
+    }
+
+    /// Whether a slot recorded for `window` on `space` is still waiting to be
+    /// reinstated.
+    pub(super) fn has_fullscreen_slot(&self, window: WindowId, space: SpaceId) -> bool {
+        self.fullscreen_slots.slots.get(&window).is_some_and(|slot| slot.space == space)
+    }
+
+    /// Whether the tree on `space` still looks as it did when `window` left
+    /// it, i.e. nothing was rearranged while it was away. Asked before the
+    /// window goes back in, since putting it back is itself a change.
+    pub(super) fn fullscreen_slot_is_untouched(&self, window: WindowId, space: SpaceId) -> bool {
+        self.fullscreen_slots.slots.get(&window).is_some_and(|slot| {
+            slot.space == space
+                && slot.digest_after_removal.is_some()
+                && self.layout_manager.layout_engine.tree_digest(space) == slot.digest_after_removal
+        })
+    }
+
+    /// `window` has just been added back to the tree on `space`. Move it to
+    /// the slot it left, and report whether the layout changed. `untouched`
+    /// is `fullscreen_slot_is_untouched` from before the addition.
+    pub(super) fn reinstate_fullscreen_slot(
+        &mut self,
+        window: WindowId,
+        space: SpaceId,
+        untouched: bool,
+    ) -> bool {
         let Some(slot) = self.fullscreen_slots.slots.remove(&window) else {
-            return self.restore_window_to_active_layout_if_visible(window, space);
+            return false;
         };
         if slot.space != space {
             debug!(?window, "Fullscreen exit landed on another space; slot dropped");
-            return self.restore_window_to_active_layout_if_visible(window, space);
+            return false;
         }
 
-        let untouched = slot.digest_after_removal.is_some()
-            && self.layout_manager.layout_engine.tree_digest(space) == slot.digest_after_removal;
         if untouched {
             let request = RestoreRequest {
                 scope: RestoreScope::Workspace,
@@ -128,9 +164,6 @@ impl Reactor {
                         matched = report.matched,
                         "Fullscreen exit: layout put back as it was"
                     );
-                    // Idempotent for a window the restore already placed;
-                    // this is what re-projects it if it is not visible yet.
-                    let _ = self.restore_window_to_active_layout_if_visible(window, space);
                     return true;
                 }
                 Ok(report) => debug!(
@@ -144,7 +177,6 @@ impl Reactor {
             }
         }
 
-        let changed = self.restore_window_to_active_layout_if_visible(window, space);
         if let Some(anchor) = slot.anchor
             && anchor.anchor != window
             && self.layout_manager.layout_engine.restore_slot(space, anchor, window)
@@ -152,7 +184,7 @@ impl Reactor {
             info!(?window, anchor = ?anchor.anchor, side = ?anchor.side, "Fullscreen exit: window put back beside its old neighbour");
             return true;
         }
-        changed
+        false
     }
 
     pub(super) fn note_fullscreen_slot_lifecycle(&mut self, event: &LayoutEvent) {

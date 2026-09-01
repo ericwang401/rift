@@ -1802,6 +1802,81 @@ fn fullscreen_exit_restores_the_slot_when_the_departure_is_seen_first() {
     );
 }
 
+/// The live sequence, as recorded off a YouTube video going fullscreen in Zen
+/// with the browser tiled left of an editor: the window leaves its user space,
+/// arrives on a fullscreen space, the display's active space *becomes* that
+/// fullscreen space, and then the whole thing runs backwards. The window is
+/// announced home before the display is, so the exit itself cannot put it
+/// back — the addition that follows has to.
+fn fullscreen_exit_across_an_active_fullscreen_space(mode: LayoutMode) {
+    let mut apps = Apps::new();
+    let settings = crate::common::config::LayoutSettings {
+        mode,
+        ..crate::common::config::LayoutSettings::default()
+    };
+    let mut reactor = Reactor::new_for_test(LayoutEngine::new(
+        &crate::common::config::VirtualWorkspaceSettings::default(),
+        &settings,
+        None,
+    ));
+
+    let frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let user_space = SpaceId::new(1);
+    let fullscreen_space = SpaceId::new(0x400000000 + user_space.get());
+    let left = WindowId::new(1, 1);
+    let right = WindowId::new(1, 2);
+
+    reactor.handle_event(space_state_event(vec![frame], vec![Some(user_space)]));
+    make_active_app(&mut apps, &mut reactor, 1, make_windows(2), Some(left));
+
+    let order = |reactor: &Reactor| {
+        reactor
+            .layout_manager
+            .layout_engine
+            .windows_on_space_in_layout_order(user_space)
+    };
+    assert_eq!(order(&reactor), vec![left, right]);
+
+    let wsid = reactor.state.windows.window(left).unwrap().info.sys_id.unwrap();
+
+    // Going fullscreen: the window leaves its space, lands on the fullscreen
+    // one, and the display follows it there.
+    crate::sys::window_server::set_window_ordered_in_override(wsid, Some(false));
+    window_server_destroyed(&mut reactor, wsid, user_space, SpaceEventKind::User);
+    crate::sys::window_server::set_window_ordered_in_override(wsid, None);
+    window_server_appeared(&mut reactor, wsid, fullscreen_space, SpaceEventKind::Fullscreen);
+    assert!(!has_window_in_layout(&mut reactor, user_space, frame, left));
+
+    reactor.space_state.fullscreen_spaces.insert(fullscreen_space);
+    reactor.handle_event(space_state_event(vec![frame], vec![None]));
+    apps.simulate_until_quiet(&mut reactor);
+
+    // Coming back: the window leaves the fullscreen space and reappears on its
+    // own while the display is still on the fullscreen space, which only then
+    // goes away.
+    window_server_destroyed(&mut reactor, wsid, fullscreen_space, SpaceEventKind::Fullscreen);
+    window_server_appeared(&mut reactor, wsid, user_space, SpaceEventKind::User);
+    reactor.space_state.fullscreen_spaces.remove(&fullscreen_space);
+    reactor.handle_event(space_state_event(vec![frame], vec![Some(user_space)]));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(
+        order(&reactor),
+        vec![left, right],
+        "a window tiled on the left must come back on the left, not beside the selection"
+    );
+}
+
+#[test]
+fn fullscreen_exit_across_an_active_fullscreen_space_traditional() {
+    fullscreen_exit_across_an_active_fullscreen_space(LayoutMode::Traditional);
+}
+
+#[test]
+fn fullscreen_exit_across_an_active_fullscreen_space_bsp() {
+    fullscreen_exit_across_an_active_fullscreen_space(LayoutMode::Bsp);
+}
+
 #[test]
 fn known_window_server_appearance_restores_same_workspace_after_fullscreen() {
     let (mut apps, mut reactor) = test_context();
