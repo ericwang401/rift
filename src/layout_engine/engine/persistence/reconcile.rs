@@ -117,17 +117,13 @@ impl LayoutEngine {
                         .flatten()
                 })
             });
-            self.persistence.record(
-                window_id,
-                WindowFingerprint {
-                    window_server_id: current_window_server_id,
-                    title: (!window.info.title.trim().is_empty())
-                        .then(|| window.info.title.clone()),
-                    width: window.frame_monotonic.size.width,
-                    height: window.frame_monotonic.size.height,
-                    app_id,
-                },
-            );
+            self.persistence.record(window_id, WindowFingerprint {
+                window_server_id: current_window_server_id,
+                title: (!window.info.title.trim().is_empty()).then(|| window.info.title.clone()),
+                width: window.frame_monotonic.size.width,
+                height: window.frame_monotonic.size.height,
+                app_id,
+            });
         }
     }
 
@@ -262,6 +258,12 @@ impl LayoutEngine {
                 workspace,
             );
         }
+        // The snapshot's verdict on this window — tiled here, floating there —
+        // is a decision the user made before the restart, so it needs the same
+        // standing as a manual toggle. Without it the restore holds only until
+        // the next space activation re-runs the app rules and a catch-all
+        // `floating` rule floats everything that was just put back.
+        window_store.set_user_floating(live, self.floating.is_floating(live));
         ReconcileOutcome {
             matched: true,
             duplicates_removed,

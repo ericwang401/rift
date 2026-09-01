@@ -84,6 +84,10 @@ pub struct WindowServerDestroyedObservations {
     pub active_spaces: HashSet<SpaceId>,
     pub mission_control_active: bool,
     pub ordered_in: Option<bool>,
+    /// Whether the window server still returns a record for this id, asked
+    /// without reference to any space. A window that left for a fullscreen
+    /// space is still known; one whose connection dropped is not.
+    pub still_known: bool,
     pub assigned_space: Option<SpaceId>,
     pub last_known_user_space: Option<SpaceId>,
 }
@@ -117,6 +121,7 @@ pub fn handle_window_server_destroyed(
         active_spaces,
         mission_control_active,
         ordered_in,
+        still_known,
         assigned_space,
         last_known_user_space,
     } = observations;
@@ -179,7 +184,15 @@ pub fn handle_window_server_destroyed(
         }
 
         if let Some(wid) = state.windows.tracked_window_id(wsid) {
-            if matches!(ordered_in, Some(false)) {
+            // Not being ordered in means the window is not drawn on the space it
+            // just left. That is true of a dead window, and equally true of one
+            // that walked off to a native fullscreen space of its own, so it
+            // cannot decide the question alone: destroying a window drops its
+            // `WindowRecord`, and with it the `user_floating` choice that
+            // outranks a catch-all app rule, so a live window retired here comes
+            // back a stranger and gets re-floated. Only an id the window server
+            // no longer knows at all is dead.
+            if matches!(ordered_in, Some(false)) && !still_known {
                 // since the connection has dropped it wont be shown in space_windows_list
                 // so ordered in can be authorative because it doesnt consider
                 // ghost windows that sometimes remain

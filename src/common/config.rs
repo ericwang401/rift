@@ -19,12 +19,8 @@ const DEPRECATED_MAP: &[(&str, &str)] = &[
     ("toggle_tile_orientation", "toggle_orientation"),
 ];
 
-pub fn data_dir() -> PathBuf {
-    dirs::home_dir().unwrap().join(".rift")
-}
-pub fn restore_file() -> PathBuf {
-    data_dir().join("layout.ron")
-}
+pub fn data_dir() -> PathBuf { dirs::home_dir().unwrap().join(".rift") }
+pub fn restore_file() -> PathBuf { data_dir().join("layout.ron") }
 pub fn config_file() -> PathBuf {
     dirs::home_dir().unwrap().join(".config").join("rift").join("config.toml")
 }
@@ -383,9 +379,7 @@ pub struct Config {
 
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D>(deserializer: D) -> Result<Config, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+    where D: serde::Deserializer<'de> {
         #[derive(Deserialize)]
         struct ConfigSerde {
             settings: Settings,
@@ -480,18 +474,14 @@ pub struct MouseModifier(pub Modifiers);
 /// config (a trace header) deserializes again.
 impl Serialize for MouseModifier {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    where S: serde::Serializer {
         serializer.serialize_str(&self.0.to_string())
     }
 }
 
 impl<'de> Deserialize<'de> for MouseModifier {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+    where D: serde::Deserializer<'de> {
         let raw = String::deserialize(deserializer)?;
         crate::sys::hotkey::modifiers_from_str(&raw)
             .map(MouseModifier)
@@ -619,6 +609,55 @@ pub struct Settings {
     /// Enable hot-reloading of the config file when it changes
     #[serde(default = "yes")]
     pub hot_reload: bool,
+
+    /// Carrying the layout across a restart. See `LayoutRestoreSettings`.
+    #[serde(default)]
+    pub layout_restore: LayoutRestoreSettings,
+}
+
+fn default_restore_max_age_secs() -> u64 { 120 }
+
+fn default_autosave_secs() -> u64 { 60 }
+
+/// Putting the layout back after rift restarts.
+///
+/// rift has always been able to save its layout and start from a saved one, but
+/// only by hand: nothing wrote the file on the way out and nothing read it on
+/// the way in. Under a float-by-default config that means re-tiling everything
+/// after each restart.
+///
+/// The restore is deliberately not unconditional. A snapshot is only worth
+/// putting back if rift is coming straight back up — a crash respawn, a
+/// `brew services restart`, a dev rebuild. After a reboot or an afternoon away
+/// the windows have moved on without it, and reasserting a stale arrangement
+/// would fight the user rather than help. `max_age_secs` is how long a snapshot
+/// stays worth restoring; `autosave_secs` keeps the file's timestamp tracking
+/// the last moment rift was known to be alive, so the age measures downtime.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutRestoreSettings {
+    /// Restore `~/.rift/layout.ron` at startup, if it is fresh enough. The
+    /// `--restore` flag forces this on for one run regardless.
+    #[serde(default = "no")]
+    pub on_start: bool,
+    /// How old the snapshot may be and still be restored, in seconds. Measured
+    /// from when the file was last written. 0 restores whatever is there.
+    #[serde(default = "default_restore_max_age_secs")]
+    pub max_age_secs: u64,
+    /// Save the layout every this many seconds. 0 disables it, leaving only
+    /// the save on shutdown — which a crash or a SIGKILL does not reach.
+    #[serde(default = "default_autosave_secs")]
+    pub autosave_secs: u64,
+}
+
+impl Default for LayoutRestoreSettings {
+    fn default() -> Self {
+        Self {
+            on_start: false,
+            max_age_secs: default_restore_max_age_secs(),
+            autosave_secs: default_autosave_secs(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -652,18 +691,10 @@ pub struct DropOverlaySettings {
     pub follow_rate: f64,
 }
 
-fn default_drop_overlay_corner_radius() -> f64 {
-    10.0
-}
-fn default_drop_overlay_border_width() -> f64 {
-    2.0
-}
-fn default_drop_overlay_blur() -> i32 {
-    24
-}
-fn default_drop_overlay_follow_rate() -> f64 {
-    0.35
-}
+fn default_drop_overlay_corner_radius() -> f64 { 10.0 }
+fn default_drop_overlay_border_width() -> f64 { 2.0 }
+fn default_drop_overlay_blur() -> i32 { 24 }
+fn default_drop_overlay_follow_rate() -> f64 { 0.35 }
 
 impl Default for DropOverlaySettings {
     fn default() -> Self {
@@ -835,33 +866,19 @@ pub struct MissionControlSettings {
     pub fade_duration_ms: f64,
 }
 
-fn default_mission_control_fade_duration_ms() -> f64 {
-    180.0
-}
+fn default_mission_control_fade_duration_ms() -> f64 { 180.0 }
 
-fn default_drag_swap_fraction() -> f64 {
-    0.3
-}
+fn default_drag_swap_fraction() -> f64 { 0.3 }
 
-fn default_master_stack_ratio() -> f64 {
-    0.6
-}
+fn default_master_stack_ratio() -> f64 { 0.6 }
 
-fn default_master_stack_count() -> usize {
-    1
-}
+fn default_master_stack_count() -> usize { 1 }
 
-fn default_scrolling_column_width_ratio() -> f64 {
-    0.7
-}
+fn default_scrolling_column_width_ratio() -> f64 { 0.7 }
 
-fn default_scrolling_min_column_width_ratio() -> f64 {
-    0.3
-}
+fn default_scrolling_min_column_width_ratio() -> f64 { 0.3 }
 
-fn default_scrolling_max_column_width_ratio() -> f64 {
-    0.9
-}
+fn default_scrolling_max_column_width_ratio() -> f64 { 0.9 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
@@ -880,9 +897,7 @@ pub enum VerticalPlacement {
 }
 
 impl StackLineSettings {
-    pub fn thickness(&self) -> f64 {
-        if self.enabled { self.thickness } else { 0.0 }
-    }
+    pub fn thickness(&self) -> f64 { if self.enabled { self.thickness } else { 0.0 } }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
@@ -1491,13 +1506,9 @@ impl InnerGaps {
     }
 }
 
-fn yes() -> bool {
-    true
-}
+fn yes() -> bool { true }
 
-fn default_stack_offset() -> f64 {
-    40.0
-}
+fn default_stack_offset() -> f64 { 40.0 }
 
 pub fn default_stack_orientation() -> StackDefaultOrientation {
     StackDefaultOrientation::Perpendicular
@@ -1507,26 +1518,16 @@ fn default_master_stack_new_window_placement() -> MasterStackNewWindowPlacement 
     MasterStackNewWindowPlacement::Master
 }
 
-fn default_animation_duration() -> f64 {
-    0.3
-}
+fn default_animation_duration() -> f64 { 0.3 }
 
-fn default_animation_fps() -> f64 {
-    100.0
-}
+fn default_animation_fps() -> f64 { 100.0 }
 
 #[allow(dead_code)]
-pub fn no() -> bool {
-    false
-}
+pub fn no() -> bool { false }
 
-fn default_layout_folder() -> PathBuf {
-    PathBuf::from("~/.config/rift/layouts")
-}
+fn default_layout_folder() -> PathBuf { PathBuf::from("~/.config/rift/layouts") }
 
-fn default_workspace_count() -> usize {
-    4
-}
+fn default_workspace_count() -> usize { 4 }
 
 fn default_workspace_names() -> Vec<String> {
     vec![
@@ -1539,25 +1540,13 @@ fn default_workspace_names() -> Vec<String> {
 
 // Interpreted as normalized fraction when <= 1.0. If > 1.0 and <= 100.0,
 // it is treated as a percentage (e.g. 40.0 -> 0.40).
-fn default_swipe_vertical_tolerance() -> f64 {
-    0.4
-}
-fn default_swipe_fingers() -> usize {
-    3
-}
-fn default_distance_pct() -> f64 {
-    0.08
-}
-fn default_overscroll_threshold() -> f64 {
-    0.15
-}
+fn default_swipe_vertical_tolerance() -> f64 { 0.4 }
+fn default_swipe_fingers() -> usize { 3 }
+fn default_distance_pct() -> f64 { 0.08 }
+fn default_overscroll_threshold() -> f64 { 0.15 }
 
-fn default_stack_line_spacing() -> f64 {
-    1.0
-}
-fn default_stack_line_thickness() -> f64 {
-    20.0
-}
+fn default_stack_line_spacing() -> f64 { 1.0 }
+fn default_stack_line_thickness() -> f64 { 20.0 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1574,9 +1563,7 @@ impl Config {
         Self::parse(&buf)
     }
 
-    pub fn default() -> Config {
-        Self::parse(include_str!("../../rift.default.toml")).unwrap()
-    }
+    pub fn default() -> Config { Self::parse(include_str!("../../rift.default.toml")).unwrap() }
 
     /// Save the current config to a file
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {

@@ -6,9 +6,40 @@ impl LayoutEngine {
         Self::load_with_schema_version(&path).map(|(engine, _)| engine)
     }
 
+    /// How long ago the snapshot at `path` was written, if it can be read.
+    ///
+    /// The file's mtime is the moment rift last saved, which with autosave
+    /// running is the last moment it was known to be alive. The gap since then
+    /// is therefore how long the machine went without a window manager.
+    pub fn snapshot_age(path: &Path) -> Option<Duration> {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|written| SystemTime::now().duration_since(written).ok())
+    }
+
     /// Load the master snapshot used for process startup and report its persisted coverage.
     /// Validation and menu previews continue to use `load` without emitting restore logs.
-    pub fn load_for_startup_restore(path: PathBuf) -> anyhow::Result<Self> {
+    ///
+    /// `max_age` bounds how stale a snapshot may be and still be worth putting
+    /// back; `None` accepts any. Returns `Ok(None)` for a snapshot that is
+    /// readable but too old, which is not an error — it is the ordinary case of
+    /// starting fresh after the machine has been doing something else.
+    pub fn load_for_startup_restore(
+        path: PathBuf,
+        max_age: Option<Duration>,
+    ) -> anyhow::Result<Option<Self>> {
+        if let (Some(max_age), Some(age)) = (max_age, Self::snapshot_age(&path))
+            && age > max_age
+        {
+            tracing::info!(
+                path = %path.display(),
+                age_secs = age.as_secs(),
+                max_age_secs = max_age.as_secs(),
+                "Saved layout is older than the restore window; starting fresh"
+            );
+            return Ok(None);
+        }
         let (mut engine, schema_version) = Self::load_with_schema_version(&path)?;
         engine.startup_restore_pending = true;
         let unavailable_windows = engine.discard_unmatchable_startup_candidates(
@@ -30,7 +61,7 @@ impl LayoutEngine {
             unavailable_windows_ignored = unavailable_windows,
             "Loaded persisted layout for startup restore"
         );
-        Ok(engine)
+        Ok(Some(engine))
     }
 
     pub(super) fn load_with_schema_version(path: &Path) -> anyhow::Result<(Self, u32)> {
@@ -402,9 +433,7 @@ impl LayoutEngine {
         }
     }
 
-    pub fn serialize_to_string(&self) -> String {
-        PersistedLayout::serialize_engine(self)
-    }
+    pub fn serialize_to_string(&self) -> String { PersistedLayout::serialize_engine(self) }
 
     pub fn finish_loading(
         &mut self,

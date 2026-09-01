@@ -751,6 +751,24 @@ fn best_space_prefers_authoritative_window_server_space_over_geometry() {
     assert_eq!(reactor.best_space_for_window_id(wid), Some(space1));
 }
 
+/// These two carried `#[serde(skip)]`, so the recorder dropped them and a trace
+/// could not show where a window went when it entered or left a space. Native
+/// fullscreen is decided here, so that was exactly the blind spot.
+#[test]
+fn window_server_space_events_survive_the_recorder() {
+    let wsid = WindowServerId::new(7);
+    let space = SpaceId::new(3);
+
+    for event in [
+        Event::WindowServerAppeared(wsid, space, SpaceEventKind::Fullscreen),
+        Event::WindowServerDestroyed(wsid, space, SpaceEventKind::User),
+    ] {
+        let json = serde_json::to_string(&event).expect("event must serialize into a trace");
+        let back: Event = serde_json::from_str(&json).expect("event must replay from a trace");
+        assert_eq!(format!("{back:?}"), format!("{event:?}"));
+    }
+}
+
 #[test]
 fn user_space_window_server_events_preserve_hidden_window_state() {
     let mut reactor = test_reactor();
@@ -784,12 +802,47 @@ fn user_space_window_server_destroyed_removes_window_when_window_server_is_gone(
     reactor.state.windows.mark_window_visible(wsid);
 
     crate::sys::window_server::set_window_ordered_in_override(wsid, Some(false));
+    crate::sys::window_server::set_window_gone_override(wsid, true);
     window_server_destroyed(&mut reactor, wsid, space1, SpaceEventKind::User);
     crate::sys::window_server::set_window_ordered_in_override(wsid, None);
+    crate::sys::window_server::set_window_gone_override(wsid, false);
 
     assert!(!reactor.state.windows.contains_window(wid));
     assert_eq!(reactor.state.windows.tracked_window_id(wsid), None);
     assert_eq!(reactor.assigned_space_for_window_id(wid), None);
+}
+
+/// Entering native fullscreen looks exactly like a close from the space the
+/// window left: it stops being ordered in there. The window server still knows
+/// it, though, and destroying it would drop its `WindowRecord` — `user_floating`
+/// included — so it would come back for the app rules to re-float.
+#[test]
+fn user_space_window_server_destroyed_keeps_window_the_window_server_still_knows() {
+    let mut reactor = test_reactor();
+    let frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space1 = SpaceId::new(1);
+    let wid = WindowId::new(1, 1);
+    let wsid = WindowServerId::new(23);
+
+    reactor.handle_event(space_state_event(vec![frame], vec![Some(space1)]));
+    reactor.insert_test_window(wid, wsid, Some(space1), frame, true);
+    reactor.state.windows.mark_window_visible(wsid);
+    reactor.state.windows.set_user_floating(wid, false);
+
+    crate::sys::window_server::set_window_ordered_in_override(wsid, Some(false));
+    window_server_destroyed(&mut reactor, wsid, space1, SpaceEventKind::User);
+    crate::sys::window_server::set_window_ordered_in_override(wsid, None);
+
+    assert!(
+        reactor.state.windows.contains_window(wid),
+        "a window the window server still knows must not be retired"
+    );
+    assert_eq!(
+        reactor.state.windows.user_floating(wid),
+        Some(false),
+        "the user's manual tile must survive the departure"
+    );
+    assert!(!reactor.state.windows.is_window_visible(wsid));
 }
 
 /// Builds a reactor with `space1` active on a screen and a single tiled window
@@ -1702,6 +1755,50 @@ fn known_fullscreen_window_appearance_removes_window_from_layout() {
             .native_fullscreen_record_for_window_server_id(wsid)
             .is_some_and(|record| record.fullscreen_space == fullscreen_space),
         "fullscreen transition should record suspended window state"
+    );
+}
+
+/// The window server announces native fullscreen twice: the window leaves its
+/// own space, and it arrives on the fullscreen one. When the departure lands
+/// first the slot used to be read after the window had already left its tree,
+/// so a window tiled on the left came back on the right.
+#[test]
+fn fullscreen_exit_restores_the_slot_when_the_departure_is_seen_first() {
+    let (mut apps, mut reactor) = test_context();
+
+    let frame = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let user_space = SpaceId::new(1);
+    let fullscreen_space = SpaceId::new(0x400000000 + user_space.get());
+    let left = WindowId::new(1, 1);
+    let right = WindowId::new(1, 2);
+
+    reactor.handle_event(space_state_event(vec![frame], vec![Some(user_space)]));
+    make_active_app(&mut apps, &mut reactor, 1, make_windows(2), Some(left));
+
+    let order = |reactor: &Reactor| {
+        reactor
+            .layout_manager
+            .layout_engine
+            .windows_on_space_in_layout_order(user_space)
+    };
+    assert_eq!(order(&reactor), vec![left, right]);
+
+    let wsid = reactor.state.windows.window(left).unwrap().info.sys_id.unwrap();
+
+    // Departure first, arrival second — the order that lost the slot.
+    crate::sys::window_server::set_window_ordered_in_override(wsid, Some(false));
+    window_server_destroyed(&mut reactor, wsid, user_space, SpaceEventKind::User);
+    crate::sys::window_server::set_window_ordered_in_override(wsid, None);
+    window_server_appeared(&mut reactor, wsid, fullscreen_space, SpaceEventKind::Fullscreen);
+
+    assert!(!has_window_in_layout(&mut reactor, user_space, frame, left));
+
+    window_server_appeared(&mut reactor, wsid, user_space, SpaceEventKind::User);
+
+    assert_eq!(
+        order(&reactor),
+        vec![left, right],
+        "a window tiled on the left must come back on the left, not beside the selection"
     );
 }
 
@@ -4675,20 +4772,24 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
         .expect("test window should have native metadata");
     assert!(reactor.state.windows.is_window_visible(wsid));
 
-    let snapshot = |suitable, ordered_in| window_discovery::StaleCleanupSnapshot {
-        pending_refresh: false,
-        suppressed: false,
-        mission_control_active: false,
-        drag_active: false,
-        inactive_windows: Default::default(),
-        server_observations: [(wsid, window_discovery::StaleWindowObservation {
-            info: Some(info),
-            suitable,
-            ordered_in,
-        })]
-        .into_iter()
-        .collect(),
-    };
+    let snapshot_known =
+        |suitable, ordered_in, still_known| window_discovery::StaleCleanupSnapshot {
+            pending_refresh: false,
+            suppressed: false,
+            mission_control_active: false,
+            drag_active: false,
+            inactive_windows: Default::default(),
+            server_observations: [(wsid, window_discovery::StaleWindowObservation {
+                info: Some(info),
+                suitable,
+                ordered_in,
+                still_known,
+            })]
+            .into_iter()
+            .collect(),
+        };
+    // The window server has forgotten the id unless a case says otherwise.
+    let snapshot = |suitable, ordered_in| snapshot_known(suitable, ordered_in, false);
 
     let (ordered_stale, _) = window_discovery::identify_stale_windows(
         &reactor.state,
@@ -4711,6 +4812,18 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
         closed_stale,
         vec![wid],
         "an ordered-out window must be retired even when cached visibility is stale",
+    );
+
+    let (fullscreen_stale, _) = window_discovery::identify_stale_windows(
+        &reactor.state,
+        wid.pid,
+        &[],
+        &snapshot_known(Some(true), Some(false), true),
+    );
+    assert!(
+        fullscreen_stale.is_empty(),
+        "a window the server still knows is away, not dead: retiring it drops the \
+         user's float choice and it returns for the app rules to re-float",
     );
 
     let (unknown_stale, _) = window_discovery::identify_stale_windows(

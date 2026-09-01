@@ -27,6 +27,28 @@ Entries describe this fork's changes relative to
   for scripts; the exit status follows the window manager alone, since rift runs
   without the scripting addition.
 
+- **The layout survives a restart of rift.** rift could always write its layout
+  and start from a written one, but only when told to by hand: nothing saved on
+  the way out and nothing read on the way in, so every crash, `brew services
+  restart` or rebuild dropped back to the app rules — under a float-by-default
+  config, everything to be re-tiled. It now saves on SIGTERM and on a heartbeat
+  (a crash and a `kill -9` reach neither the handler nor a manual save), and
+  reads the file back at startup.
+
+  The restore is deliberately conditional. A snapshot is only worth putting back
+  if rift is coming straight back up; after a reboot or an afternoon away the
+  windows have moved on without it, and reasserting a stale arrangement would
+  fight the user rather than help. `max_age_secs` bounds how old a snapshot may
+  be, measured from when it was written — which with the heartbeat running is
+  the last moment rift was known to be alive, so the age is the length of the
+  gap. `rift --restore` still restores by hand, ignoring the age.
+
+  Restoring also records the snapshot's tiled/floating verdict as the user's own
+  choice, the same standing a manual toggle has. Without that the restore held
+  only until the next space activation re-ran the app rules and a catch-all
+  `floating` rule floated everything back. Off by default; see
+  `[settings.layout_restore]` in `rift.default.toml`.
+
 ### Deprecated
 
 - **`rift-cli` is deprecated** in favour of `rift`, which now takes the same
@@ -59,6 +81,32 @@ Entries describe this fork's changes relative to
 - `just dev` / `just install` ignored a `formula=` override, because they
   chained through nested `just` calls rather than dependencies — building one
   thing and installing into another.
+- **A window taken into native fullscreen came back floating** — Discord
+  fullscreening a video, or anything else that moves a window to a space of its
+  own. From the space it left, such a window looks exactly like one that closed:
+  it is no longer ordered in there. Rift retired it on that evidence alone,
+  which destroyed its record and with it the manual float/tile choice that
+  outranks a matching app rule, so the window returned as a stranger for the
+  rules to place again. Departure now has to be corroborated by the window
+  server having forgotten the id, which a window sitting in a fullscreen space
+  has not.
+- **A window came back from native fullscreen in the wrong slot** — tiled on
+  the left, back on the right. The window server announces the transition
+  twice, as a departure from the window's own space and an arrival on the
+  fullscreen one, in either order. Rift only recorded the window's slot once it
+  had seen the arrival, so whenever the departure landed first the slot was read
+  after the window had already left its tree: no anchor and a snapshot that no
+  longer held it, leaving it to come back beside whatever was selected. The slot
+  is now taken from whichever removal still has one to take. A single tiled
+  window on its space could not show this; two could.
+
+### Changed
+
+- **`WindowServerAppeared` and `WindowServerDestroyed` are recorded in traces.**
+  They were `#[serde(skip)]`, so `rift execute trace dump` silently omitted
+  them — and since a window's arrival on and departure from a space is where
+  native fullscreen is decided, every bug in that area was invisible to the one
+  tool meant to explain it.
 
 ## [0.5.3-plus.1] - 2026-08-31
 

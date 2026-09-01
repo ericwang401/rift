@@ -36,6 +36,7 @@ mod SpaceEventHandler {
             active_spaces: reactor.active_spaces.clone(),
             mission_control_active: reactor.is_mission_control_active(),
             ordered_in: crate::sys::window_server::window_ordered_in(wsid),
+            still_known: crate::sys::window_server::get_window(wsid).is_some(),
             assigned_space,
             last_known_user_space: super::events::space::resolve_last_known_user_space(
                 tracked_window.and_then(|window| reactor.best_space_for_window_id(window)),
@@ -150,7 +151,7 @@ impl std::ops::Deref for ReactorHandle {
 
 use crate::model::server::RuntimeWindowData;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpaceEventKind {
     User,
     Fullscreen,
@@ -294,13 +295,14 @@ pub enum Event {
         Option<MouseState>,
     ),
     WindowDestroyed(WindowId),
-    #[serde(skip)]
+    /// Recorded, not skipped: a window's arrival on and departure from a space
+    /// is where native fullscreen is decided, and leaving these two out of the
+    /// flight recorder made every fullscreen bug invisible to a trace.
     WindowServerDestroyed(
         crate::sys::window_server::WindowServerId,
         SpaceId,
         SpaceEventKind,
     ),
-    #[serde(skip)]
     WindowServerAppeared(
         crate::sys::window_server::WindowServerId,
         SpaceId,
@@ -1613,6 +1615,7 @@ impl Reactor {
                     active_spaces: self.active_spaces.clone(),
                     mission_control_active: self.is_mission_control_active(),
                     ordered_in: window_server::window_ordered_in(wsid),
+                    still_known: window_server::get_window(wsid).is_some(),
                     assigned_space,
                     last_known_user_space,
                 };
@@ -2283,6 +2286,15 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::SaveLayout { path })) => {
                 let active_space = self.active_display_space();
                 return command_workflow::handle_command_reactor_save_layout(
+                    &self.state,
+                    &mut self.layout_manager,
+                    path,
+                    active_space,
+                );
+            }
+            Event::Command(Command::Reactor(ReactorCommand::AutosaveLayout { path })) => {
+                let active_space = self.active_display_space();
+                return command_workflow::handle_command_reactor_autosave_layout(
                     &self.state,
                     &mut self.layout_manager,
                     path,
@@ -3432,21 +3444,35 @@ impl Reactor {
                 (wid.pid == pid && self.is_window_on_known_inactive_space(wid)).then_some(wid)
             })
             .collect();
+        // AX can replace a window's process-local identity while preserving its
+        // WindowServer id. Treat the currently tracked identity as visible for
+        // stale cleanup so the state survives long enough to be rekeyed below.
+        let mut cleanup_visible = known_visible.clone();
+        cleanup_visible.extend(new.iter().filter_map(|(_, info)| {
+            info.sys_id.and_then(|wsid| self.state.windows.tracked_window_id(wsid))
+        }));
+        // Only a window this sweep did not see can be retired, so only those are
+        // worth querying — and for those the live answer is worth the query, both
+        // as the liveness signal and because the cached one may be old.
+        let cleanup_visible_set: HashSet<WindowId> = cleanup_visible.iter().copied().collect();
         let server_observations = self
             .state
             .windows
             .iter_windows()
-            .filter_map(|(wid, window)| (wid.pid == pid).then_some(window.info.sys_id).flatten())
+            .filter_map(|(wid, window)| {
+                (wid.pid == pid && !cleanup_visible_set.contains(&wid))
+                    .then_some(window.info.sys_id)
+                    .flatten()
+            })
             .map(|wsid| {
-                let info = self
-                    .state
-                    .windows
-                    .get_window_server_info(wsid)
-                    .or_else(|| window_server::get_window(wsid));
+                let live = window_server::get_window(wsid);
+                let still_known = live.is_some();
+                let info = live.or_else(|| self.state.windows.get_window_server_info(wsid));
                 (wsid, window_discovery::StaleWindowObservation {
                     info,
                     suitable: window_server::app_window_suitability(wsid),
                     ordered_in: window_server::window_ordered_in(wsid),
+                    still_known,
                 })
             })
             .collect();
@@ -3464,13 +3490,6 @@ impl Reactor {
             inactive_windows,
             server_observations,
         };
-        // AX can replace a window's process-local identity while preserving its
-        // WindowServer id. Treat the currently tracked identity as visible for
-        // stale cleanup so the state survives long enough to be rekeyed below.
-        let mut cleanup_visible = known_visible.clone();
-        cleanup_visible.extend(new.iter().filter_map(|(_, info)| {
-            info.sys_id.and_then(|wsid| self.state.windows.tracked_window_id(wsid))
-        }));
         let (stale_windows, pending_refresh) = window_discovery::identify_stale_windows(
             &self.state,
             pid,

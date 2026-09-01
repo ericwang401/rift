@@ -19,6 +19,7 @@ pub mod geometry;
 pub mod gesture;
 pub mod haptics;
 pub mod hotkey;
+pub mod lifecycle;
 pub mod mach;
 pub mod observer;
 pub mod osax;

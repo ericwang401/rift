@@ -112,6 +112,23 @@ run_on_start = []
 # - If false, your config changes will only apply when restarting rift.
 hot_reload = true
 
+# Carry the layout across a restart of rift itself — a crash respawn, a
+# `brew services restart`, a rebuild. rift writes ~/.rift/layout.ron every
+# `autosave_secs` and again on the way out, and reads it back at startup.
+#
+# The restore is deliberately not unconditional. A snapshot is only worth
+# putting back if rift is coming straight back up; after a reboot or an
+# afternoon away the windows have moved on without it, and reasserting a stale
+# arrangement fights you rather than helps. `max_age_secs` is how long a
+# snapshot stays worth restoring, measured from when it was last written — which
+# with the autosave running is the last moment rift was known to be alive, so
+# the age is the length of the gap. `rift --restore` ignores it and restores by
+# hand.
+[settings.layout_restore]
+on_start = false
+max_age_secs = 120
+autosave_secs = 60      # 0 leaves only the save on shutdown, which a crash misses
+
 [settings.layout]
 # Layout Types:
 #   - "traditional" (i3/sway-like containers)

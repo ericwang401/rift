@@ -46,15 +46,23 @@ impl Reactor {
     /// Called from the layout-event sink just before the removal that takes
     /// a window entering native fullscreen out of its tree.
     pub(super) fn record_fullscreen_slot(&mut self, window: WindowId) {
-        if self.state.windows.native_fullscreen_record_for_window(window).is_none() {
-            return;
-        }
         let Some(space) = self.assigned_space_for_window_id(window) else {
             return;
         };
         let engine = &mut self.layout_manager.layout_engine;
         if engine.is_window_floating(window) {
             // A float comes back as a float; its frame is kept elsewhere.
+            return;
+        }
+        // Native fullscreen reaches the reactor as two independent window-server
+        // events — the window leaving its own space and arriving on the
+        // fullscreen one — in either order. Keying this on the fullscreen record
+        // already existing meant that whenever the departure came first the slot
+        // was read *after* the window had left its tree: no anchor, and a
+        // snapshot that no longer held it, so it came back beside whatever
+        // happened to be selected. Record from the removal that still has a slot
+        // to record, and let the other one find the work already done.
+        if !engine.is_window_tiled(space, window) {
             return;
         }
         let anchor = engine.slot_of(space, window);

@@ -159,6 +159,10 @@ pub(crate) struct StaleWindowObservation {
     pub(crate) info: Option<crate::sys::window_server::WindowServerInfo>,
     pub(crate) suitable: Option<bool>,
     pub(crate) ordered_in: Option<bool>,
+    /// Whether the window server still returns a record for this id, asked
+    /// without reference to any space. See `still_known` on
+    /// `WindowServerDestroyedObservations`.
+    pub(crate) still_known: bool,
 }
 
 pub(crate) fn identify_stale_windows(
@@ -238,8 +242,14 @@ pub(crate) fn identify_stale_windows(
             let unsuitable = matches!(observation.suitable, Some(false));
             let invalid_layer = info.layer != 0;
             let too_small = width < MIN_REAL_WINDOW_DIMENSION || height < MIN_REAL_WINDOW_DIMENSION;
+            // Ordered out but still known to the window server is what a window
+            // in a native fullscreen space looks like from the space it left.
+            // Retiring it destroys its `WindowRecord`, taking the user's manual
+            // float/tile choice with it, and it returns as a stranger for the
+            // app rules to re-float. Only an id the server has forgotten is dead.
             let ordered_out = matches!(observation.ordered_in, Some(false));
-            if unsuitable || invalid_layer || too_small || ordered_out {
+            if unsuitable || invalid_layer || too_small || (ordered_out && !observation.still_known)
+            {
                 Some(wid)
             } else {
                 None

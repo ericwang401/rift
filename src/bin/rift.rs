@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::process;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use objc2::MainThreadMarker;
@@ -67,7 +68,8 @@ struct Cli {
     #[arg(long)]
     validate: bool,
 
-    /// Restore the master layout file saved at shutdown.
+    /// Restore the master layout file saved at shutdown, regardless of its age
+    /// and of `settings.layout_restore.on_start`.
     #[arg(long)]
     restore: bool,
 
@@ -208,28 +210,38 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
 
     let (broadcast_tx, broadcast_rx) = rift_wm::actor::channel();
 
-    let mut layout = if opt.restore {
-        let path = restore_file();
-        match LayoutEngine::load_for_startup_restore(path.clone()) {
-            Ok(layout) => layout,
-            Err(error) => {
-                eprintln!(
-                    "Could not restore master file at {}; starting with a fresh layout: {error}",
-                    path.display()
-                );
-                LayoutEngine::new(
-                    &config.virtual_workspaces,
-                    &config.settings.layout,
-                    Some(broadcast_tx.clone()),
-                )
-            }
-        }
-    } else {
+    let restore_settings = config.settings.layout_restore.clone();
+    let fresh_layout = || {
         LayoutEngine::new(
             &config.virtual_workspaces,
             &config.settings.layout,
             Some(broadcast_tx.clone()),
         )
+    };
+    // `--restore` is a deliberate act, so it ignores the age window the
+    // automatic restore observes.
+    let max_age = (!opt.restore && restore_settings.max_age_secs > 0)
+        .then(|| Duration::from_secs(restore_settings.max_age_secs));
+    let mut layout = if opt.restore || restore_settings.on_start {
+        let path = restore_file();
+        match LayoutEngine::load_for_startup_restore(path.clone(), max_age) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => fresh_layout(),
+            // No file at all is the ordinary first run, not a problem to report.
+            Err(error) if !path.exists() => {
+                tracing::info!(path = %path.display(), %error, "No saved layout yet");
+                fresh_layout()
+            }
+            Err(error) => {
+                eprintln!(
+                    "Could not restore master file at {}; starting with a fresh layout: {error}",
+                    path.display()
+                );
+                fresh_layout()
+            }
+        }
+    } else {
+        fresh_layout()
     };
     layout.finish_loading(
         &config.virtual_workspaces,
@@ -257,6 +269,29 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         opt.one,
     );
     let events_tx = reactor.sender();
+
+    // Save on the way out, and on a heartbeat so a crash or a SIGKILL — neither
+    // of which reaches the handler — costs at most one interval. The heartbeat
+    // doubles as rift's proof of life: the file's mtime is what the next
+    // startup measures its downtime against.
+    {
+        let shutdown_tx = events_tx.clone();
+        rift_wm::sys::lifecycle::save_on_termination(move || {
+            shutdown_tx.send(reactor::Event::Command(reactor::Command::Reactor(
+                reactor::ReactorCommand::SaveAndExit,
+            )));
+        });
+        let autosave_tx = events_tx.clone();
+        let autosave_path = restore_file();
+        rift_wm::sys::lifecycle::save_periodically(
+            Duration::from_secs(restore_settings.autosave_secs),
+            move || {
+                autosave_tx.send(reactor::Event::Command(reactor::Command::Reactor(
+                    reactor::ReactorCommand::AutosaveLayout { path: autosave_path.clone() },
+                )));
+            },
+        );
+    }
 
     let config_tx =
         ConfigActor::spawn_with_path(config.clone(), events_tx.clone(), config_path.clone());

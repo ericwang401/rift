@@ -23,17 +23,16 @@ use serde::{Deserialize, Serialize};
 use super::geometry::{CGRectDef, CGSizeDef};
 use crate::actor::app::WindowId;
 #[cfg(test)]
-use crate::common::collections::HashMap;
+use crate::common::collections::{HashMap, HashSet};
 use crate::sys::app::pid_t;
 use crate::sys::axuielement::{AXUIElement, Error as AxError};
-use crate::sys::cg_ok;
 #[cfg(not(test))]
 use crate::sys::geometry::CGRectExt;
 use crate::sys::mach::mach_get_window_sub_level;
 use crate::sys::process::ProcessSerialNumber;
 use crate::sys::screen::{ScreenInfo, SpaceId};
 use crate::sys::skylight::*;
-use crate::sys::trace;
+use crate::sys::{cg_ok, trace};
 
 static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
 static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +42,9 @@ thread_local! {
     static TEST_SPACE_WINDOW_LIST_BY_SPACE_OVERRIDE: RefCell<HashMap<u64, Vec<u32>>> = RefCell::new(HashMap::default());
     static TEST_WINDOW_SPACES_OVERRIDE: RefCell<HashMap<u32, Vec<u64>>> = RefCell::new(HashMap::default());
     static TEST_WINDOW_ORDERED_IN_OVERRIDE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::default());
+    /// Ids the window server has forgotten. `get_window` fabricates a record for
+    /// any id in tests, so this is how a test says "this window is really gone".
+    static TEST_WINDOW_GONE_OVERRIDE: RefCell<HashSet<u32>> = RefCell::new(HashSet::default());
 }
 
 pub const WINDOWSERVER_QUIET_US: u64 = 350_000;
@@ -54,26 +56,18 @@ pub struct WindowServerId(pub CGWindowID);
 
 impl WindowServerId {
     #[inline]
-    pub fn new(id: CGWindowID) -> Self {
-        Self(id)
-    }
+    pub fn new(id: CGWindowID) -> Self { Self(id) }
 
     #[inline]
-    pub fn as_u32(self) -> u32 {
-        self.0
-    }
+    pub fn as_u32(self) -> u32 { self.0 }
 
     #[inline]
-    pub fn as_nonzero(self) -> Option<NonZeroU32> {
-        NonZeroU32::new(self.0)
-    }
+    pub fn as_nonzero(self) -> Option<NonZeroU32> { NonZeroU32::new(self.0) }
 }
 
 impl From<WindowServerId> for u32 {
     #[inline]
-    fn from(id: WindowServerId) -> Self {
-        id.0
-    }
+    fn from(id: WindowServerId) -> Self { id.0 }
 }
 
 impl TryFrom<&AXUIElement> for WindowServerId {
@@ -93,9 +87,7 @@ impl TryFrom<&AXUIElement> for WindowServerId {
 }
 
 impl From<WindowId> for WindowServerId {
-    fn from(id: WindowId) -> Self {
-        Self(id.idx.into())
-    }
+    fn from(id: WindowId) -> Self { Self(id.idx.into()) }
 }
 
 #[inline]
@@ -178,9 +170,7 @@ impl WindowIterator {
     }
 
     #[inline]
-    pub fn count(&self) -> i32 {
-        unsafe { SLSWindowIteratorGetCount(self.iter) }
-    }
+    pub fn count(&self) -> i32 { unsafe { SLSWindowIteratorGetCount(self.iter) } }
 
     #[inline]
     pub fn advance<'a>(&'a self) -> Option<&'a Self> {
@@ -192,46 +182,30 @@ impl WindowIterator {
     }
 
     #[inline]
-    pub fn window_id(&self) -> u32 {
-        unsafe { SLSWindowIteratorGetWindowID(self.iter) }
-    }
+    pub fn window_id(&self) -> u32 { unsafe { SLSWindowIteratorGetWindowID(self.iter) } }
 
     #[inline]
-    pub fn level(&self) -> i32 {
-        unsafe { SLSWindowIteratorGetLevel(self.iter) }
-    }
+    pub fn level(&self) -> i32 { unsafe { SLSWindowIteratorGetLevel(self.iter) } }
 
     #[inline]
-    pub fn pid(&self) -> i32 {
-        unsafe { SLSWindowIteratorGetPID(self.iter) }
-    }
+    pub fn pid(&self) -> i32 { unsafe { SLSWindowIteratorGetPID(self.iter) } }
 
     #[inline]
-    pub fn parent_id(&self) -> u32 {
-        unsafe { SLSWindowIteratorGetParentID(self.iter) }
-    }
+    pub fn parent_id(&self) -> u32 { unsafe { SLSWindowIteratorGetParentID(self.iter) } }
 
     #[inline]
-    pub fn bounds(&self) -> CGRect {
-        unsafe { SLSWindowIteratorGetBounds(self.iter) }
-    }
+    pub fn bounds(&self) -> CGRect { unsafe { SLSWindowIteratorGetBounds(self.iter) } }
 
     #[inline]
-    pub fn alpha(&self) -> f32 {
-        unsafe { SLSWindowIteratorGetAlpha(self.iter) }
-    }
+    pub fn alpha(&self) -> f32 { unsafe { SLSWindowIteratorGetAlpha(self.iter) } }
 
     #[inline]
     #[allow(dead_code)]
-    pub fn tags(&self) -> u64 {
-        unsafe { SLSWindowIteratorGetTags(self.iter) }
-    }
+    pub fn tags(&self) -> u64 { unsafe { SLSWindowIteratorGetTags(self.iter) } }
 
     #[inline]
     #[allow(dead_code)]
-    pub fn attributes(&self) -> u64 {
-        unsafe { SLSWindowIteratorGetAttributes(self.iter) }
-    }
+    pub fn attributes(&self) -> u64 { unsafe { SLSWindowIteratorGetAttributes(self.iter) } }
 
     #[inline]
     pub fn constraints(&self) -> (CGSize, CGSize) {
@@ -257,9 +231,7 @@ impl WindowIterator {
 }
 
 impl Drop for WindowIterator {
-    fn drop(&mut self) {
-        unsafe { CFRelease(self.iter) }
-    }
+    fn drop(&mut self) { unsafe { CFRelease(self.iter) } }
 }
 
 /// Server-side filter for `SLSWindowQueryRun`.
@@ -520,9 +492,7 @@ pub fn window_ordered_in(id: WindowServerId) -> Option<bool> {
     })
 }
 
-pub fn window_is_ordered_in(id: WindowServerId) -> bool {
-    window_ordered_in(id).unwrap_or(false)
-}
+pub fn window_is_ordered_in(id: WindowServerId) -> bool { window_ordered_in(id).unwrap_or(false) }
 
 fn get_windows_raw<T: Type>(
     options: CGWindowListOption,
@@ -547,8 +517,26 @@ fn get_visible_windows_raw<T: Type>() -> CFRetained<CFArray<T>> {
 }
 
 #[cfg(test)]
+pub fn set_window_gone_override(id: WindowServerId, gone: bool) {
+    TEST_WINDOW_GONE_OVERRIDE.with(|override_gone| {
+        let mut override_gone = override_gone.borrow_mut();
+        if gone {
+            override_gone.insert(id.as_u32());
+        } else {
+            override_gone.remove(&id.as_u32());
+        }
+    });
+}
+
+#[cfg(test)]
+fn window_is_gone_in_test(id: WindowServerId) -> bool {
+    TEST_WINDOW_GONE_OVERRIDE.with(|override_gone| override_gone.borrow().contains(&id.as_u32()))
+}
+
+#[cfg(test)]
 pub fn get_windows(ids: &[WindowServerId]) -> Vec<WindowServerInfo> {
     ids.iter()
+        .filter(|&&id| !window_is_gone_in_test(id))
         .map(|&id| WindowServerInfo {
             id,
             pid: 1234,
@@ -631,9 +619,7 @@ pub fn focus_desktop_window(screen: &ScreenInfo) -> bool {
 }
 
 #[cfg(test)]
-pub fn focus_desktop_window(_screen: &ScreenInfo) -> bool {
-    false
-}
+pub fn focus_desktop_window(_screen: &ScreenInfo) -> bool { false }
 
 #[cfg_attr(test, allow(dead_code))]
 fn window_is_effectively_invisible(alpha: f32, layer: i32) -> bool {
@@ -690,9 +676,7 @@ fn find_window_at_point(point: &mut CGPoint, below_window_id: Option<u32>) -> Op
     (wid != 0).then_some((wid, wcid))
 }
 
-fn is_own_window(cid: i32) -> bool {
-    *G_CONNECTION == cid
-}
+fn is_own_window(cid: i32) -> bool { *G_CONNECTION == cid }
 
 pub fn get_window_at_point(mut point: CGPoint) -> Option<WindowServerId> {
     trace::observe("window_at_point", trace::point_to(point), || {
@@ -869,9 +853,7 @@ pub fn window_level(wid: u32) -> Option<NSWindowLevel> {
     .map(|level| level as NSWindowLevel)
 }
 
-pub fn window_sub_level(wid: u32) -> c_int {
-    unsafe { mach_get_window_sub_level(wid) }
-}
+pub fn window_sub_level(wid: u32) -> c_int { unsafe { mach_get_window_sub_level(wid) } }
 
 /// Returns the typed Skylight tags exposed by a window-query iterator.
 fn iterator_window_tags(iterator: *mut CFType) -> SLSWindowTags {

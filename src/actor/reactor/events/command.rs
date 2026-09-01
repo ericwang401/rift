@@ -1,4 +1,4 @@
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::super::ScreenInfo;
 use crate::actor::app::{AppThreadHandle, Quiet, WindowId};
@@ -263,6 +263,21 @@ pub fn handle_command_reactor_save_layout(
     save_layout(state, layout, path.clone(), active_space)?;
     info!(path = %path.display(), "Saved layout");
     Ok(EventOutcome::no_change().with_stdout_line(format!("Saved layout to {}", path.display())))
+}
+
+/// The heartbeat save. A failure is logged and forgotten: the next beat is a
+/// minute away, and there is no one waiting on an answer.
+pub fn handle_command_reactor_autosave_layout(
+    state: &RiftState,
+    layout: &mut LayoutManager,
+    path: std::path::PathBuf,
+    active_space: Option<SpaceId>,
+) -> anyhow::Result<EventOutcome> {
+    match save_layout(state, layout, path.clone(), active_space) {
+        Ok(()) => debug!(path = %path.display(), "Autosaved layout"),
+        Err(error) => warn!(path = %path.display(), %error, "Could not autosave the layout"),
+    }
+    Ok(EventOutcome::no_change())
 }
 
 #[derive(Debug, Clone)]
