@@ -139,9 +139,7 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     /// Replace a window identity in-place without changing its layout position.
     fn replace_window(&mut self, from: WindowId, to: WindowId);
     fn remove_window(&mut self, wid: WindowId);
-    fn remove_window_and_rebalance_parent(&mut self, wid: WindowId) {
-        self.remove_window(wid)
-    }
+    fn remove_window_and_rebalance_parent(&mut self, wid: WindowId) { self.remove_window(wid) }
     fn remove_windows_for_app(&mut self, pid: pid_t);
     fn windows_for_app(&self, layout: LayoutId, pid: pid_t) -> Vec<WindowId>;
     fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>);
@@ -200,17 +198,22 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
 
     /// Whether `insert_window_next_to` can succeed here at all, so a drop
     /// preview only promises a split the layout is able to make.
-    fn can_insert_next_to(&self) -> bool {
-        false
-    }
+    fn can_insert_next_to(&self) -> bool { false }
+
+    /// Whether `a` and `b` are members of one stack: siblings of a stacked
+    /// container, which hands every child the container's whole rect and
+    /// shows one of them at a time.
+    ///
+    /// Swapping such a pair trades two identical places, so a drag has
+    /// nothing to offer by treating one as the other's drop target. Only the
+    /// tree layouts have stacks; the default says no.
+    fn windows_share_a_stack(&self, _layout: LayoutId, _a: WindowId, _b: WindowId) -> bool { false }
 
     /// Where `window` sits: a neighbouring window, the side of that
     /// neighbour the window is on, and the share of their parent split it
     /// has — enough for `restore_slot` to put it back after it has been
     /// away. Tree layouts only.
-    fn slot_of(&self, _layout: LayoutId, _window: WindowId) -> Option<Slot> {
-        None
-    }
+    fn slot_of(&self, _layout: LayoutId, _window: WindowId) -> Option<Slot> { None }
 
     /// Put `window` back where `slot_of` found it, next to the same
     /// neighbour on the same side with the same share. Reports failure if
@@ -264,9 +267,7 @@ mod tests {
     use crate::actor::app::WindowId;
     use crate::common::config::{ScrollingLayoutSettings, WindowInsertionPoint};
 
-    fn w(idx: u32) -> WindowId {
-        WindowId::new(1, idx)
-    }
+    fn w(idx: u32) -> WindowId { WindowId::new(1, idx) }
 
     #[test]
     fn common_insertion_point_controls_tree_and_linear_layouts() {
@@ -276,10 +277,11 @@ mod tests {
         traditional.add_window_after_selection(traditional_layout, w(2));
         traditional.select_window(traditional_layout, w(1));
         traditional.add_window_after_selection(traditional_layout, w(3));
-        assert_eq!(
-            traditional.all_windows_in_layout(traditional_layout),
-            vec![w(1), w(2), w(3)]
-        );
+        assert_eq!(traditional.all_windows_in_layout(traditional_layout), vec![
+            w(1),
+            w(2),
+            w(3)
+        ]);
 
         let mut scrolling_settings = ScrollingLayoutSettings::default();
         scrolling_settings.base.window_insertion_point = Some(WindowInsertionPoint::EndOfTree);
@@ -289,10 +291,11 @@ mod tests {
         scrolling.add_window_after_selection(scrolling_layout, w(2));
         scrolling.select_window(scrolling_layout, w(1));
         scrolling.add_window_after_selection(scrolling_layout, w(3));
-        assert_eq!(
-            scrolling.all_windows_in_layout(scrolling_layout),
-            vec![w(1), w(2), w(3)]
-        );
+        assert_eq!(scrolling.all_windows_in_layout(scrolling_layout), vec![
+            w(1),
+            w(2),
+            w(3)
+        ]);
     }
 
     #[test]

@@ -5757,6 +5757,17 @@ impl Reactor {
                 {
                     return None;
                 }
+                // A window in the same stack is no target. Every member of a
+                // stack is given the container's whole rect, so the pointer
+                // is over all of them at once and a swap trades two identical
+                // places: the overlay drew the tile the dragged window is
+                // already in and promised a move that could not happen. Under
+                // the stack layout that is every other window on the space,
+                // so a drag there now offers nothing rather than a
+                // screen-sized rectangle that means nothing.
+                if engine.windows_share_a_stack(space, wid, other_wid) {
+                    return None;
+                }
                 Some((other_wid, other_state.frame_monotonic))
             })
             .collect()

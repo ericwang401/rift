@@ -60,6 +60,15 @@ Entries describe this fork's changes relative to
 
 ### Fixed
 
+- **The drop overlay no longer promises a move a stack cannot make.** Dragging
+  a window on a space in stack mode drew a screen-sized drop region for the
+  length of the drag, and releasing it swapped the dragged window with an
+  arbitrary member of the stack — a change nothing on screen reflects, since a
+  stack hands every window the same rect and shows one at a time. Windows in
+  one stack are no longer offered to each other as drop targets, so the drag
+  shows nothing and does nothing. The same holds for a stacked container inside
+  the traditional layout; drops between windows that really do occupy different
+  places are untouched.
 - `rift-cli service …` printed "service commands have been moved to the `rift`
   binary" and exited 0 without doing anything, so a script could not tell the
   difference between starting the service and not starting it. The subcommands

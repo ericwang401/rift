@@ -48,9 +48,7 @@ impl TraditionalLayoutSystem {
         self.window_insertion_point = value;
     }
 
-    pub fn set_equalize_nodes(&mut self, value: bool) {
-        self.equalize_nodes = value;
-    }
+    pub fn set_equalize_nodes(&mut self, value: bool) { self.equalize_nodes = value; }
 
     fn find_best_focus_target(&self, node: NodeId) -> Option<(NodeId, WindowId)> {
         if let Some(wid) = self.tree.data.window.at(node) {
@@ -138,17 +136,13 @@ impl TraditionalLayoutSystem {
         self.find_or_create_common_parent_internal(layout, node1, node2)
     }
 
-    pub(crate) fn root(&self, layout: LayoutId) -> NodeId {
-        self.layout_roots[layout].id()
-    }
+    pub(crate) fn root(&self, layout: LayoutId) -> NodeId { self.layout_roots[layout].id() }
 
     pub(crate) fn selection(&self, layout: LayoutId) -> NodeId {
         self.tree.data.selection.current_selection(self.root(layout))
     }
 
-    pub(crate) fn map(&self) -> &NodeMap {
-        &self.tree.map
-    }
+    pub(crate) fn map(&self) -> &NodeMap { &self.tree.map }
 
     pub(crate) fn local_selection(&self, node: NodeId) -> Option<NodeId> {
         self.tree
@@ -158,9 +152,7 @@ impl TraditionalLayoutSystem {
             .or_else(|| self.tree.data.selection.last_selection(self.map(), node))
     }
 
-    pub(crate) fn layout(&self, node: NodeId) -> LayoutKind {
-        self.tree.data.layout.kind(node)
-    }
+    pub(crate) fn layout(&self, node: NodeId) -> LayoutKind { self.tree.data.layout.kind(node) }
 
     pub(crate) fn layouts_for_window(&self, wid: WindowId) -> Vec<LayoutId> {
         self.tree.data.window.layouts_for(wid)
@@ -529,9 +521,7 @@ impl LayoutSystem for TraditionalLayoutSystem {
         self.layout_roots.insert(root)
     }
 
-    fn contains_layout(&self, layout: LayoutId) -> bool {
-        self.layout_roots.contains_key(layout)
-    }
+    fn contains_layout(&self, layout: LayoutId) -> bool { self.layout_roots.contains_key(layout) }
 
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
         let source_root = self.layout_roots[layout].id();
@@ -542,9 +532,11 @@ impl LayoutSystem for TraditionalLayoutSystem {
             source_root.traverse_preorder(&self.tree.map),
             cloned_root.traverse_preorder(&self.tree.map),
         ) {
-            self.tree
-                .data
-                .dispatch_event(&self.tree.map, TreeEvent::Copied { src, dest, dest_layout });
+            self.tree.data.dispatch_event(&self.tree.map, TreeEvent::Copied {
+                src,
+                dest,
+                dest_layout,
+            });
         }
         dest_layout
     }
@@ -1226,6 +1218,28 @@ impl LayoutSystem for TraditionalLayoutSystem {
     fn rebalance(&mut self, layout: LayoutId) {
         let root = self.root(layout);
         self.rebalance_node(root)
+    }
+
+    fn windows_share_a_stack(&self, layout: LayoutId, a: WindowId, b: WindowId) -> bool {
+        let (Some(node_a), Some(node_b)) = (
+            self.tree.data.window.node_for(layout, a),
+            self.tree.data.window.node_for(layout, b),
+        ) else {
+            return false;
+        };
+        if node_a == node_b {
+            return false;
+        }
+        let map = self.map();
+        // Siblings, not merely both somewhere under the same stack: a stack
+        // hands each child its whole rect, so two windows one level apart —
+        // a window and a member of a split beside it — do not share a place.
+        match (node_a.parent(map), node_b.parent(map)) {
+            (Some(parent_a), Some(parent_b)) => {
+                parent_a == parent_b && self.layout(parent_a).is_stacked()
+            }
+            _ => false,
+        }
     }
 
     fn swap_windows(&mut self, layout: LayoutId, a: WindowId, b: WindowId) -> bool {
@@ -2341,9 +2355,7 @@ struct WindowNodeInfo {
 struct WindowNodeInfoVec(Vec<WindowNodeInfo>);
 
 impl WindowIndex {
-    pub(crate) fn at(&self, node: NodeId) -> Option<WindowId> {
-        self.windows.get(node).copied()
-    }
+    pub(crate) fn at(&self, node: NodeId) -> Option<WindowId> { self.windows.get(node).copied() }
 
     fn layouts_for(&self, wid: WindowId) -> Vec<LayoutId> {
         self.window_nodes
@@ -2623,9 +2635,7 @@ impl Layout {
         }
     }
 
-    fn kind(&self, node: NodeId) -> LayoutKind {
-        self.info[node].kind
-    }
+    fn kind(&self, node: NodeId) -> LayoutKind { self.info[node].kind }
 
     fn proportion(&self, map: &NodeMap, node: NodeId) -> Option<f64> {
         let Some(parent) = node.parent(map) else { return None };
@@ -3199,9 +3209,7 @@ mod tests {
     use super::*;
     use crate::layout_engine::{Direction, LayoutKind};
 
-    fn w(idx: u32) -> WindowId {
-        WindowId::new(1, idx)
-    }
+    fn w(idx: u32) -> WindowId { WindowId::new(1, idx) }
 
     #[test]
     fn window_in_direction_prefers_leftmost_when_moving_right() {
@@ -3257,9 +3265,7 @@ mod tests {
     }
 
     impl Drop for TestTraditionalLayoutSystem {
-        fn drop(&mut self) {
-            self._root.remove(&mut self.system.tree);
-        }
+        fn drop(&mut self) { self._root.remove(&mut self.system.tree); }
     }
 
     #[test]

@@ -5815,6 +5815,55 @@ fn drop_target_is_the_tiled_window_under_the_pointer_regardless_of_overlap() {
     );
 }
 
+/// A stack gives every member the container's whole rect and shows one of
+/// them at a time, so trading two of them leaves the screen exactly as it
+/// was. The pointer, being over all of them at once, always found one to
+/// swap with: the overlay drew a screen-sized promise for the length of the
+/// drag and the drop kept none of it. Under the stack layout that is every
+/// other window on the space, so the drag now finds nothing at all.
+#[test]
+fn a_stack_member_is_not_a_drop_target() {
+    let (mut reactor, dragged, other, space, _) = reactor_with_two_tiled_windows(LayoutMode::Stack);
+    let whole = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+    for wid in [dragged, other] {
+        reactor.state.windows.window_mut(wid).unwrap().frame_monotonic = whole;
+    }
+    reactor.config.settings.ui.drop_overlay.enabled = true;
+    reactor.drag_manager.drag_state = DragState::Active {
+        session: DragSession {
+            window: dragged,
+            last_frame: whole,
+            origin_space: Some(space),
+            settled_space: Some(space),
+            layout_dirty: true,
+        },
+    };
+
+    assert!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .windows_share_a_stack(space, dragged, other),
+        "the stack layout keeps every window on the space in one stack"
+    );
+    assert!(
+        reactor.collect_drag_swap_candidates(dragged, space).is_empty(),
+        "a stack sibling is nothing to swap with"
+    );
+
+    reactor.evaluate_drop_target(dragged, whole, Some(whole.mid()));
+    assert_eq!(reactor.get_pending_drag_swap(), None);
+    assert!(
+        !reactor.drag_manager.drop_overlay_shown,
+        "no overlay where the drop would rearrange nothing"
+    );
+
+    // Windows that merely sit side by side are not in a stack, and dropping
+    // one on the other still means something.
+    let (tiled, left, right, bsp_space, _) = reactor_with_two_tiled_windows(LayoutMode::Bsp);
+    assert!(!tiled.layout_manager.layout_engine.windows_share_a_stack(bsp_space, left, right));
+}
+
 #[test]
 fn no_drop_target_while_the_pointer_is_over_the_dragged_windows_own_slot() {
     let (mut reactor, top, bottom, _space, bottom_frame) =
