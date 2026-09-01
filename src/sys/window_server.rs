@@ -432,19 +432,29 @@ fn window_is_sticky_raw(id: WindowServerId) -> bool {
 }
 
 pub fn window_spaces(id: WindowServerId) -> Vec<crate::sys::screen::SpaceId> {
+    // Under test the window server is never asked. Tests invent window ids, and
+    // on a developer's Mac an invented id is liable to collide with a real
+    // window, which then answers with its own space and decides the test: the
+    // suite passed where nothing owned the id and failed where something did.
+    // A test that needs an answer here states it with the override.
     #[cfg(test)]
-    if let Some(override_spaces) =
-        TEST_WINDOW_SPACES_OVERRIDE.with(|spaces| spaces.borrow().get(&id.as_u32()).cloned())
     {
-        return override_spaces.into_iter().map(crate::sys::screen::SpaceId::new).collect();
+        return TEST_WINDOW_SPACES_OVERRIDE
+            .with(|spaces| spaces.borrow().get(&id.as_u32()).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::sys::screen::SpaceId::new)
+            .collect();
     }
 
+    #[cfg(not(test))]
     trace::observe("window_spaces", id.as_u32(), || window_spaces_raw(id))
         .into_iter()
         .map(crate::sys::screen::SpaceId::new)
         .collect()
 }
 
+#[cfg(not(test))]
 fn window_spaces_raw(id: WindowServerId) -> Vec<u64> {
     let cf_windows = cf_array_from_ids(&[id]);
     let space_list_ref = unsafe {
