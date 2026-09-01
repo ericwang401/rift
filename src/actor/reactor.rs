@@ -4302,7 +4302,11 @@ impl Reactor {
             self.is_space_active(space)
                 && self.restore_window_to_layout_after_fullscreen(owner, space)
         } else {
-            self.fullscreen_slots.forget(owner);
+            // The window's workspace assignment still says the fullscreen
+            // space it is leaving, so this is the ordinary exit, not a window
+            // that went somewhere else — dropping the slot here is what used
+            // to lose the position. Reassigning puts it back in the tree, and
+            // the addition reinstates the slot.
             self.reassign_window_to_authoritative_space(owner, space)
         })
     }
@@ -5034,27 +5038,12 @@ impl Reactor {
             self.capture_pre_churn_layout();
         }
         self.note_fullscreen_slot_lifecycle(&event);
-        let seal_slot_for = match &event {
-            LayoutEvent::WindowRemovedPreserveFloating(window) => Some(*window),
-            _ => None,
-        };
         // A window coming back from native fullscreen is put into the tree by
         // whichever path notices it first, and none of them knows where it
-        // used to sit. Read the slot off the addition, remembering how the
-        // tree looked before it: that is what says whether the whole layout
-        // can go back as it was.
-        let reinstate_slot_for = match &event {
-            LayoutEvent::WindowAdded(space, window)
-                if self.has_fullscreen_slot(*window, *space) =>
-            {
-                Some((
-                    *window,
-                    *space,
-                    self.fullscreen_slot_is_untouched(*window, *space),
-                ))
-            }
-            _ => None,
-        };
+        // used to sit. Note which slots are still waiting before the engine
+        // sees this event; any of them tiled afterwards was inserted by it,
+        // and gets its slot back before this event's arrange writes a frame.
+        let slots_awaiting_insertion = self.fullscreen_slots_awaiting_insertion();
         let focus_changed = matches!(
             &event,
             LayoutEvent::WindowFocused(_, window)
@@ -5072,14 +5061,13 @@ impl Reactor {
         let event_clone = event.clone();
         let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
-        if let Some(window) = seal_slot_for {
-            self.seal_fullscreen_slot(window);
-        }
         let mut response = layout_outcome.response;
-        if let Some((window, space, untouched)) = reinstate_slot_for
-            && self.reinstate_fullscreen_slot(window, space, untouched)
-        {
-            response.changed = true;
+        for (window, space) in slots_awaiting_insertion {
+            if self.layout_manager.layout_engine.is_window_tiled(space, window)
+                && self.reinstate_fullscreen_slot(window, space)
+            {
+                response.changed = true;
+            }
         }
         let (placements, resizes, workspace_focus) = layout_outcome.app_rules.into_parts();
         self.apply_app_rule_placements(placements);

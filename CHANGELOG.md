@@ -61,14 +61,22 @@ Entries describe this fork's changes relative to
 ### Fixed
 
 - **A window that goes native fullscreen and comes back lands where it was**,
-  not beside whatever is selected. A browser tiled on the left of an editor came
-  back on the right after a video was fullscreened and closed again. rift already
-  remembered the window's slot on the way out, but read it from the event that
-  says the window is home — and the window server says that *before* it says the
-  display has left the fullscreen space, so the restoration was skipped as
-  happening on an inactive space and the window was quietly added back a moment
-  later by another path that knew nothing about the slot. The slot is now
-  reinstated from the addition itself, whichever path makes it.
+  not beside whatever is selected, and without passing through the wrong place
+  on the way. A browser tiled left of an editor came back on the right after a
+  video was fullscreened and closed — or, in a layout of stacked columns, on top
+  of the editor. rift already remembered the window's slot on the way out, but
+  the transition itself defeated it at every step: the slot was read from a
+  workspace assignment macOS clears first, so usually nothing was recorded;
+  when something was, it was recorded on a later removal, after the transition
+  had already shoved the window across; the exit handler and a transient
+  "not admitted" removal each threw the slot away; and the window was put back
+  into the tree by whichever of several paths noticed first, none of which
+  consulted it. Now the slot is captured at the first removal with the space
+  read off the tree, survives until the window is really gone, and is
+  reinstated by whatever event actually re-inserts the window — before that
+  event writes a frame. The whole layout is restored as it was; the "beside
+  its old neighbour" fallback is used only when the snapshot matches nothing,
+  since splitting a stacked neighbour puts the window into the stack.
 - **The drop overlay no longer promises a move a stack cannot make.** Dragging
   a window on a space in stack mode drew a screen-sized drop region for the
   length of the drag, and releasing it swapped the dragged window with an

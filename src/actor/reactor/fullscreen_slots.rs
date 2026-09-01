@@ -6,15 +6,14 @@
 //! gone. This remembers the window's slot on the way out and reinstates it on
 //! the way back:
 //!
-//! - the layout is snapshotted *before* the window leaves, and the tree as it
-//!   looks *after* it has left is recorded as a digest;
-//! - on exit, if the tree still matches that digest — nothing was touched
-//!   while the window was away — the pre-departure layout is restored
-//!   outright: same structure, nesting and ratios;
-//! - if the tree was edited meanwhile, those edits are kept: the window is
-//!   re-inserted next to its old neighbour on the same side with its old
-//!   share, or, if that neighbour is gone too, wherever it would otherwise
-//!   have landed.
+//! - the layout is snapshotted *before* the window leaves;
+//! - on exit, that layout is restored outright — same structure, nesting and
+//!   ratios — for every window the snapshot still finds; windows that arrived
+//!   meanwhile keep the places they have;
+//! - only if the snapshot matches nothing is the window re-inserted next to
+//!   its old neighbour on the same side with its old share. This is a last
+//!   resort, not an equal: splitting a neighbour that sits in a stack puts
+//!   the window *into* the stack, on top of it.
 //!
 //! The slot is read from the addition that puts the window back in the tree,
 //! not from the event that announces the return. The window server says the
@@ -41,8 +40,6 @@ struct FullscreenSlot {
     space: SpaceId,
     /// The engine as it was with the window still in its tree.
     snapshot: String,
-    /// The tree with the window gone, before anything else happened to it.
-    digest_after_removal: Option<String>,
     anchor: Option<Slot>,
 }
 
@@ -54,23 +51,21 @@ impl Reactor {
     /// Called from the layout-event sink just before the removal that takes
     /// a window entering native fullscreen out of its tree.
     pub(super) fn record_fullscreen_slot(&mut self, window: WindowId) {
-        let Some(space) = self.assigned_space_for_window_id(window) else {
+        // The first removal is the only truthful one. A native fullscreen
+        // transition churns the tree — the window is taken out, put back by a
+        // path that does not know where it is going, and taken out again — and
+        // by the second removal it sits wherever that path dropped it: a window
+        // tiled on the left records itself as the right-hand one. Later
+        // removals find the work already done.
+        if self.fullscreen_slots.slots.contains_key(&window) {
+            return;
+        }
+        let Some(space) = self.space_of_tiled_window(window) else {
             return;
         };
         let engine = &mut self.layout_manager.layout_engine;
         if engine.is_window_floating(window) {
             // A float comes back as a float; its frame is kept elsewhere.
-            return;
-        }
-        // Native fullscreen reaches the reactor as two independent window-server
-        // events — the window leaving its own space and arriving on the
-        // fullscreen one — in either order. Keying this on the fullscreen record
-        // already existing meant that whenever the departure came first the slot
-        // was read *after* the window had left its tree: no anchor, and a
-        // snapshot that no longer held it, so it came back beside whatever
-        // happened to be selected. Record from the removal that still has a slot
-        // to record, and let the other one find the work already done.
-        if !engine.is_window_tiled(space, window) {
             return;
         }
         let anchor = engine.slot_of(space, window);
@@ -81,22 +76,30 @@ impl Reactor {
                 return;
             }
         };
-        self.fullscreen_slots.slots.insert(window, FullscreenSlot {
-            space,
-            snapshot,
-            digest_after_removal: None,
-            anchor,
-        });
+        self.fullscreen_slots
+            .slots
+            .insert(window, FullscreenSlot { space, snapshot, anchor });
     }
 
-    /// Called right after that removal has been applied.
-    pub(super) fn seal_fullscreen_slot(&mut self, window: WindowId) {
-        let Some(slot) = self.fullscreen_slots.slots.get_mut(&window) else {
-            return;
-        };
-        if slot.digest_after_removal.is_none() {
-            slot.digest_after_removal = self.layout_manager.layout_engine.tree_digest(slot.space);
+    /// Which space's tree is holding `window` right now.
+    ///
+    /// Not the workspace assignment: a native fullscreen transition clears that
+    /// before the removals that need it, so asking the assignment answers
+    /// `None` exactly when a slot most needs recording. The tree still has the
+    /// window at that point, so ask the tree, and keep the assignment only as
+    /// the fast path.
+    fn space_of_tiled_window(&self, window: WindowId) -> Option<SpaceId> {
+        let engine = &self.layout_manager.layout_engine;
+        if let Some(space) = self.assigned_space_for_window_id(window)
+            && engine.is_window_tiled(space, window)
+        {
+            return Some(space);
         }
+        engine
+            .virtual_workspace_manager()
+            .initialized_spaces()
+            .into_iter()
+            .find(|space| engine.is_window_tiled(*space, window))
     }
 
     /// The window is back on `space`. Adding it to the layout is what
@@ -111,32 +114,25 @@ impl Reactor {
         self.restore_window_to_active_layout_if_visible(window, space)
     }
 
-    /// Whether a slot recorded for `window` on `space` is still waiting to be
-    /// reinstated.
-    pub(super) fn has_fullscreen_slot(&self, window: WindowId, space: SpaceId) -> bool {
-        self.fullscreen_slots.slots.get(&window).is_some_and(|slot| slot.space == space)
-    }
-
-    /// Whether the tree on `space` still looks as it did when `window` left
-    /// it, i.e. nothing was rearranged while it was away. Asked before the
-    /// window goes back in, since putting it back is itself a change.
-    pub(super) fn fullscreen_slot_is_untouched(&self, window: WindowId, space: SpaceId) -> bool {
-        self.fullscreen_slots.slots.get(&window).is_some_and(|slot| {
-            slot.space == space
-                && slot.digest_after_removal.is_some()
-                && self.layout_manager.layout_engine.tree_digest(space) == slot.digest_after_removal
-        })
+    /// The slots whose window is not in its tree yet. Asked before a layout
+    /// event is applied; whichever of these windows is tiled afterwards was
+    /// put there by that event, whatever kind of event it was. Discovery
+    /// reconciles an app's windows from the store rather than from its own
+    /// payload, so the event that inserts a returning window need not so much
+    /// as name it — this is the only test that catches every path.
+    pub(super) fn fullscreen_slots_awaiting_insertion(&self) -> Vec<(WindowId, SpaceId)> {
+        let engine = &self.layout_manager.layout_engine;
+        self.fullscreen_slots
+            .slots
+            .iter()
+            .filter(|(window, slot)| !engine.is_window_tiled(slot.space, **window))
+            .map(|(window, slot)| (*window, slot.space))
+            .collect()
     }
 
     /// `window` has just been added back to the tree on `space`. Move it to
-    /// the slot it left, and report whether the layout changed. `untouched`
-    /// is `fullscreen_slot_is_untouched` from before the addition.
-    pub(super) fn reinstate_fullscreen_slot(
-        &mut self,
-        window: WindowId,
-        space: SpaceId,
-        untouched: bool,
-    ) -> bool {
+    /// the slot it left, and report whether the layout changed.
+    pub(super) fn reinstate_fullscreen_slot(&mut self, window: WindowId, space: SpaceId) -> bool {
         let Some(slot) = self.fullscreen_slots.slots.remove(&window) else {
             return false;
         };
@@ -145,35 +141,33 @@ impl Reactor {
             return false;
         }
 
-        if untouched {
-            let request = RestoreRequest {
-                scope: RestoreScope::Workspace,
-                active_space: space,
-                source: RestoreSource::CurrentSpace,
-            };
-            let layout_settings = self.config.settings.layout.clone();
-            match self.layout_manager.layout_engine.restore_layout_from_snapshot(
-                &slot.snapshot,
-                request,
-                &mut self.state.windows,
-                &layout_settings,
-            ) {
-                Ok(report) if report.matched > 0 => {
-                    info!(
-                        ?window,
-                        matched = report.matched,
-                        "Fullscreen exit: layout put back as it was"
-                    );
-                    return true;
-                }
-                Ok(report) => debug!(
+        let request = RestoreRequest {
+            scope: RestoreScope::Workspace,
+            active_space: space,
+            source: RestoreSource::CurrentSpace,
+        };
+        let layout_settings = self.config.settings.layout.clone();
+        match self.layout_manager.layout_engine.restore_layout_from_snapshot(
+            &slot.snapshot,
+            request,
+            &mut self.state.windows,
+            &layout_settings,
+        ) {
+            Ok(report) if report.matched > 0 => {
+                info!(
                     ?window,
-                    ?report,
-                    "Fullscreen slot snapshot matched nothing; re-anchoring"
-                ),
-                Err(error) => {
-                    warn!(?window, %error, "Fullscreen slot snapshot could not be restored; re-anchoring")
-                }
+                    matched = report.matched,
+                    "Fullscreen exit: layout put back as it was"
+                );
+                return true;
+            }
+            Ok(report) => debug!(
+                ?window,
+                ?report,
+                "Fullscreen slot snapshot matched nothing; re-anchoring"
+            ),
+            Err(error) => {
+                warn!(?window, %error, "Fullscreen slot snapshot could not be restored; re-anchoring")
             }
         }
 
@@ -192,7 +186,23 @@ impl Reactor {
             LayoutEvent::WindowRemovedPreserveFloating(window) => {
                 self.record_fullscreen_slot(*window)
             }
-            LayoutEvent::WindowRemoved(window) => self.fullscreen_slots.forget(*window),
+            LayoutEvent::WindowRemoved(window) => {
+                // A plain removal is not always the end of the window. Several
+                // paths take a window out of the tree for a moment —
+                // reconciliation, the visibility restore, discovery — and a
+                // native fullscreen transition trips them before rift ever
+                // hears about the fullscreen space. The window is coming back,
+                // and whichever path puts it back drops it beside the
+                // selection, so this is the last moment its real place can be
+                // read. Record from here too; only a window the store has let
+                // go of has no place worth keeping. A window in the user's hand
+                // is the exception: its next place is wherever the drop says.
+                if !self.state.windows.contains_window(*window) {
+                    self.fullscreen_slots.forget(*window);
+                } else if self.window_in_drag() != Some(*window) {
+                    self.record_fullscreen_slot(*window);
+                }
+            }
             _ => {}
         }
     }
