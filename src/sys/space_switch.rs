@@ -11,12 +11,6 @@ use objc2_core_graphics::{CGEvent, CGEventField};
 use objc2_foundation::NSProcessInfo;
 use once_cell::sync::Lazy;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
-
-use parking_lot::Mutex;
-use tracing::warn;
-
 use crate::common::collections::BTreeMap;
 use crate::common::config::SpaceSwitchMethod;
 use crate::layout_engine::Direction;
@@ -207,7 +201,7 @@ pub unsafe fn switch_to_space_index(index: usize, method: SpaceSwitchMethod) {
     if current == target {
         return;
     }
-    if teleport_to_space_on_display(target, &display.display_uuid, method) {
+    if teleport_to_space(target, method) {
         return;
     }
     let Some(steps) = steps_between(&display.spaces, current, target) else {
@@ -245,95 +239,22 @@ fn steps_between(spaces: &[SpaceId], current: SpaceId, target: SpaceId) -> Optio
     (steps != 0).then_some(steps)
 }
 
-/// How long the scripting addition gets to land a switch before the gesture
-/// takes over. A healthy call measures in tenths of a millisecond, so this is a
-/// wide margin rather than a tight budget.
-const TELEPORT_DEADLINE: Duration = Duration::from_millis(40);
-const TELEPORT_POLL: Duration = Duration::from_millis(2);
-/// Consecutive misses before the addition is set aside, in `Auto` only.
-const TELEPORT_MISS_LIMIT: u32 = 3;
-const TELEPORT_COOLDOWN: Duration = Duration::from_secs(30);
-
-static TELEPORT_MISSES: AtomicU32 = AtomicU32::new(0);
-static TELEPORT_COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Switches by asking the scripting addition, reporting whether the space
-/// actually changed.
+/// Switches by asking the scripting addition, reporting whether it did.
 ///
-/// False means nothing happened and the caller should fall back: the addition
-/// either refused the command or did not land it, so a fallback cannot switch
-/// twice. The check is what makes `Auto` safe — the alternative, trusting the
-/// call and gesturing as well, would double-switch whenever it did work.
+/// False means nothing happened and the caller should fall back to the
+/// gesture. The verdict is the payload's own: it serves commands one at a time
+/// and answers once the switch is issued, so a true here cannot be followed by
+/// a gesture and a false cannot hide a switch that happened. This used to be
+/// judged instead by polling the window server for up to 40ms, and under a
+/// fullscreen game that single read could stall past the deadline while the
+/// switch landed anyway — the gesture then ran on top of it, one swipe per
+/// step, which from a fullscreen space at the end of the list meant flying to
+/// the leftmost desktop and rubber-banding there.
 fn teleport_to_space(target: SpaceId, method: SpaceSwitchMethod) -> bool {
-    match display_holding_space(target) {
-        Some(display) => teleport_to_space_on_display(target, &display.display_uuid, method),
-        None => false,
-    }
-}
-
-/// Like `teleport_to_space`, judged against the display that owns the
-/// space: `CGSGetActiveSpace` only reports the display the pointer is on,
-/// which says nothing about a switch on the other one.
-fn teleport_to_space_on_display(
-    target: SpaceId,
-    display_uuid: &str,
-    method: SpaceSwitchMethod,
-) -> bool {
     if method == SpaceSwitchMethod::Gesture {
         return false;
     }
-    let current = || crate::sys::screen::current_space_for_display_uuid(display_uuid);
-    if current() == Some(target) {
-        return true;
-    }
-    if method == SpaceSwitchMethod::Auto && !teleport_is_available() {
-        return false;
-    }
-    if !crate::sys::scripting_addition::focus_space(target.get()) {
-        note_teleport_miss(method);
-        return false;
-    }
-
-    // The addition sets the window server's current space directly, but the
-    // read can trail the write, so judge on the deadline rather than one
-    // sample.
-    let started = Instant::now();
-    while started.elapsed() < TELEPORT_DEADLINE {
-        if current() == Some(target) {
-            TELEPORT_MISSES.store(0, Ordering::Relaxed);
-            return true;
-        }
-        std::thread::sleep(TELEPORT_POLL);
-    }
-
-    warn!(
-        ?target,
-        "Scripting addition did not land the switch; using the gesture"
-    );
-    note_teleport_miss(method);
-    false
-}
-
-fn teleport_is_available() -> bool {
-    match *TELEPORT_COOLDOWN_UNTIL.lock() {
-        Some(until) => Instant::now() >= until,
-        None => true,
-    }
-}
-
-fn note_teleport_miss(method: SpaceSwitchMethod) {
-    if method != SpaceSwitchMethod::Auto {
-        return;
-    }
-    let misses = TELEPORT_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
-    if misses >= TELEPORT_MISS_LIMIT {
-        warn!(
-            "Scripting addition missed {misses} switches; using the gesture for {}s",
-            TELEPORT_COOLDOWN.as_secs()
-        );
-        TELEPORT_MISSES.store(0, Ordering::Relaxed);
-        *TELEPORT_COOLDOWN_UNTIL.lock() = Some(Instant::now() + TELEPORT_COOLDOWN);
-    }
+    crate::sys::scripting_addition::focus_space(target.get())
 }
 
 /// The space one step from the active one, or `None` at either end.
@@ -453,25 +374,19 @@ fn post_legacy_pair(phase: i64, right: bool, velocity_x: Option<f64>) {
     } else {
         -K_LEGACY_TRUE_MIN
     };
-    set_integer_fields(
-        &dock,
-        &[(K_GESTURE_PROGRESS_BITS_FIELD, progress.to_bits() as i32 as i64)],
-    );
-    set_double_fields(
-        &dock,
-        &[
-            (K_GESTURE_SCROLL_Y_FIELD, 0.0),
-            (K_GESTURE_POSITION_FALLBACK_FIELD, K_LEGACY_TRUE_MIN as f64),
-        ],
-    );
+    set_integer_fields(&dock, &[(
+        K_GESTURE_PROGRESS_BITS_FIELD,
+        progress.to_bits() as i32 as i64,
+    )]);
+    set_double_fields(&dock, &[
+        (K_GESTURE_SCROLL_Y_FIELD, 0.0),
+        (K_GESTURE_POSITION_FALLBACK_FIELD, K_LEGACY_TRUE_MIN as f64),
+    ]);
     if let Some(velocity_x) = velocity_x {
-        set_double_fields(
-            &dock,
-            &[
-                (K_GESTURE_SWIPE_VELOCITY_X_FIELD, velocity_x),
-                (K_GESTURE_SWIPE_VELOCITY_Y_FIELD, 0.0),
-            ],
-        );
+        set_double_fields(&dock, &[
+            (K_GESTURE_SWIPE_VELOCITY_X_FIELD, velocity_x),
+            (K_GESTURE_SWIPE_VELOCITY_Y_FIELD, 0.0),
+        ]);
     }
 
     let companion = new_event();
@@ -514,27 +429,21 @@ fn dock_control_gesture_event(
 ) -> CFRetained<CGEvent> {
     let event = new_event();
     configure_dock_swipe_event(&event, phase);
-    set_integer_fields(
-        &event,
-        &[(
-            K_GESTURE_SWIPE_MASK_FIELD,
-            swipe_mask_for_direction(direction) as i64,
-        )],
-    );
+    set_integer_fields(&event, &[(
+        K_GESTURE_SWIPE_MASK_FIELD,
+        swipe_mask_for_direction(direction) as i64,
+    )]);
     set_double_fields(&event, &[(K_GESTURE_SWIPE_PROGRESS_FIELD, progress)]);
 
     if let Some(velocity_x) = velocity_x {
         set_double_fields(&event, &[(K_GESTURE_SWIPE_VELOCITY_X_FIELD, velocity_x)]);
     }
 
-    set_double_fields(
-        &event,
-        &[
-            (K_GESTURE_FLAVOR_FIELD, K_GESTURE_FLAVOR_DOCK_PRIMARY),
-            (K_GESTURE_TIMESTAMP_FIELD, unsafe { mach_absolute_time() as f64 }),
-            (K_GESTURE_SWIPE_POSITION_X_FIELD, K_GESTURE_SWIPE_POSITION_X),
-        ],
-    );
+    set_double_fields(&event, &[
+        (K_GESTURE_FLAVOR_FIELD, K_GESTURE_FLAVOR_DOCK_PRIMARY),
+        (K_GESTURE_TIMESTAMP_FIELD, unsafe { mach_absolute_time() as f64 }),
+        (K_GESTURE_SWIPE_POSITION_X_FIELD, K_GESTURE_SWIPE_POSITION_X),
+    ]);
     event
 }
 
@@ -671,21 +580,16 @@ fn generate_iohid_system_queue_element(event: &CGEvent) -> Vec<u8> {
     out
 }
 
-fn new_event() -> CFRetained<CGEvent> {
-    CGEvent::new(None).expect("CGEventCreate should succeed")
-}
+fn new_event() -> CFRetained<CGEvent> { CGEvent::new(None).expect("CGEventCreate should succeed") }
 
 fn configure_dock_swipe_event(event: &CGEvent, phase: i64) {
-    set_integer_fields(
-        event,
-        &[
-            (K_CGS_EVENT_TYPE_FIELD, K_CGS_EVENT_DOCK_CONTROL),
-            (K_GESTURE_HID_TYPE_FIELD, K_IOHID_EVENT_TYPE_DOCK_SWIPE),
-            (K_GESTURE_PHASE_FIELD, phase),
-            (K_GESTURE_PHASE_MIRROR_FIELD, phase),
-            (K_GESTURE_SWIPE_MOTION_FIELD, K_CG_GESTURE_MOTION_HORIZONTAL),
-        ],
-    );
+    set_integer_fields(event, &[
+        (K_CGS_EVENT_TYPE_FIELD, K_CGS_EVENT_DOCK_CONTROL),
+        (K_GESTURE_HID_TYPE_FIELD, K_IOHID_EVENT_TYPE_DOCK_SWIPE),
+        (K_GESTURE_PHASE_FIELD, phase),
+        (K_GESTURE_PHASE_MIRROR_FIELD, phase),
+        (K_GESTURE_SWIPE_MOTION_FIELD, K_CG_GESTURE_MOTION_HORIZONTAL),
+    ]);
 }
 
 fn set_integer_fields(event: &CGEvent, fields: &[(CGEventField, i64)]) {

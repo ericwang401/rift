@@ -99,6 +99,20 @@ for bytes the first one already replaced. On a machine that also has yabai's
 addition loaded, `0x3f` is the expected, healthy answer, and
 `move_window_to_space` — the command that matters most — needs no flag at all.
 
+## What the payload answers
+
+Every command is one short-lived connection: rift writes the frame, the
+payload acts, then closes. Most commands write nothing back, and the close is
+the acknowledgement. Two answer first: the handshake, with the version and
+attribute flags described above, and `SPACE_FOCUS`, with one byte saying
+whether the switch was issued (`1`) or refused (`0`, meaning Dock did not
+know the space). That byte is a rift addition to yabai's protocol. It exists
+because `auto` switching falls back to a synthetic swipe when the addition
+does not act, and a swipe posted on top of a switch that did happen lands one
+space too far — so the fallback decision has to rest on the payload's own
+word, not on rift reading the window server back afterwards, which can stall
+under a fullscreen game long enough to look like a miss.
+
 ## Versioning
 
 `OSAX_VERSION` appears twice — in `src/osax/common.h`, compiled into the
