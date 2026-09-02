@@ -428,13 +428,12 @@ pub enum DisplacedWindows {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpaceSwitchMethod {
-    /// Use the scripting addition when it is loaded and behaving, and the
-    /// gesture otherwise.
+    /// Use the scripting addition when it is loaded, and the gesture
+    /// otherwise.
     ///
-    /// Each switch is verified: if the addition does not land on the requested
-    /// space quickly, the gesture runs instead, and repeated misses put the
-    /// addition aside for a cooldown so a degraded one does not cost latency on
-    /// every switch afterwards.
+    /// The addition answers each switch with whether it issued it, and the
+    /// gesture runs only on a refusal — the addition not loaded, or Dock not
+    /// knowing the space — so the two never both act on one switch.
     Auto,
     /// Post a synthetic dock swipe at a velocity that makes the window server
     /// skip its slide. Needs no elevated privileges, and is the only option on
@@ -444,9 +443,7 @@ pub enum SpaceSwitchMethod {
     Gesture,
     /// Ask the scripting addition to switch, which teleports with no
     /// animation at all. Requires the addition (and so the SIP configuration it
-    /// needs); falls back to `Gesture` when it is not loaded. Issuing many
-    /// switches in rapid succession can leave Dock settling on a different
-    /// space than the last one requested.
+    /// needs); falls back to `Gesture` when it is not loaded.
     ScriptingAddition,
 }
 

@@ -28,10 +28,11 @@
 //! ```
 //!
 //! where `length` counts the opcode and args, i.e. the frame size minus its own
-//! two bytes. The server replies with a single byte and closes; each command is
-//! its own short-lived connection, so there is no session to keep. The one
-//! exception is [`handshake`], answered with a NUL-terminated version string
-//! followed by a `u32` of attribute flags.
+//! two bytes. The server closes the connection once it has acted; each command
+//! is its own short-lived connection, so there is no session to keep. Two
+//! commands answer first: [`handshake`], with a NUL-terminated version string
+//! followed by a `u32` of attribute flags, and [`focus_space`], with one byte
+//! saying whether the switch was issued.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -185,9 +186,7 @@ pub mod test_hooks {
         static SENT: RefCell<Vec<(u8, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
     }
 
-    pub fn available() -> bool {
-        AVAILABLE.with(|available| available.get())
-    }
+    pub fn available() -> bool { AVAILABLE.with(|available| available.get()) }
 
     pub fn set_available(available: bool) {
         AVAILABLE.with(|cell| cell.set(available));
@@ -239,14 +238,23 @@ fn send(op: u8, args: &[u8]) -> bool {
         return test_hooks::record(op, args);
     }
     #[allow(unreachable_code)]
-    let Some(path) = socket_path() else {
-        return false;
-    };
+    send_frame(op, args).is_some()
+}
+
+/// Delivers one command and returns whatever the payload wrote back before
+/// closing, which for most commands is nothing. `None` means the command
+/// never reached the payload.
+///
+/// The read waits for the close, and the payload closes only after acting,
+/// so a returned reply means the command has been carried out, not merely
+/// queued.
+fn send_frame(op: u8, args: &[u8]) -> Option<Vec<u8>> {
+    let path = socket_path()?;
 
     let body_len = 1 + args.len();
     let Ok(header) = i16::try_from(body_len) else {
         warn!("scripting addition command too large");
-        return false;
+        return None;
     };
 
     let mut frame = Vec::with_capacity(2 + body_len);
@@ -258,7 +266,7 @@ fn send(op: u8, args: &[u8]) -> bool {
         Ok(stream) => stream,
         Err(error) => {
             debug!(%error, %path, "scripting addition is not loaded");
-            return false;
+            return None;
         }
     };
     let _ = stream.set_write_timeout(Some(CONNECT_TIMEOUT));
@@ -266,14 +274,12 @@ fn send(op: u8, args: &[u8]) -> bool {
 
     if let Err(error) = stream.write_all(&frame) {
         warn!(%error, op, "failed to send scripting addition command");
-        return false;
+        return None;
     }
 
-    // The payload answers with a single byte and closes. A closed connection
-    // with nothing read still means the command was taken.
-    let mut ack = [0u8; 1];
-    let _ = stream.read(&mut ack);
-    true
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply);
+    Some(reply)
 }
 
 /// Moves a window to a space, both by their window-server ids.
@@ -294,20 +300,42 @@ pub fn move_window_to_space(window_server_id: u32, space: u64) -> bool {
 /// synthetic-swipe path in `sys::space_switch` still shows a single frame of
 /// movement because it drives the Dock's real swipe machinery; this does not.
 ///
-/// The trade is state: this sets the window server's idea of the current space
-/// directly, and issuing many in quick succession has been observed to leave
-/// Dock settling somewhere other than the last space asked for. Fine for
-/// ordinary use, worse than the gesture under repeated rapid switching.
+/// True means the payload issued the switch (or the space was already
+/// current), false that it refused — the addition is not loaded, or Dock did
+/// not know the space. That verdict is the whole basis for falling back to a
+/// gesture, so it comes from the payload itself rather than from watching
+/// the window server afterwards: the payload serves commands one at a time
+/// and answers after the switch is issued, whereas a readback from here can
+/// stall long enough under load to look like a miss. A swipe posted on top
+/// of a switch that did happen lands one space too far.
 pub fn focus_space(space: u64) -> bool {
     crate::sys::trace::observe("sa_focus_space", space, || {
-        send(opcode::SPACE_FOCUS, &space.to_ne_bytes())
+        send_for_verdict(opcode::SPACE_FOCUS, &space.to_ne_bytes())
     })
 }
 
-/// Creates a space on the display holding `space`.
-pub fn create_space(space: u64) -> bool {
-    send(opcode::SPACE_CREATE, &space.to_ne_bytes())
+/// Like [`send`], for the commands the payload answers with a verdict byte.
+///
+/// No byte at all is read as accepted, not refused: it is what a payload from
+/// before the verdict existed answers, and one of those has already acted by
+/// the time it closes the connection.
+fn send_for_verdict(op: u8, args: &[u8]) -> bool {
+    #[cfg(test)]
+    {
+        return test_hooks::record(op, args);
+    }
+    #[allow(unreachable_code)]
+    match send_frame(op, args) {
+        Some(reply) => verdict(&reply),
+        None => false,
+    }
 }
+
+/// Reads a verdict reply: `[0]` is a refusal, anything else is acceptance.
+fn verdict(reply: &[u8]) -> bool { reply.first().is_none_or(|byte| *byte != 0) }
+
+/// Creates a space on the display holding `space`.
+pub fn create_space(space: u64) -> bool { send(opcode::SPACE_CREATE, &space.to_ne_bytes()) }
 
 /// Reorders `space` to sit immediately after `after` on the same display,
 /// optionally focusing it.
@@ -324,13 +352,21 @@ pub fn move_space_after_space(space: u64, after: u64, focus: bool) -> bool {
 }
 
 /// Destroys a space by id.
-pub fn destroy_space(space: u64) -> bool {
-    send(opcode::SPACE_DESTROY, &space.to_ne_bytes())
-}
+pub fn destroy_space(space: u64) -> bool { send(opcode::SPACE_DESTROY, &space.to_ne_bytes()) }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verdict_reads_the_payload_byte_and_tolerates_none() {
+        assert!(verdict(&[1]));
+        assert!(!verdict(&[0]));
+        assert!(
+            verdict(&[]),
+            "a pre-verdict payload has acted by the time it closes"
+        );
+    }
 
     #[test]
     fn required_attributes_exclude_what_rift_never_sends() {
@@ -338,7 +374,10 @@ mod tests {
         // holds another one reports 0x3f, never 0x40 -- finding ANIM_TIME means
         // matching an instruction the first payload has already overwritten.
         // rift sends no opcode that needs it, so 0x3f is healthy.
-        let handshake = Handshake { version: "1.0.0".into(), attributes: 0x3f };
+        let handshake = Handshake {
+            version: "1.0.0".into(),
+            attributes: 0x3f,
+        };
         assert!(handshake.missing().is_empty());
 
         assert_eq!(attrib::REQUIRED & attrib::ANIM_TIME, 0);
@@ -356,7 +395,10 @@ mod tests {
 
     #[test]
     fn a_payload_that_found_nothing_is_missing_every_requirement() {
-        let handshake = Handshake { version: "1.0.0".into(), attributes: 0 };
+        let handshake = Handshake {
+            version: "1.0.0".into(),
+            attributes: 0,
+        };
         assert_eq!(handshake.missing().len(), 5);
     }
 

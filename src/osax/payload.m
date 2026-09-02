@@ -563,39 +563,50 @@ static void do_space_create(char *message)
     });
 }
 
-static void do_space_focus(char *message)
+//
+// NOTE(rift): unlike yabai, this reports whether the switch was issued. The
+// client falls back to a synthetic swipe when it was not, and a swipe on top
+// of a switch that did happen lands one space too far, so the answer has to
+// come from here rather than from watching the window server afterwards.
+// "Already there" counts as done: there is nothing for a fallback to do.
+//
+static bool do_space_focus(char *message)
 {
-    if (dock_spaces == nil) return;
+    if (dock_spaces == nil) return false;
 
     uint64_t dest_space_id;
     unpack(dest_space_id);
+    if (!dest_space_id) return false;
 
-    if (dest_space_id) {
-        CFStringRef dest_display = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
-        id source_space = macOSSequoia
-                        ? ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceForDisplayUUID:), dest_display)
-                        : ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceforDisplayUUID:), dest_display);
-        uint64_t source_space_id = get_space_id(source_space);
+    bool focused = false;
+    CFStringRef dest_display = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
+    id source_space = macOSSequoia
+                    ? ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceForDisplayUUID:), dest_display)
+                    : ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceforDisplayUUID:), dest_display);
+    uint64_t source_space_id = get_space_id(source_space);
 
-        if (source_space_id != dest_space_id) {
-            id dest_space = space_for_display_with_id(dest_display, dest_space_id);
-            if (dest_space != nil) {
-                id display_space = display_space_for_space_with_id(source_space_id);
-                if (display_space != nil) {
-                    NSArray *ns_source_space = @[ @(source_space_id) ];
-                    NSArray *ns_dest_space = @[ @(dest_space_id) ];
-                    SLSShowSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_dest_space);
-                    SLSHideSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_source_space);
-                    SLSManagedDisplaySetCurrentSpace(SLSMainConnectionID(), dest_display, dest_space_id);
-                    set_ivar_value(display_space, "_currentSpace", [dest_space retain]);
-                    [ns_dest_space release];
-                    [ns_source_space release];
-                }
+    if (source_space_id == dest_space_id) {
+        focused = true;
+    } else {
+        id dest_space = space_for_display_with_id(dest_display, dest_space_id);
+        if (dest_space != nil) {
+            id display_space = display_space_for_space_with_id(source_space_id);
+            if (display_space != nil) {
+                NSArray *ns_source_space = @[ @(source_space_id) ];
+                NSArray *ns_dest_space = @[ @(dest_space_id) ];
+                SLSShowSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_dest_space);
+                SLSHideSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_source_space);
+                SLSManagedDisplaySetCurrentSpace(SLSMainConnectionID(), dest_display, dest_space_id);
+                set_ivar_value(display_space, "_currentSpace", [dest_space retain]);
+                [ns_dest_space release];
+                [ns_source_space release];
+                focused = true;
             }
         }
-
-        CFRelease(dest_display);
     }
+
+    CFRelease(dest_display);
+    return focused;
 }
 
 static void do_window_scale(char *message)
@@ -968,7 +979,8 @@ static void handle_message(int sockfd, char *message)
         do_handshake(sockfd);
     } break;
     case SA_OPCODE_SPACE_FOCUS: {
-        do_space_focus(message);
+        char focused = do_space_focus(message);
+        send(sockfd, &focused, 1, 0);
     } break;
     case SA_OPCODE_SPACE_CREATE: {
         do_space_create(message);

@@ -77,6 +77,20 @@ Entries describe this fork's changes relative to
   event writes a frame. The whole layout is restored as it was; the "beside
   its old neighbour" fallback is used only when the snapshot matches nothing,
   since splitting a stacked neighbour puts the window into the stack.
+- **Switching spaces away from a fullscreen game no longer flies to the leftmost
+  desktop.** With `space_switch_method = "auto"`, rift asked the scripting
+  addition to switch and then polled the window server for up to 40ms to
+  confirm it had. With Roblox fullscreen on either display that first read
+  could stall past the deadline while the switch landed anyway, so rift judged
+  it a miss and posted the gesture fallback on top: one synthetic swipe per
+  step from the *old* space, which from a fullscreen space at the end of the
+  list meant several swipes left, ending on the first desktop and
+  rubber-banding at the edge. From a normal desktop the same stall overshot by
+  one space. The payload now answers a space-focus command with whether it
+  issued the switch, and the gesture runs only on a refusal — the readback,
+  its deadline, and the miss counter and 30s cooldown that came with them are
+  gone. `OSAX_VERSION` is `1.1.0`; run `rift sa load` after updating.
+
 - **The drop overlay no longer promises a move a stack cannot make.** Dragging
   a window on a space in stack mode drew a screen-sized drop region for the
   length of the drag, and releasing it swapped the dragged window with an
