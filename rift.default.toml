@@ -49,18 +49,31 @@ mouse_follows_focus_blacklist = []
 # Remember a display's layout when it disconnects — unplugging, sleep, closing
 # the lid — and put it back when the same display returns. macOS gives a
 # returning display a brand-new space, so without this the old layout is
-# orphaned and its windows stay piled on whichever display survived. While the
-# display is away its windows live on the surviving display (tiled ones as one
-# cluster in that tree, floating ones stay floating); when it comes back they
-# are moved home through the scripting addition and the saved tree is restored.
+# orphaned and its windows stay piled on whichever display survived. When it
+# comes back its windows are moved home through the scripting addition and the
+# saved tree is restored. `displaced_windows` says where they live meanwhile.
 restore_display_layouts = true
 
 # Where a disconnected display's windows go in the meantime:
+# - "spaces" they stay on their own desktops. rift records where every window
+#            and every desktop was when the display left. The desktops macOS
+#            carries over to the surviving display are shown there as they
+#            are; the surviving display's own windows, which macOS merges
+#            into one of them, get a desktop made for them with their
+#            layout, its own desktops go first, and it is switched back to
+#            the desktop it was showing. When the display returns, the
+#            scripting addition puts everything back where the record has
+#            it — desktops on their own display in order, windows on their
+#            own desktops, each desktop's layout — in one pass, and the made
+#            desktop is destroyed. Windows and desktops you moved or made in
+#            the meantime stay as you left them, and so does a desktop you
+#            rearranged; the restore_departure_layout command puts such a
+#            desktop back the way it was.
 # - "float"  they float over the surviving display, whose layout is left as it
 #            was. A layout that lost its screen does not get to reshape one that
 #            did not. Alt+Shift+T tiles one on demand.
 # - "tile"   they join the surviving display's tree as one cluster.
-displaced_windows = "float"
+displaced_windows = "spaces"
 
 # Modifier-drag: hold a modifier and drag anywhere in a window to move or resize
 # it, rather than aiming for its title bar or its edge.
@@ -451,6 +464,8 @@ comb1 = "Alt + Shift"
 
 # Commands
 # - toggle_space_activated
+# - restore_departure_layout (put this desktop's layout back the way it was
+#   when a display last departed; see displaced_windows = "spaces")
 # - reload_config
 # - next_workspace / prev_workspace
 # - next_workspace = true|false (optional skip-empty override)

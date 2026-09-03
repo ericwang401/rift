@@ -142,6 +142,10 @@ pub enum ReactorCommand {
     CreateSpace,
     /// Destroy the active macOS space. Scripting addition only.
     DestroySpace,
+    /// Put the active macOS space's layout back the way it was when a display
+    /// last departed. In spaces mode a desktop rearranged while a display was
+    /// away keeps the rearrangement on replug; this undoes that on demand.
+    RestoreDepartureLayout,
     ToggleSpaceActivated,
     FocusWindow {
         window_id: WindowId,

@@ -416,9 +416,18 @@ unsafe impl Sync for Config {}
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplacedWindows {
+    /// They stay on their own desktops. Where every window and desktop was
+    /// is recorded when the display leaves; the survivor's merged windows
+    /// get a desktop made for them meanwhile; and when the display returns
+    /// the scripting addition puts everything back where the record has it
+    /// in one pass. Windows and desktops the user moved or made meanwhile
+    /// stay as they were left, and so does a desktop they rearranged;
+    /// `RestoreDepartureLayout` puts one back on demand. See
+    /// `actor::reactor::display_record`.
+    #[default]
+    Spaces,
     /// They float on the surviving display, leaving its layout as it was. A
     /// layout that lost its screen does not get to reshape one that did not.
-    #[default]
     Float,
     /// They are tiled into the surviving display's tree as one cluster.
     Tile,

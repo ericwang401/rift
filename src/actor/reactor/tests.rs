@@ -7589,6 +7589,9 @@ mod display_archive {
     /// non-default arrangement on the second.
     fn fixture() -> Fixture {
         let mut reactor = test_reactor();
+        // These tests were written for float mode; the ones for the default
+        // `spaces` mode set it themselves.
+        reactor.config.settings.displaced_windows = crate::common::config::DisplacedWindows::Float;
         // The second display also has a spare desktop, `space2_extra`, that is
         // never shown: rift lists workspaces for it but has no layout state.
         reactor.handle_event(space_state_event_with(
@@ -8066,6 +8069,765 @@ mod display_archive {
         }
         assert_eq!(test_layout(&mut f.reactor, space1(), screen1()).len(), 4);
         clear_overrides(&f.exiled_wsids);
+    }
+
+    #[test]
+    fn spaces_mode_is_the_default() {
+        assert_eq!(
+            crate::common::config::DisplacedWindows::default(),
+            crate::common::config::DisplacedWindows::Spaces
+        );
+    }
+
+    // ---- spaces mode: one record at departure, one reconciliation at return.
+    // Each test scripts what the window server does and asserts only the
+    // end state: every window on the desktop the record has for it, or where
+    // the user put it, desktops on their own display, layouts back.
+
+    fn spaces_fixture() -> Fixture {
+        let mut f = fixture();
+        f.reactor.config.settings.displaced_windows =
+            crate::common::config::DisplacedWindows::Spaces;
+        sa::set_available(true);
+        f
+    }
+
+    fn managed(displays: Vec<(&str, Vec<SpaceId>)>) {
+        crate::sys::screen::set_managed_display_spaces_override(Some(
+            displays
+                .into_iter()
+                .map(|(uuid, spaces)| crate::sys::screen::ManagedDisplaySpaces {
+                    display_uuid: uuid.to_string(),
+                    spaces,
+                })
+                .collect(),
+        ));
+    }
+
+    fn spaces_cleanup(f: &Fixture, extra: &[WindowServerId]) {
+        set_window_spaces_override(f.reactor.test_window_server_id(f.survivor), None);
+        for wsid in extra {
+            set_window_spaces_override(*wsid, None);
+        }
+        clear_overrides(&f.exiled_wsids);
+        crate::sys::screen::set_managed_display_spaces_override(None);
+        sa::set_next_created_space(None);
+        sa::set_available(false);
+    }
+
+    /// The main display departs: macOS hands its desktops to the survivor,
+    /// destroys the survivor's own desktop and merges its window in among
+    /// the visitors. `windows` is where the window server has every window
+    /// as the change is seen.
+    /// `live` is what the window server lists for the survivor once the
+    /// addition has made whatever it makes.
+    fn takeover(
+        f: &mut Fixture,
+        survivor_desktops: Vec<SpaceId>,
+        live: Vec<SpaceId>,
+        windows: Vec<(WindowServerId, SpaceId)>,
+    ) {
+        managed(vec![("test-display-0", live)]);
+        let mut screens = make_screen_snapshots(vec![screen1()], vec![Some(space2())]);
+        screens[0].display_uuid = "test-display-0".to_string();
+        for (wsid, space) in &windows {
+            set_window_spaces(&[*wsid], *space);
+        }
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1()],
+            vec![Some(space2())],
+            move |state| {
+                state.screens = screens;
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                state.display_space_ids.insert("test-display-0".to_string(), survivor_desktops);
+                for (wsid, space) in windows {
+                    state.active_window_spaces.insert(wsid, space);
+                }
+            },
+        ));
+    }
+
+    /// The main display returns. `laptop` and `lg` are what the window
+    /// server lists for each, `shown` what each shows, `windows` where it
+    /// has every window.
+    fn replug_after_takeover(
+        f: &mut Fixture,
+        laptop: Vec<SpaceId>,
+        lg: Vec<SpaceId>,
+        shown: (SpaceId, SpaceId),
+        windows: Vec<(WindowServerId, SpaceId)>,
+    ) {
+        managed(vec![("test-display-0", laptop.clone()), (DISPLAY2, lg.clone())]);
+        for (wsid, space) in &windows {
+            set_window_spaces(&[*wsid], *space);
+        }
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(shown.0), Some(shown.1)],
+            move |state| {
+                state.has_seen_display_set = true;
+                state.display_set_changed = true;
+                state.topology_changed = true;
+                state.should_force_refresh_layout = true;
+                state.display_space_ids.insert("test-display-0".to_string(), laptop);
+                state.display_space_ids.insert(DISPLAY2.to_string(), lg);
+                for (wsid, space) in windows {
+                    state.active_window_spaces.insert(wsid, space);
+                }
+            },
+        ));
+    }
+
+    /// The window server reports every window where `windows` says.
+    fn land(f: &mut Fixture, shown: (SpaceId, SpaceId), windows: Vec<(WindowServerId, SpaceId)>) {
+        let before: Vec<(WindowServerId, Option<SpaceId>)> = windows
+            .iter()
+            .map(|(wsid, _)| {
+                let wid = f.reactor.state.windows.tracked_window_id(*wsid);
+                (
+                    *wsid,
+                    wid.and_then(|wid| f.reactor.assigned_space_for_window_id(wid)),
+                )
+            })
+            .collect();
+        for (wsid, space) in &windows {
+            set_window_spaces(&[*wsid], *space);
+        }
+        let moved = before
+            .into_iter()
+            .zip(windows.iter())
+            .filter_map(|((wsid, from), (_, to))| {
+                from.filter(|from| from != to).map(|from| (wsid, from, *to))
+            })
+            .collect();
+        f.reactor.handle_event(topology_event(
+            vec![screen1(), screen2()],
+            vec![Some(shown.0), Some(shown.1)],
+            moved,
+            windows,
+        ));
+    }
+
+    fn sorted_moves() -> Vec<(u32, u64)> {
+        let mut moves = sa::window_moves();
+        moves.sort_unstable();
+        moves
+    }
+
+    #[test]
+    fn spaces_mode_puts_a_destroyed_departed_desktop_back_on_replug() {
+        let mut f = spaces_fixture();
+        // The second display goes and macOS destroys its desktop outright,
+        // dumping its windows on the survivor.
+        unplug(&mut f);
+        assert!(
+            sa::window_moves().is_empty(),
+            "nothing is moved while the display is away"
+        );
+        assert!(f.reactor.display_archive.record().is_some());
+
+        // It comes back with a fresh desktop.
+        managed(vec![
+            ("test-display-0", vec![space1()]),
+            (DISPLAY2, vec![space2_returned()]),
+        ]);
+        replug(&mut f);
+        let expected: Vec<(u32, u64)> = f
+            .exiled_wsids
+            .iter()
+            .map(|wsid| (wsid.as_u32(), space2_returned().get()))
+            .collect();
+        assert_eq!(
+            sorted_moves(),
+            expected,
+            "every exiled window is sent to the fresh desktop"
+        );
+
+        windows_land(&mut f);
+        assert!(f.reactor.display_archive.is_empty());
+        for wid in &f.exiled {
+            assert_eq!(
+                f.reactor.assigned_space_for_window_id(*wid),
+                Some(space2_returned())
+            );
+        }
+        assert_eq!(
+            f.reactor.assigned_space_for_window_id(f.survivor),
+            Some(space1())
+        );
+        assert_eq!(
+            test_layout(&mut f.reactor, space2_returned(), screen2()),
+            f.layout_before,
+            "the departed display's layout is back on its fresh desktop"
+        );
+        spaces_cleanup(&f, &[]);
+    }
+
+    #[test]
+    fn spaces_mode_puts_the_survivors_window_back_after_a_takeover() {
+        let mut f = spaces_fixture();
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let survivor_layout = test_layout(&mut f.reactor, space1(), screen1());
+        let made = SpaceId::new(23);
+        sa::set_next_created_space(Some(made.get()));
+
+        // The churn merges the survivor's window into the main space before
+        // the display change is seen, and rift follows it.
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        let merged: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        takeover(
+            &mut f,
+            vec![space2(), space2_extra()],
+            vec![space2(), space2_extra(), made],
+            merged.clone(),
+        );
+
+        // Settled: a desktop made for the survivor's window, put first with
+        // the visitors walked behind it, the window sent there, and the
+        // survivor switched to it, since that is what it was showing.
+        assert_eq!(
+            sa::space_creations(),
+            vec![space2_extra().get()],
+            "made after the last visitor"
+        );
+        assert_eq!(sa::window_moves(), vec![(survivor_wsid.as_u32(), made.get())]);
+        assert_eq!(
+            sa::space_moves(),
+            vec![
+                (space2().get(), made.get()),
+                (space2_extra().get(), space2().get())
+            ],
+            "the visitors are walked behind the made desktop, in order"
+        );
+        assert_eq!(sa::space_focuses(), vec![made.get()]);
+        for wid in &f.exiled {
+            assert_eq!(
+                f.reactor.assigned_space_for_window_id(*wid),
+                Some(space2()),
+                "the visitors keep their desktop"
+            );
+        }
+        // The window arrives; the destroyed desktop's tree is put back on
+        // the made one.
+        set_window_spaces(&[survivor_wsid], made);
+        let on_made: Vec<_> = std::iter::once((survivor_wsid, made))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        f.reactor.handle_event(topology_event(
+            vec![screen1()],
+            vec![Some(made)],
+            vec![(survivor_wsid, space2(), made)],
+            on_made,
+        ));
+        assert!(
+            f.reactor.display_archive.record().is_some(),
+            "the record lives on while the display is away"
+        );
+        assert_eq!(f.reactor.assigned_space_for_window_id(f.survivor), Some(made));
+        assert_eq!(
+            test_layout(&mut f.reactor, made, screen1()),
+            survivor_layout,
+            "the survivor's layout is on its made desktop"
+        );
+
+        // Back: macOS takes the made desktop along with the main display's
+        // and gives the survivor a fresh one; the main display comes back
+        // showing a different desktop than it left on — the made one, first
+        // in the list it took along — and the switch back that rift orders
+        // has not landed by the time the return is over.
+        let fresh = SpaceId::new(13);
+        crate::sys::screen::set_current_space_override(DISPLAY2, Some(made.get()));
+        let moves_before = sa::window_moves().len();
+        let focuses_before = sa::space_focuses().len();
+        let space_moves_before = sa::space_moves().len();
+        let back: Vec<_> = std::iter::once((survivor_wsid, made))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        replug_after_takeover(
+            &mut f,
+            vec![fresh],
+            vec![space2(), space2_extra(), made],
+            (fresh, space2_extra()),
+            back,
+        );
+        assert_eq!(
+            &sa::window_moves()[moves_before..],
+            &[(survivor_wsid.as_u32(), fresh.get())],
+            "only the survivor's window moves, to the fresh desktop"
+        );
+        assert_eq!(
+            sa::space_moves().len(),
+            space_moves_before,
+            "the made desktop is not mistaken for one of the user's"
+        );
+        assert!(
+            sa::space_focuses()[focuses_before..].contains(&space2().get()),
+            "the main display is switched back to the desktop it was showing"
+        );
+
+        let landed: Vec<_> = std::iter::once((survivor_wsid, fresh))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        land(&mut f, (fresh, space2()), landed);
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(f.reactor.assigned_space_for_window_id(f.survivor), Some(fresh));
+        assert_eq!(
+            test_layout(&mut f.reactor, fresh, screen1()),
+            survivor_layout,
+            "the destroyed desktop's layout is on the fresh one"
+        );
+        assert_eq!(
+            test_layout(&mut f.reactor, space2(), screen2()),
+            f.layout_before,
+            "the main display's layout is intact"
+        );
+        assert!(
+            sa::space_destroys().is_empty(),
+            "the made desktop is not destroyed while the main display still shows it"
+        );
+        // The switch lands; the next space change retires it.
+        crate::sys::screen::set_current_space_override(DISPLAY2, None);
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(fresh), Some(space2())],
+            |state| {
+                state.has_seen_display_set = true;
+            },
+        ));
+        assert_eq!(
+            sa::space_destroys(),
+            vec![made.get()],
+            "the made desktop is destroyed once nothing shows it"
+        );
+        spaces_cleanup(&f, &[]);
+    }
+
+    #[test]
+    fn spaces_mode_restores_the_layout_of_a_window_macos_put_back_itself() {
+        let mut f = spaces_fixture();
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let survivor_layout = test_layout(&mut f.reactor, space1(), screen1());
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        let merged: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        takeover(
+            &mut f,
+            vec![space2(), space2_extra()],
+            vec![space2(), space2_extra()],
+            merged,
+        );
+
+        // Back: the window is already on the fresh desktop, and rift has
+        // already filed it under a workspace it made for that desktop.
+        let fresh = SpaceId::new(13);
+        let workspace = f.reactor.test_workspace(fresh, 0);
+        assert!(f.reactor.assign_test_window_to_workspace(fresh, f.survivor, workspace));
+        let back: Vec<_> = std::iter::once((survivor_wsid, fresh))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        replug_after_takeover(
+            &mut f,
+            vec![fresh],
+            vec![space2(), space2_extra()],
+            (fresh, space2()),
+            back.clone(),
+        );
+        assert!(sa::window_moves().is_empty(), "nothing needs moving");
+        if !f.reactor.display_archive.is_empty() {
+            land(&mut f, (fresh, space2()), back);
+        }
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(f.reactor.assigned_space_for_window_id(f.survivor), Some(fresh));
+        assert_eq!(
+            test_layout(&mut f.reactor, fresh, screen1()),
+            survivor_layout,
+            "the destroyed desktop's layout is restored around the window macOS put back"
+        );
+        spaces_cleanup(&f, &[]);
+    }
+
+    /// A desktop the user rearranges while the display is away keeps the
+    /// arrangement when the display is back, scaled to that screen, while
+    /// an untouched desktop gets its tree from the record. The command puts
+    /// the tree from the departure back on demand.
+    #[test]
+    fn spaces_mode_keeps_a_desktop_rearranged_while_away_and_can_put_it_back() {
+        let mut f = spaces_fixture();
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        let merged: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        takeover(
+            &mut f,
+            vec![space2(), space2_extra()],
+            vec![space2(), space2_extra()],
+            merged,
+        );
+
+        // Shown on the laptop, the main display's desktop is rearranged:
+        // its first window is moved right, past the next of its own.
+        let survivor = f.survivor;
+        let order = move |layout: &[(WindowId, CGRect)]| -> Vec<WindowId> {
+            layout.iter().map(|(wid, _)| *wid).filter(|wid| *wid != survivor).collect()
+        };
+        let first = order(&f.layout_before)[0];
+        f.reactor.send_layout_event(LayoutEvent::WindowFocused(space2(), first));
+        let _ = f.reactor.layout_manager.layout_engine.handle_command(
+            &mut f.reactor.state.windows,
+            Some(space2()),
+            &[space2()],
+            &crate::common::collections::HashMap::default(),
+            LayoutCommand::MoveNode(Direction::Right),
+        );
+        let rearranged = order(&test_layout(&mut f.reactor, space2(), screen2()));
+        assert_ne!(
+            rearranged,
+            order(&f.layout_before),
+            "the rearrangement must change the order"
+        );
+
+        let fresh = SpaceId::new(13);
+        let now: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        replug_after_takeover(
+            &mut f,
+            vec![fresh],
+            vec![space2(), space2_extra()],
+            (fresh, space2()),
+            now,
+        );
+        let landed: Vec<_> = std::iter::once((survivor_wsid, fresh))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        land(&mut f, (fresh, space2()), landed);
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(
+            order(&test_layout(&mut f.reactor, space2(), screen2())),
+            rearranged,
+            "the rearranged desktop goes back to its display as the user left it"
+        );
+
+        // On demand, the tree from the departure is put back.
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(fresh), Some(space2())],
+            |state| {
+                state.has_seen_display_set = true;
+                state.command_space = Some(space2());
+            },
+        ));
+        f.reactor.handle_event(Event::Command(super::Command::Reactor(
+            super::ReactorCommand::RestoreDepartureLayout,
+        )));
+        assert_eq!(
+            test_layout(&mut f.reactor, space2(), screen2()),
+            f.layout_before,
+            "the departure's layout is back"
+        );
+        spaces_cleanup(&f, &[]);
+    }
+
+    #[test]
+    fn spaces_mode_leaves_a_window_where_the_user_put_it_while_away() {
+        let mut f = spaces_fixture();
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        let merged: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        takeover(
+            &mut f,
+            vec![space2(), space2_extra()],
+            vec![space2(), space2_extra()],
+            merged,
+        );
+
+        // Well after the churn, the user drags one of the visitors to the
+        // other visiting desktop.
+        let moved = f.exiled[0];
+        let moved_wsid = f.exiled_wsids[0];
+        f.reactor
+            .display_archive
+            .record_mut()
+            .unwrap()
+            .backdate(std::time::Duration::from_secs(30));
+        set_window_spaces(&[moved_wsid], space2_extra());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            moved_wsid,
+            space2_extra(),
+            SpaceEventKind::User,
+        ));
+        assert_eq!(
+            f.reactor.display_archive.record().unwrap().recorded_desktop(moved),
+            Some(space2_extra()),
+            "the record follows the user"
+        );
+
+        let fresh = SpaceId::new(13);
+        let now: Vec<_> = [(survivor_wsid, space2()), (moved_wsid, space2_extra())]
+            .into_iter()
+            .chain(f.exiled_wsids[1..].iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        replug_after_takeover(
+            &mut f,
+            vec![fresh],
+            vec![space2(), space2_extra()],
+            (fresh, space2()),
+            now.clone(),
+        );
+        assert_eq!(
+            sa::window_moves(),
+            vec![(survivor_wsid.as_u32(), fresh.get())],
+            "the window the user moved is left where it is"
+        );
+
+        let landed: Vec<_> = now
+            .into_iter()
+            .map(|(wsid, space)| {
+                if wsid == survivor_wsid {
+                    (wsid, fresh)
+                } else {
+                    (wsid, space)
+                }
+            })
+            .collect();
+        land(&mut f, (fresh, space2()), landed);
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(
+            f.reactor.assigned_space_for_window_id(moved),
+            Some(space2_extra())
+        );
+        spaces_cleanup(&f, &[]);
+    }
+
+    /// With two desktops on the survivor, macOS destroys the *first* and
+    /// carries the second along; on replug it lists the fresh one first,
+    /// may bring the display back showing the kept one, sends the kept one
+    /// along with the main display, dumps the kept desktop's window on one
+    /// of the main display's, and puts the destroyed desktop's window on
+    /// the fresh one itself. All of it is put right.
+    #[test]
+    fn spaces_mode_puts_a_kept_desktop_and_its_window_back_however_macos_scattered_them() {
+        let mut f = spaces_fixture();
+        let extra = SpaceId::new(15);
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        let survivor_layout = test_layout(&mut f.reactor, space1(), screen1());
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1(), screen2()],
+            vec![Some(extra), Some(space2())],
+            |state| {
+                state.has_seen_display_set = true;
+                state
+                    .display_space_ids
+                    .insert("test-display-0".to_string(), vec![space1(), extra]);
+                state
+                    .display_space_ids
+                    .insert(DISPLAY2.to_string(), vec![space2(), space2_extra()]);
+                state.last_user_space_by_display.insert("test-display-0".to_string(), extra);
+            },
+        ));
+        let kept_window = WindowId::new(1, 9);
+        let kept_wsid = WindowServerId::new(109);
+        f.reactor.add_test_window(
+            kept_window,
+            kept_wsid,
+            Some(extra),
+            CGRect::new(CGPoint::new(20., 20.), CGSize::new(600., 400.)),
+        );
+        let kept_workspace = f.reactor.test_workspace(extra, 0);
+        assert!(f.reactor.assign_test_window_to_workspace(extra, kept_window, kept_workspace));
+        f.reactor.send_layout_event(LayoutEvent::WindowAdded(extra, kept_window));
+
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        let merged: Vec<_> = [(survivor_wsid, space2()), (kept_wsid, extra)]
+            .into_iter()
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        takeover(
+            &mut f,
+            vec![space2(), space2_extra(), extra],
+            vec![space2(), space2_extra(), extra],
+            merged,
+        );
+        assert!(
+            sa::window_moves().is_empty(),
+            "the survivor's window stays put while the display is away"
+        );
+        assert_eq!(
+            sa::space_moves(),
+            vec![
+                (space2().get(), extra.get()),
+                (space2_extra().get(), space2().get())
+            ],
+            "the kept desktop is put ahead of the visitors"
+        );
+        let space_moves_before = sa::space_moves().len();
+
+        let fresh = SpaceId::new(17);
+        let scattered: Vec<_> = [(survivor_wsid, fresh), (kept_wsid, space2_extra())]
+            .into_iter()
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        replug_after_takeover(
+            &mut f,
+            vec![fresh],
+            vec![space2(), space2_extra(), extra],
+            (fresh, space2()),
+            scattered,
+        );
+        assert_eq!(
+            &sa::space_moves()[space_moves_before..],
+            &[(extra.get(), fresh.get())],
+            "the kept desktop comes back behind the fresh one"
+        );
+        assert_eq!(
+            sa::window_moves(),
+            vec![(kept_wsid.as_u32(), extra.get())],
+            "the dumped window goes back; the one macOS put on the fresh desktop is not sent again"
+        );
+        assert!(
+            sa::space_focuses().contains(&extra.get()),
+            "the survivor is switched back to the desktop it was showing"
+        );
+
+        let landed: Vec<_> = [(survivor_wsid, fresh), (kept_wsid, extra)]
+            .into_iter()
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        land(&mut f, (fresh, space2()), landed);
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(f.reactor.assigned_space_for_window_id(f.survivor), Some(fresh));
+        assert_eq!(f.reactor.assigned_space_for_window_id(kept_window), Some(extra));
+        assert_eq!(test_layout(&mut f.reactor, fresh, screen1()), survivor_layout);
+        assert!(has_window_in_layout(
+            &mut f.reactor,
+            extra,
+            screen1(),
+            kept_window
+        ));
+        assert_eq!(test_layout(&mut f.reactor, space2(), screen2()), f.layout_before);
+        spaces_cleanup(&f, &[kept_wsid]);
+    }
+
+    #[test]
+    fn spaces_mode_brings_a_desktop_made_while_away_back_to_the_survivor() {
+        let mut f = spaces_fixture();
+        let survivor_wsid = f.reactor.test_window_server_id(f.survivor);
+        set_window_spaces(&[survivor_wsid], space2());
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            survivor_wsid,
+            space2(),
+            SpaceEventKind::User,
+        ));
+        let merged: Vec<_> = std::iter::once((survivor_wsid, space2()))
+            .chain(f.exiled_wsids.iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        takeover(
+            &mut f,
+            vec![space2(), space2_extra()],
+            vec![space2(), space2_extra()],
+            merged,
+        );
+
+        // While away the user makes a desktop and puts a visitor on it.
+        let made = SpaceId::new(21);
+        f.reactor.handle_event(space_state_event_with(
+            vec![screen1()],
+            vec![Some(made)],
+            |state| {
+                state.has_seen_display_set = true;
+                state.display_space_ids.insert("test-display-0".to_string(), vec![
+                    space2(),
+                    space2_extra(),
+                    made,
+                ]);
+            },
+        ));
+        let moved = f.exiled[0];
+        let moved_wsid = f.exiled_wsids[0];
+        f.reactor
+            .display_archive
+            .record_mut()
+            .unwrap()
+            .backdate(std::time::Duration::from_secs(30));
+        set_window_spaces(&[moved_wsid], made);
+        f.reactor.handle_event(Event::WindowServerAppeared(
+            moved_wsid,
+            made,
+            SpaceEventKind::User,
+        ));
+
+        // Back: macOS files the made desktop with the main display's.
+        let fresh = SpaceId::new(13);
+        let now: Vec<_> = [(survivor_wsid, space2()), (moved_wsid, made)]
+            .into_iter()
+            .chain(f.exiled_wsids[1..].iter().map(|wsid| (*wsid, space2())))
+            .collect();
+        replug_after_takeover(
+            &mut f,
+            vec![fresh],
+            vec![space2(), space2_extra(), made],
+            (fresh, space2()),
+            now.clone(),
+        );
+        assert_eq!(
+            sa::space_moves(),
+            vec![(made.get(), fresh.get())],
+            "the made desktop is the survivor's"
+        );
+        assert_eq!(
+            sa::window_moves(),
+            vec![(survivor_wsid.as_u32(), fresh.get())],
+            "the window on it stays on it"
+        );
+
+        let landed: Vec<_> = now
+            .into_iter()
+            .map(|(wsid, space)| {
+                if wsid == survivor_wsid {
+                    (wsid, fresh)
+                } else {
+                    (wsid, space)
+                }
+            })
+            .collect();
+        land(&mut f, (fresh, space2()), landed);
+        assert!(f.reactor.display_archive.is_empty());
+        assert_eq!(f.reactor.assigned_space_for_window_id(moved), Some(made));
+        spaces_cleanup(&f, &[]);
     }
 
     #[test]

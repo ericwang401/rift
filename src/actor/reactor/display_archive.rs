@@ -13,13 +13,18 @@
 //!
 //! The archive answers both. When a display departs, its layout is snapshotted
 //! (the same serialization the master file uses, kept in memory) together with
-//! the windows that were on it; those windows are then left to land on the
-//! surviving display as floats (or, with `displaced_windows = "tile"`, as one
-//! cluster in that tree). When a display with the same UUID reappears, the old
-//! space's workspaces are remapped onto the new space id, the exiled windows
-//! are moved home through the scripting addition, and once they have landed
-//! the snapshot is restored onto the new space. Anything that never lands —
-//! closed in the meantime, or no scripting addition — is simply left out.
+//! the windows that were on it. What happens to those windows meanwhile is
+//! `displaced_windows`. The default, `"spaces"`, leaves them on their own
+//! desktops: when the departed display was the main one macOS carries its
+//! desktops over to the survivor, trees and all, and they are simply shown
+//! there; a desktop macOS destroyed instead has its windows join the
+//! survivor's tree as one cluster. `"float"` sends them onto the survivor's
+//! own desktop as floats, and `"tile"` clusters them into its tree. When a
+//! display with the same UUID reappears, the old space's workspaces are
+//! remapped onto the new space id, the exiled windows are moved home through
+//! the scripting addition, and once they have landed the snapshot is restored
+//! onto the new space. Anything that never lands — closed in the meantime, or
+//! no scripting addition — is simply left out.
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +58,15 @@ pub(super) struct DisplayArchive {
     /// The layout as it was just before the window server started moving
     /// windows between spaces on its own. See `capture_pre_churn_layout`.
     pre_churn: Option<PreChurn>,
+    /// Spaces mode: where everything was at departure, reconciled at
+    /// return. See `display_record`.
+    pub(super) record: Option<super::display_record::DisplayRecord>,
+    /// Desktops rift made that could not be destroyed yet because a display
+    /// was still showing them, with when they were first tried.
+    pub(super) retiring: Vec<(SpaceId, Instant)>,
+    /// The last record's layout, kept after its return for
+    /// `RestoreDepartureLayout`.
+    pub(super) last_departure: Option<super::display_record::DepartureSnapshot>,
 }
 
 /// The window server starts moving windows the moment a display goes, and
@@ -65,10 +79,10 @@ pub(super) struct DisplayArchive {
 /// as the start of a churn, and the layout is snapshotted before it happens.
 /// If a display change follows within the TTL, that snapshot is the one
 /// worth keeping.
-struct PreChurn {
-    layout: String,
+pub(super) struct PreChurn {
+    pub(super) layout: String,
     /// The windows of every space, in layout order, as the trees had them.
-    members: HashMap<SpaceId, Vec<WindowId>>,
+    pub(super) members: HashMap<SpaceId, Vec<WindowId>>,
     taken: Instant,
 }
 
@@ -91,9 +105,16 @@ pub(super) struct ArchivedDisplay {
     /// display's: its layout waits here until that display is back, because
     /// only then does the survivor get a space of its own again.
     waiting_for: Option<String>,
+    /// The display's desktops when it departed. What it comes back with
+    /// beyond these — the survivor's own desktops, kept or made while the
+    /// display was away, that macOS filed with it — goes back to the
+    /// survivor; and a window of this display that turns up on a desktop
+    /// outside these while it is away has been moved there by the user.
+    desktops: Vec<SpaceId>,
     homing: Option<Homing>,
 }
 
+#[derive(Clone)]
 struct ExiledWindow {
     wid: WindowId,
     wsid: Option<WindowServerId>,
@@ -104,16 +125,26 @@ struct ExiledWindow {
 
 struct Homing {
     space: SpaceId,
-    /// Windows asked to move home that the window server has not yet reported
-    /// on the new space.
-    waiting: HashSet<WindowId>,
+    /// The space the snapshot has the layout under.
+    from: SpaceId,
+    /// Windows asked to move home, each with the space it was sent to, that
+    /// the window server has not yet reported there.
+    waiting: HashMap<WindowId, SpaceId>,
     started: Instant,
 }
 
 impl DisplayArchive {
-    pub(super) fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub(super) fn is_empty(&self) -> bool { self.entries.is_empty() && self.record.is_none() }
 
     pub(super) fn has(&self, display_uuid: &str) -> bool { self.entries.contains_key(display_uuid) }
+
+    #[cfg(test)]
+    pub(super) fn archived_windows(&self, display_uuid: &str) -> Vec<WindowId> {
+        self.entries
+            .get(display_uuid)
+            .map(|entry| entry.windows.iter().map(|window| window.wid).collect())
+            .unwrap_or_default()
+    }
 
     pub(super) fn is_homing(&self, display_uuid: &str) -> bool {
         self.entries.get(display_uuid).is_some_and(|entry| entry.homing.is_some())
@@ -125,8 +156,8 @@ impl DisplayArchive {
         self.entries
             .values()
             .filter_map(|entry| entry.homing.as_ref())
-            .find(|homing| homing.waiting.contains(&wid))
-            .map(|homing| homing.space)
+            .find_map(|homing| homing.waiting.get(&wid).copied())
+            .or_else(|| self.record.as_ref().and_then(|record| record.destination(wid)))
     }
 
     /// A stay-behind archive is only actionable once the display it waits
@@ -138,11 +169,21 @@ impl DisplayArchive {
             .is_none_or(|waited| screens.iter().any(|screen| screen.display_uuid == waited))
     }
 
-    fn fresh_pre_churn(&self) -> Option<&PreChurn> {
+    pub(super) fn fresh_pre_churn(&self) -> Option<&PreChurn> {
         self.pre_churn.as_ref().filter(|pre| pre.taken.elapsed() < PRE_CHURN_TTL)
     }
 
     fn any_homing(&self) -> bool { self.entries.values().any(|entry| entry.homing.is_some()) }
+
+    #[cfg(test)]
+    pub(super) fn record(&self) -> Option<&super::display_record::DisplayRecord> {
+        self.record.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_mut(&mut self) -> Option<&mut super::display_record::DisplayRecord> {
+        self.record.as_mut()
+    }
 }
 
 /// Fallback `cgdisplay-N` ids are not identities: N is reassigned on every
@@ -216,7 +257,7 @@ impl Reactor {
             return;
         }
         let engine = &mut self.layout_manager.layout_engine;
-        let members = engine
+        let members: HashMap<SpaceId, Vec<WindowId>> = engine
             .virtual_workspace_manager()
             .initialized_spaces()
             .into_iter()
@@ -224,6 +265,7 @@ impl Reactor {
             .collect();
         match engine.snapshot_current_layout_lightly(&self.state.windows) {
             Ok(layout) => {
+                crate::sys::trace::act("pre_churn", &members.len());
                 self.display_archive.pre_churn = Some(PreChurn {
                     layout,
                     members,
@@ -240,12 +282,22 @@ impl Reactor {
     fn windows_belonging_to_space(&self, space: SpaceId) -> Vec<ExiledWindow> {
         let engine = &self.layout_manager.layout_engine;
         let mut wids = engine.windows_on_space_in_layout_order(space);
-        if let Some(pre) = self.display_archive.fresh_pre_churn()
-            && let Some(members) = pre.members.get(&space)
-        {
-            let carried: Vec<WindowId> =
-                members.iter().copied().filter(|wid| !wids.contains(wid)).collect();
-            wids.extend(carried);
+        if let Some(pre) = self.display_archive.fresh_pre_churn() {
+            // The churn moves windows both ways: this space's own out, and
+            // the other display's in. A window the snapshot had on some
+            // other space is one the churn brought here — the survivor's,
+            // merged into a visitor's desktop — and is not this space's to
+            // archive or to bring back later.
+            wids.retain(|wid| {
+                !pre.members
+                    .iter()
+                    .any(|(other, members)| *other != space && members.contains(wid))
+            });
+            if let Some(members) = pre.members.get(&space) {
+                let carried: Vec<WindowId> =
+                    members.iter().copied().filter(|wid| !wids.contains(wid)).collect();
+                wids.extend(carried);
+            }
         }
         wids.into_iter()
             .filter_map(|wid| {
@@ -279,11 +331,25 @@ impl Reactor {
         active_displays: &[String],
         screens: &[ScreenInfo],
         display_space_ids: &HashMap<String, Vec<SpaceId>>,
-    ) {
+    ) -> EventOutcome {
+        let mut outcome = EventOutcome::default();
         if !self.display_archive_enabled() {
-            return;
+            return outcome;
         }
         let departed = self.layout_manager.layout_engine.departed_displays(active_displays);
+        if self.config.settings.displaced_windows == DisplacedWindows::Spaces {
+            let departed: Vec<String> = departed
+                .into_iter()
+                .map(|(uuid, _)| uuid)
+                .filter(|uuid| is_stable_display_uuid(uuid))
+                .collect();
+            if !departed.is_empty() {
+                self.record_departure(departed);
+                outcome.absorb(self.settle_after_departure());
+            }
+            self.display_archive.pre_churn = None;
+            return outcome;
+        }
         for (uuid, space) in departed {
             if !is_stable_display_uuid(&uuid) {
                 continue;
@@ -299,13 +365,18 @@ impl Reactor {
                 .find(|screen| screen.space == Some(space))
                 .map(|screen| screen.display_uuid.clone());
             if let Some(survivor) = &taken_over_by {
-                self.archive_survivors_lost_space(survivor, &uuid, display_space_ids);
+                outcome.absorb(self.archive_survivors_lost_space(
+                    survivor,
+                    &uuid,
+                    display_space_ids,
+                ));
             }
             self.archive_display(uuid, space, taken_over_by, display_space_ids);
         }
         // Whatever was captured has served its purpose; the next churn gets
         // its own.
         self.display_archive.pre_churn = None;
+        outcome
     }
 
     fn archive_display(
@@ -315,7 +386,19 @@ impl Reactor {
         taken_over_by: Option<String>,
         display_space_ids: &HashMap<String, Vec<SpaceId>>,
     ) {
-        let windows = self.windows_belonging_to_space(space);
+        // The survivor's own windows may already have been merged into this
+        // space by the takeover, and the survivor's archive (made just
+        // before) holds them. They are its, not this display's: claimed here
+        // too, the return trip would carry them off to the other display.
+        let claimed: HashSet<WindowId> = self
+            .display_archive
+            .entries
+            .iter()
+            .filter(|(other, _)| **other != uuid)
+            .flat_map(|(_, entry)| entry.windows.iter().map(|window| window.wid))
+            .collect();
+        let mut windows = self.windows_belonging_to_space(space);
+        windows.retain(|window| !claimed.contains(&window.wid));
 
         if let Some(existing) = self.display_archive.entries.get_mut(&uuid) {
             // The display left again mid-return. The snapshot from its first
@@ -328,6 +411,8 @@ impl Reactor {
             existing.settled = false;
             existing.parked_on = None;
             existing.waiting_for = None;
+            existing.desktops =
+                self.space_state.display_space_ids.get(&uuid).cloned().unwrap_or_default();
             for window in windows {
                 if !existing.windows.iter().any(|known| known.wid == window.wid) {
                     existing.windows.push(window);
@@ -362,6 +447,7 @@ impl Reactor {
             settled: false,
             parked_on: None,
             waiting_for: None,
+            desktops: self.space_state.display_space_ids.get(&uuid).cloned().unwrap_or_default(),
             homing: None,
         });
         match taken_over_by {
@@ -372,38 +458,77 @@ impl Reactor {
         }
     }
 
-    /// When the survivor inherits the departed display's space, macOS may
-    /// destroy the survivor's own space outright and merge its windows into
-    /// the inherited one — so they would ride back to the other display on
-    /// replug. Archive the survivor's layout under the survivor's own UUID,
-    /// to be restored onto whatever space it is given once the departed
+    /// When the survivor inherits the departed display's space, macOS
+    /// destroys the survivor's own space outright and merges its windows
+    /// into the inherited one — so they would ride back to the other display
+    /// on replug. Archive the survivor's layout under the survivor's own
+    /// UUID, to be restored onto whatever space it is given once the departed
     /// display has taken its space back.
+    ///
+    /// Nothing is done meanwhile, on purpose. The window server is what
+    /// reshuffles the desktops on both unplug and replug, and everything rift
+    /// did in between — a desktop of its own for the survivor, windows moved
+    /// back mid-churn — it undid or moved along with the visitors on replug,
+    /// while every desktop operation asked of Dock during the reshuffle was a
+    /// chance to take Dock down. One pass at replug, once the topology is
+    /// quiet, puts everything where it belongs.
     fn archive_survivors_lost_space(
         &mut self,
         survivor: &str,
         departed: &str,
         new_display_space_ids: &HashMap<String, Vec<SpaceId>>,
-    ) {
-        let Some(lost) = self
+    ) -> EventOutcome {
+        let outcome = EventOutcome::default();
+        if self.display_archive.entries.contains_key(survivor) {
+            return outcome;
+        }
+        // macOS destroys the survivor's *first* desktop in the takeover, not
+        // necessarily the one it is showing; any others it had are carried
+        // along behind the visitors. Every desktop that was the survivor's
+        // and is now listed nowhere is gone; the one shown is preferred when
+        // several are, and the rest are noted, since one entry per display
+        // is all the archive holds.
+        let shown = self
             .space_state
             .screens
             .iter()
             .find(|screen| screen.display_uuid == survivor)
-            .and_then(|screen| screen.space)
-        else {
-            return;
+            .and_then(|screen| screen.space);
+        let still_listed = |space: &SpaceId| {
+            new_display_space_ids.values().flatten().any(|listed| listed == space)
         };
-        if new_display_space_ids.values().flatten().any(|space| *space == lost)
-            || self.display_archive.entries.contains_key(survivor)
-        {
-            return;
+        let mut vanished: Vec<SpaceId> = self
+            .space_state
+            .display_space_ids
+            .get(survivor)
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(shown)
+            .filter(|space| !still_listed(space))
+            .collect();
+        vanished.dedup();
+        let Some(lost) = shown
+            .filter(|space| vanished.contains(space))
+            .or_else(|| vanished.first().copied())
+        else {
+            return outcome;
+        };
+        if vanished.len() > 1 {
+            warn!(
+                %survivor,
+                ?vanished,
+                kept = lost.get(),
+                "Several of the survivor's desktops were destroyed; only one is archived"
+            );
         }
         let windows = self.windows_belonging_to_space(lost);
+
         let snapshot = match self.snapshot_for_departure(lost) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(%survivor, space = lost.get(), %error, "Could not snapshot the survivor's layout");
-                return;
+                return outcome;
             }
         };
         info!(
@@ -420,8 +545,20 @@ impl Reactor {
             settled: true,
             parked_on: None,
             waiting_for: Some(departed.to_string()),
+            desktops: self.space_state.display_space_ids.get(survivor).cloned().unwrap_or_default(),
             homing: None,
         });
+        outcome
+    }
+
+    /// Each display's desktops as the window server lists them now, falling
+    /// back to the last snapshot. The snapshot can be a reshuffle behind —
+    /// listing a desktop destroyed a moment ago, or not yet the one just made
+    /// — and asking Dock to move a desktop it no longer knows took Dock down.
+    pub(super) fn display_space_ids_now(&self) -> HashMap<String, Vec<SpaceId>> {
+        let mut now = self.space_state.display_space_ids.clone();
+        now.extend(crate::sys::screen::managed_display_space_ids());
+        now
     }
 
     /// The space a surviving display should go back to when it has been
@@ -457,11 +594,14 @@ impl Reactor {
     }
 
     /// Another display has inherited the departed display's space, tree and
-    /// all, squeezed onto its screen — the one thing the archive exists to
-    /// prevent. Send the departed display's windows to the survivor's own
-    /// space as floats and switch the survivor back to it, so it shows the
-    /// layout it had with the visitors floating over it. Both moves need the
-    /// scripting addition; without it the takeover is left as macOS made it.
+    /// all, squeezed onto its screen. In `spaces` mode that is the point:
+    /// the desktop keeps its windows and its tree, laid out for the screen
+    /// it is on, and the snapshot puts the ratios back on return. In `float`
+    /// mode it is the one thing the archive exists to prevent: send the
+    /// departed display's windows to the survivor's own space as floats and
+    /// switch the survivor back to it, so it shows the layout it had with
+    /// the visitors floating over it. Both moves need the scripting
+    /// addition; without it the takeover is left as macOS made it.
     fn evict_from_taken_over_space(
         &mut self,
         uuid: &str,
@@ -469,8 +609,18 @@ impl Reactor {
         survivor: &str,
         display_space_ids: &HashMap<String, Vec<SpaceId>>,
     ) {
-        if self.config.settings.displaced_windows != DisplacedWindows::Float {
-            return;
+        match self.config.settings.displaced_windows {
+            DisplacedWindows::Float => {}
+            DisplacedWindows::Spaces => {
+                info!(
+                    display = %uuid,
+                    %survivor,
+                    taken_over = taken_over.get(),
+                    "Space taken over by another display; its desktops stay as they are until it is back"
+                );
+                return;
+            }
+            DisplacedWindows::Tile => return,
         }
         let Some(parking) =
             self.takeover_parking_space(survivor, uuid, taken_over, display_space_ids)
@@ -546,10 +696,12 @@ impl Reactor {
 
     /// After a snapshot has been reconciled: in tile mode, gather each
     /// departed display's windows into one cluster of the tree they landed
-    /// in, once they have all landed.
+    /// in, once they have all landed. The same in spaces mode, for windows
+    /// whose desktop macOS destroyed: ones still on their own desktop are
+    /// still assigned to the archived space, so they never get here.
     pub(super) fn settle_displaced_windows(&mut self) {
         if self.display_archive.is_empty()
-            || self.config.settings.displaced_windows != DisplacedWindows::Tile
+            || self.config.settings.displaced_windows == DisplacedWindows::Float
         {
             return;
         }
@@ -588,15 +740,26 @@ impl Reactor {
     /// display→space map is up to date. Starts the return trip for every
     /// archived display that is on screen again.
     pub(super) fn begin_display_homing(&mut self) -> EventOutcome {
-        let mut outcome = EventOutcome::default();
+        self.retire_made_desktops();
+        let mut outcome = self.reconcile_record();
         if self.display_archive.is_empty() {
             return outcome;
         }
-        let returned: Vec<(String, SpaceId)> = self
+        let on_screen: Vec<(String, SpaceId)> = self
             .space_state
             .screens
             .iter()
             .filter_map(|screen| Some((screen.display_uuid.clone(), screen.space?)))
+            .collect();
+        // Whatever else a display is waiting on, desktops of its own that
+        // went with another display come back as soon as it is on screen.
+        for (uuid, _) in &on_screen {
+            if self.display_archive.has(uuid) {
+                self.reclaim_stray_desktops(uuid);
+            }
+        }
+        let returned: Vec<(String, SpaceId)> = on_screen
+            .into_iter()
             .filter(|(uuid, _)| {
                 self.display_archive.has(uuid)
                     && !self.display_archive.is_homing(uuid)
@@ -610,20 +773,132 @@ impl Reactor {
             // the windows go there and the display is switched to it.
             let target = self.homing_target(&uuid, shown);
             outcome.absorb(self.home_display(&uuid, target));
-            if target != shown
-                && self.display_archive.is_homing(&uuid)
-                && !scripting_addition::focus_space(target.get())
-            {
+            // Whether the return trip is still in flight or was over at once
+            // (nothing to move), the display belongs on the desktop its
+            // layout lives on, not on whatever macOS handed it.
+            if target != shown && !scripting_addition::focus_space(target.get()) {
                 warn!(display = %uuid, space = target.get(), "Could not switch the returned display to its restored desktop");
             }
         }
         outcome
     }
 
+    /// Whatever a returning display comes back with beyond the desktops it
+    /// left with is the survivor's — desktops it kept through the takeover,
+    /// or made while the display was away — that macOS filed with the
+    /// visitors and took along. Send them back, in order, behind the desktop
+    /// the survivor is showing; the windows on them come along.
+    fn reclaim_stray_desktops(&mut self, uuid: &str) {
+        let Some(entry) = self.display_archive.entries.get(uuid) else {
+            return;
+        };
+        // Only a departed display come back has strays; a survivor's entry
+        // lists the desktops it lost, and everything it shows now is new.
+        if entry.waiting_for.is_some() {
+            return;
+        }
+        let listed = self.display_space_ids_now().remove(uuid).unwrap_or_default();
+        let strays: Vec<SpaceId> =
+            listed.into_iter().filter(|space| !entry.desktops.contains(space)).collect();
+        if strays.is_empty() {
+            return;
+        }
+        // The survivor: the display waiting for this one, else whichever
+        // other display is on screen.
+        let survivor = self
+            .display_archive
+            .entries
+            .iter()
+            .find(|(_, other)| other.waiting_for.as_deref() == Some(uuid))
+            .map(|(other, _)| other.clone())
+            .or_else(|| {
+                self.space_state
+                    .screens
+                    .iter()
+                    .find(|screen| screen.display_uuid != uuid)
+                    .map(|screen| screen.display_uuid.clone())
+            });
+        let Some(anchor) = survivor.and_then(|survivor| {
+            self.space_state
+                .screens
+                .iter()
+                .find(|screen| screen.display_uuid == survivor)
+                .and_then(|screen| screen.space)
+        }) else {
+            debug!(display = %uuid, ?strays, "Stray desktops, but no other display to send them to");
+            return;
+        };
+        if !scripting_addition::is_available() {
+            warn!(display = %uuid, ?strays, "The other display's desktops came back with this one; sending them back needs the scripting addition");
+            return;
+        }
+        let mut previous = anchor;
+        for space in strays {
+            if scripting_addition::move_space_after_space(space.get(), previous.get(), false) {
+                info!(display = %uuid, desktop = space.get(), "Sent a desktop back to the display it belongs to");
+                previous = space;
+            } else {
+                warn!(display = %uuid, desktop = space.get(), "Could not send a desktop back");
+            }
+        }
+    }
+
+    /// A window of a departed display has turned up on a desktop that was
+    /// not that display's: the user moved it there — Mission Control, a
+    /// drag — while the display was away. It is theirs to place; the return
+    /// trip must not take it back. (rift's own moves happen under homing,
+    /// which is skipped here; and the survivor's windows, merged into the
+    /// visitors' desktops by the takeover, are held by an entry that waits
+    /// for another display, also skipped.)
+    pub(super) fn note_window_appeared_while_away(&mut self, wid: WindowId, space: SpaceId) {
+        let on_screen: Vec<String> = self
+            .space_state
+            .screens
+            .iter()
+            .map(|screen| screen.display_uuid.clone())
+            .collect();
+        let listed = self.space_state.display_space_ids.values().flatten().any(|s| *s == space);
+        if !listed {
+            return;
+        }
+        self.note_window_placed_while_away(wid, space);
+        let mut adopted = Vec::new();
+        for (uuid, entry) in self.display_archive.entries.iter_mut() {
+            if entry.homing.is_some()
+                || entry.waiting_for.is_some()
+                || on_screen.contains(uuid)
+                || entry.desktops.contains(&space)
+                || !entry.windows.iter().any(|window| window.wid == wid)
+            {
+                continue;
+            }
+            entry.windows.retain(|window| window.wid != wid);
+            adopted.push(uuid.clone());
+        }
+        for uuid in adopted {
+            info!(?wid, display = %uuid, space = space.get(), "Window moved by the user while its display is away; it stays where it was put");
+            crate::sys::trace::act("archive_adopt", &(wid.idx.get(), space.get()));
+        }
+    }
+
     pub(super) fn homing_target(&self, uuid: &str, shown: SpaceId) -> SpaceId {
         let Some(entry) = self.display_archive.entries.get(uuid) else {
             return shown;
         };
+        // A survivor whose desktop was destroyed gets a fresh one from macOS
+        // on replug, listed first — not necessarily shown, since macOS can
+        // bring the display back on one of its kept desktops. The destroyed
+        // desktop's layout belongs on the fresh one; the kept ones have
+        // their own.
+        if entry.waiting_for.is_some() {
+            let fresh = self
+                .display_space_ids_now()
+                .remove(uuid)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|space| !entry.desktops.contains(space));
+            return fresh.unwrap_or(shown);
+        }
         let still_there = self
             .space_state
             .display_space_ids
@@ -684,24 +959,39 @@ impl Reactor {
         // authority on where a window is, and a window that arrives on the
         // new space by any route counts. Ones that never arrive are cut off by
         // the deadline.
-        let mut waiting = HashSet::default();
+        let mut waiting: HashMap<WindowId, SpaceId> = HashMap::default();
         let mut refused = 0usize;
         let addition = scripting_addition::is_available();
         for (wid, wsid) in &tracked {
-            if self.assigned_space_for_window_id(*wid) == Some(new_space) {
+            let target = &new_space;
+            // Where the window server has the window, not where rift has it
+            // assigned: the remap above just renamed the old space to the
+            // new one in every assignment, so a window macOS merged into a
+            // visitor's desktop but that rift had not yet caught up with
+            // read as "already there" and was never moved.
+            // macOS can have done the move itself — on replug it puts the
+            // windows it merged out of the destroyed desktop onto the fresh
+            // one — ahead of rift's assignment catching up. Such a window is
+            // not sent again, but the restore still waits for it to be
+            // assigned there, or it would find nothing to match.
+            let assigned = self.assigned_space_for_window_id(*wid);
+            let already_there = wsid.and_then(crate::sys::window_server::window_space).or(assigned)
+                == Some(*target);
+            if already_there {
+                if assigned != Some(*target) {
+                    waiting.insert(*wid, *target);
+                }
                 continue;
             }
             let Some(wsid) = wsid else {
                 continue;
             };
-            if !addition
-                || !scripting_addition::move_window_to_space(wsid.as_u32(), new_space.get())
-            {
+            if !addition || !scripting_addition::move_window_to_space(wsid.as_u32(), target.get()) {
                 refused += 1;
             } else {
                 self.note_window_sent_to_space(*wsid);
             }
-            waiting.insert(*wid);
+            waiting.insert(*wid, *target);
         }
         if refused > 0 {
             warn!(
@@ -724,6 +1014,7 @@ impl Reactor {
         let immediate = waiting.is_empty();
         entry.homing = Some(Homing {
             space: new_space,
+            from: old_space,
             waiting,
             started: crate::sys::trace::now(),
         });
@@ -734,7 +1025,7 @@ impl Reactor {
         EventOutcome::default()
     }
 
-    fn schedule_homing_deadline(&self, uuid: String) {
+    pub(super) fn schedule_homing_deadline(&self, uuid: String) {
         let Some(sender) = self.communication_manager.events_tx.clone() else {
             return;
         };
@@ -748,10 +1039,11 @@ impl Reactor {
     /// Runs after every event while a return trip is in flight: once every
     /// window asked to move home is reported on the new space, restore.
     pub(super) fn advance_display_homing(&mut self) -> Option<EventOutcome> {
+        let record = self.advance_record();
         if !self.display_archive.any_homing() {
-            return None;
+            return record;
         }
-        let mut outcome = EventOutcome::default();
+        let mut outcome = record.unwrap_or_default();
         let uuids: Vec<String> = self.display_archive.entries.keys().cloned().collect();
         for uuid in uuids {
             let landed = {
@@ -759,22 +1051,21 @@ impl Reactor {
                 let Some(homing) = entry.homing.as_mut() else {
                     continue;
                 };
-                let target = homing.space;
-                let assigned: HashSet<WindowId> = homing
+                let landed: HashSet<WindowId> = homing
                     .waiting
                     .iter()
-                    .copied()
-                    .filter(|wid| {
-                        self.state.windows.window(*wid).is_none()
+                    .filter(|(wid, target)| {
+                        self.state.windows.window(**wid).is_none()
                             || self
                                 .layout_manager
                                 .layout_engine
                                 .virtual_workspace_manager()
-                                .workspace_info_for_window_any(&self.state.windows, *wid)
-                                .is_some_and(|info| info.space == target)
+                                .workspace_info_for_window_any(&self.state.windows, **wid)
+                                .is_some_and(|info| info.space == **target)
                     })
+                    .map(|(wid, _)| *wid)
                     .collect();
-                homing.waiting.retain(|wid| !assigned.contains(wid));
+                homing.waiting.retain(|wid, _| !landed.contains(wid));
                 homing.waiting.is_empty()
             };
             if landed {
@@ -786,6 +1077,9 @@ impl Reactor {
 
     /// The deadline fired: restore with whatever has landed.
     pub(super) fn handle_display_homing_deadline(&mut self, uuid: &str) -> EventOutcome {
+        if uuid == super::display_record::RECORD_DEADLINE_KEY {
+            return self.handle_record_deadline();
+        }
         let Some(entry) = self.display_archive.entries.get(uuid) else {
             return EventOutcome::default();
         };
@@ -804,10 +1098,10 @@ impl Reactor {
     }
 
     fn finish_display_homing(&mut self, uuid: &str) -> EventOutcome {
-        let Some(entry) = self.display_archive.entries.remove(uuid) else {
+        let Some(mut entry) = self.display_archive.entries.remove(uuid) else {
             return EventOutcome::default();
         };
-        let Some(homing) = entry.homing else {
+        let Some(homing) = entry.homing.take() else {
             return EventOutcome::default();
         };
         let space = homing.space;
@@ -817,7 +1111,7 @@ impl Reactor {
         // float override, or the app rules would tile them into a tree on a
         // display they do not belong to.
         for window in &entry.windows {
-            if homing.waiting.contains(&window.wid) {
+            if homing.waiting.contains_key(&window.wid) {
                 continue;
             }
             if self.state.windows.window(window.wid).is_some() {
@@ -829,6 +1123,7 @@ impl Reactor {
             scope: RestoreScope::Space,
             active_space: space,
             source: RestoreSource::CurrentSpace,
+            from_space: Some(homing.from),
         };
         let layout_settings = self.config.settings.layout.clone();
         match self.layout_manager.layout_engine.restore_layout_from_snapshot(
@@ -850,7 +1145,7 @@ impl Reactor {
                 // snapshot tiles has no other defence against a catch-all
                 // floating rule when it next appears on a space.
                 for window in &entry.windows {
-                    if homing.waiting.contains(&window.wid)
+                    if homing.waiting.contains_key(&window.wid)
                         || self.state.windows.window(window.wid).is_none()
                         || self.assigned_space_for_window_id(window.wid) != Some(space)
                     {
@@ -865,7 +1160,6 @@ impl Reactor {
                 return EventOutcome::default();
             }
         }
-
         let size = self
             .space_state
             .screens

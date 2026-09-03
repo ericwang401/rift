@@ -40,6 +40,11 @@ impl RestorePlan {
         request: RestoreRequest,
     ) -> anyhow::Result<SpaceId> {
         let saved_spaces = snapshot.workspace_layouts.spaces();
+        if let Some(from) = request.from_space
+            && saved_spaces.contains(&from)
+        {
+            return Ok(from);
+        }
         let saved_active = snapshot
             .persistence
             .saved_active_space
@@ -95,7 +100,11 @@ impl RestorePlan {
                 // layout ownership between the snapshot and the pre-restore state.
                 if source.len() != target.len() {
                     return Err(anyhow::anyhow!(
-                        "saved and current spaces have different workspace counts"
+                        "saved and current spaces have different workspace counts: saved space {} has {}, current space {} has {}",
+                        source_space.get(),
+                        source.len(),
+                        request.active_space.get(),
+                        target.len()
                     ));
                 }
                 source

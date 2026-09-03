@@ -1316,6 +1316,19 @@ impl LayoutEngine {
     }
 
     /// Move all per-space layout state from `old_space` to `new_space`.
+    /// Makes the layout `space` is showing now the one it shows at every
+    /// screen size, dropping the trees it kept for other sizes. For a
+    /// desktop rearranged while shown on another display: what the user
+    /// made there is what they get when it goes back, scaled to that
+    /// screen, instead of the tree from before.
+    pub fn adopt_active_layout_for_all_sizes(&mut self, space: SpaceId) {
+        for (workspace, _) in self.virtual_workspace_manager.existing_workspaces(space) {
+            if let Some(layout) = self.workspace_layouts.active(space, workspace) {
+                self.workspace_layouts.replace_layouts_for_workspace(space, workspace, layout);
+            }
+        }
+    }
+
     pub fn remap_space(
         &mut self,
         window_store: &mut WindowStore,

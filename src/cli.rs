@@ -271,6 +271,8 @@ pub enum SpaceCommands {
     Create,
     /// Destroy the active space. Needs the scripting addition (`rift sa load`)
     Destroy,
+    /// Put the active space's layout back the way it was when a display last departed
+    RestoreDeparture,
     /// Switch to an adjacent macOS space (Mission Control spaces, not virtual workspaces)
     Switch {
         /// Direction to switch (left, right, up, down)
@@ -1154,6 +1156,7 @@ fn map_space_command(cmd: SpaceCommands) -> Result<CliCommand, String> {
         }
         SpaceCommands::Create => reactor::ReactorCommand::CreateSpace,
         SpaceCommands::Destroy => reactor::ReactorCommand::DestroySpace,
+        SpaceCommands::RestoreDeparture => reactor::ReactorCommand::RestoreDepartureLayout,
     };
 
     Ok(CliCommand::Reactor(reactor::Command::Reactor(command)))

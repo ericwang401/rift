@@ -27,6 +27,11 @@ pub struct RestoreRequest {
     pub scope: RestoreScope,
     pub active_space: SpaceId,
     pub source: RestoreSource,
+    /// The snapshot space to read, when the caller knows it. Otherwise it
+    /// is inferred from `active_space` and `source`, which for a snapshot
+    /// taken while a display showed one desktop and restored onto another
+    /// picks the wrong one.
+    pub from_space: Option<SpaceId>,
 }
 
 impl RestoreRequest {
@@ -36,6 +41,7 @@ impl RestoreRequest {
             scope,
             active_space,
             source: RestoreSource::SavedActiveSpace,
+            from_space: None,
         }
     }
 
@@ -45,6 +51,7 @@ impl RestoreRequest {
             scope,
             active_space,
             source: RestoreSource::CurrentSpace,
+            from_space: None,
         }
     }
 }

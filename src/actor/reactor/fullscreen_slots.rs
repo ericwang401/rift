@@ -145,6 +145,7 @@ impl Reactor {
             scope: RestoreScope::Workspace,
             active_space: space,
             source: RestoreSource::CurrentSpace,
+            from_space: None,
         };
         let layout_settings = self.config.settings.layout.clone();
         match self.layout_manager.layout_engine.restore_layout_from_snapshot(

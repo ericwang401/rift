@@ -30,25 +30,17 @@ use crate::sys::geometry::CGRectDef;
 pub struct SpaceId(u64);
 
 impl SpaceId {
-    pub fn new(id: u64) -> SpaceId {
-        SpaceId(id)
-    }
+    pub fn new(id: u64) -> SpaceId { SpaceId(id) }
 
-    pub fn get(&self) -> u64 {
-        self.0
-    }
+    pub fn get(&self) -> u64 { self.0 }
 }
 
 impl Into<u64> for SpaceId {
-    fn into(self) -> u64 {
-        self.get()
-    }
+    fn into(self) -> u64 { self.get() }
 }
 
 impl ToString for SpaceId {
-    fn to_string(&self) -> String {
-        self.get().to_string()
-    }
+    fn to_string(&self) -> String { self.get().to_string() }
 }
 
 #[derive(Debug, Clone)]
@@ -91,9 +83,7 @@ impl ScreenInfo {
 }
 
 impl ScreenCache<Actual> {
-    pub fn new(mtm: MainThreadMarker) -> Self {
-        Self::new_with(Actual { mtm })
-    }
+    pub fn new(mtm: MainThreadMarker) -> Self { Self::new_with(Actual { mtm }) }
 }
 
 impl<S: System> ScreenCache<S> {
@@ -288,9 +278,7 @@ fn menu_bar_inset(hidden: bool, height: f64, notch_height: f64) -> f64 {
     }
 }
 
-fn dock_hidden() -> bool {
-    unsafe { CoreDockGetAutoHideEnabled() }
-}
+fn dock_hidden() -> bool { unsafe { CoreDockGetAutoHideEnabled() } }
 
 fn dock_orientation() -> i32 {
     let mut orientation = 0;
@@ -401,15 +389,11 @@ pub struct CoordinateConverter {
 
 /// Creates a `CoordinateConverter` that returns None for any conversion.
 impl Default for CoordinateConverter {
-    fn default() -> Self {
-        Self { screen_height: f64::NAN }
-    }
+    fn default() -> Self { Self { screen_height: f64::NAN } }
 }
 
 impl CoordinateConverter {
-    pub fn from_height(height: f64) -> Self {
-        Self { screen_height: height }
-    }
+    pub fn from_height(height: f64) -> Self { Self { screen_height: height } }
 
     pub fn from_screen(screen: &NSScreen) -> Option<Self> {
         let screen_id = screen.get_number().ok()?;
@@ -448,9 +432,7 @@ pub trait System {
     fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError>;
     fn display_uuid(&self, screen: &CGScreenInfo) -> CFRetained<CFString>;
     fn ns_screens(&self) -> Vec<NSScreenInfo>;
-    fn notch_height(&self, _did: u32) -> f64 {
-        0.0
-    }
+    fn notch_height(&self, _did: u32) -> f64 { 0.0 }
 }
 
 #[derive(Debug, Clone)]
@@ -570,13 +552,9 @@ type CGDirectDisplayID = u32;
 pub struct ScreenId(CGDirectDisplayID);
 
 impl ScreenId {
-    pub fn new(id: u32) -> Self {
-        ScreenId(id)
-    }
+    pub fn new(id: u32) -> Self { ScreenId(id) }
 
-    pub fn as_u32(&self) -> u32 {
-        self.0
-    }
+    pub fn as_u32(&self) -> u32 { self.0 }
 }
 
 pub trait NSScreenExt {
@@ -617,9 +595,35 @@ pub fn active_menu_bar_display_uuid() -> Option<String> {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CURRENT_SPACE: std::cell::RefCell<HashMap<String, u64>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// What `current_space_for_display_uuid` answers for a display under test.
+#[cfg(test)]
+pub fn set_current_space_override(display_uuid: &str, space: Option<u64>) {
+    TEST_CURRENT_SPACE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        match space {
+            Some(space) => {
+                map.insert(display_uuid.to_string(), space);
+            }
+            None => {
+                map.remove(display_uuid);
+            }
+        }
+    });
+}
+
 pub fn current_space_for_display_uuid(display_uuid: &str) -> Option<SpaceId> {
     if display_uuid.is_empty() {
         return None;
+    }
+    #[cfg(test)]
+    if let Some(space) = TEST_CURRENT_SPACE.with(|cell| cell.borrow().get(display_uuid).copied()) {
+        return Some(SpaceId::new(space));
     }
 
     crate::sys::trace::observe("display_current_space", display_uuid, || {
@@ -646,9 +650,7 @@ pub mod diagnostic {
 
     use super::*;
 
-    pub fn cur_space() -> SpaceId {
-        SpaceId(unsafe { CGSGetActiveSpace(SLSMainConnectionID()) })
-    }
+    pub fn cur_space() -> SpaceId { SpaceId(unsafe { CGSGetActiveSpace(SLSMainConnectionID()) }) }
 
     pub fn visible_spaces() -> CFRetained<CFArray<SpaceId>> {
         unsafe {
@@ -735,9 +737,26 @@ pub fn display_frame_for_uuid(display_uuid: &str) -> Option<CGRect> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_MANAGED_DISPLAY_SPACES: std::cell::RefCell<Option<Vec<ManagedDisplaySpaces>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What `managed_display_spaces_in_order` answers under test, instead of
+/// asking the window server about the machine the tests run on.
+#[cfg(test)]
+pub fn set_managed_display_spaces_override(spaces: Option<Vec<ManagedDisplaySpaces>>) {
+    TEST_MANAGED_DISPLAY_SPACES.with(|cell| *cell.borrow_mut() = spaces);
+}
+
 /// Every display's spaces, in the order the window server lists displays —
 /// the order Mission Control numbers spaces in, across displays.
 pub fn managed_display_spaces_in_order() -> Vec<ManagedDisplaySpaces> {
+    #[cfg(test)]
+    if let Some(spaces) = TEST_MANAGED_DISPLAY_SPACES.with(|cell| cell.borrow().clone()) {
+        return spaces;
+    }
     let mut out: Vec<ManagedDisplaySpaces> = Vec::new();
     unsafe {
         let raw = CGSCopyManagedDisplaySpaces(SLSMainConnectionID());
@@ -827,21 +846,15 @@ mod test {
         ns_screens: Vec<NSScreenInfo>,
     }
     impl System for Stub {
-        fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError> {
-            Ok(self.cg_screens.clone())
-        }
+        fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError> { Ok(self.cg_screens.clone()) }
 
         fn display_uuid(&self, _screen: &CGScreenInfo) -> CFRetained<CFString> {
             CFString::from_str("stub")
         }
 
-        fn ns_screens(&self) -> Vec<NSScreenInfo> {
-            self.ns_screens.clone()
-        }
+        fn ns_screens(&self) -> Vec<NSScreenInfo> { self.ns_screens.clone() }
 
-        fn notch_height(&self, _did: u32) -> f64 {
-            0.0
-        }
+        fn notch_height(&self, _did: u32) -> f64 { 0.0 }
     }
 
     struct SequenceSystem {
@@ -880,9 +893,7 @@ mod test {
             self.ns_screens.borrow_mut().pop_front().unwrap_or_default()
         }
 
-        fn notch_height(&self, _did: u32) -> f64 {
-            0.0
-        }
+        fn notch_height(&self, _did: u32) -> f64 { 0.0 }
     }
 
     #[test]

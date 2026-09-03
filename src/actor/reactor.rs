@@ -6,6 +6,7 @@
 
 mod animation;
 mod display_archive;
+mod display_record;
 mod events;
 mod fullscreen_slots;
 mod main_window;
@@ -1781,6 +1782,11 @@ impl Reactor {
                     app_known,
                     running_app_info,
                 };
+                if matches!(kind, SpaceEventKind::User)
+                    && let Some(wid) = tracked_window
+                {
+                    self.note_window_appeared_while_away(wid, sid);
+                }
                 return topology_workflow::handle_window_server_appeared(
                     &mut self.state,
                     topology_workflow::WindowServerLifecyclePayload {
@@ -2449,7 +2455,12 @@ impl Reactor {
                         "Could not restore saved layout: no active macOS space is available".into(),
                     ));
                 };
-                let request = layout::RestoreRequest { scope, active_space, source };
+                let request = layout::RestoreRequest {
+                    scope,
+                    active_space,
+                    source,
+                    from_space: None,
+                };
                 let outcome = EventOutcome::window_membership_changed(false, true);
                 let report = self.layout_manager.layout_engine.restore_layout(
                     path,
@@ -2492,6 +2503,9 @@ impl Reactor {
             Event::Command(Command::Reactor(ReactorCommand::CreateSpace)) => {
                 self.create_space_after_active();
                 return Ok(EventOutcome::default());
+            }
+            Event::Command(Command::Reactor(ReactorCommand::RestoreDepartureLayout)) => {
+                return Ok(self.restore_departure_layout());
             }
             Event::Command(Command::Reactor(ReactorCommand::DestroySpace)) => {
                 let active = crate::sys::space_switch::active_space();
@@ -3458,7 +3472,11 @@ impl Reactor {
         if display_set_changed {
             let active_displays: Vec<String> =
                 screens.iter().map(|screen| screen.display_uuid.clone()).collect();
-            self.archive_departed_displays(&active_displays, &screens, &display_space_ids);
+            outcome.absorb(self.archive_departed_displays(
+                &active_displays,
+                &screens,
+                &display_space_ids,
+            ));
             self.layout_manager.layout_engine.prune_display_state(&active_displays);
         }
         self.space_state.menu_bar_space = menu_bar_space;

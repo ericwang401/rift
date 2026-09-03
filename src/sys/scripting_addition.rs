@@ -190,6 +190,7 @@ pub mod test_hooks {
     thread_local! {
         static AVAILABLE: Cell<bool> = const { Cell::new(false) };
         static SENT: RefCell<Vec<(u8, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+        static NEXT_CREATED: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
     pub fn available() -> bool { AVAILABLE.with(|available| available.get()) }
@@ -197,6 +198,50 @@ pub mod test_hooks {
     pub fn set_available(available: bool) {
         AVAILABLE.with(|cell| cell.set(available));
         SENT.with(|sent| sent.borrow_mut().clear());
+        NEXT_CREATED.with(|cell| cell.set(None));
+    }
+
+    /// The id `create_space_after` reports for the next desktop it creates.
+    pub fn set_next_created_space(space: Option<u64>) { NEXT_CREATED.with(|cell| cell.set(space)); }
+
+    pub(super) fn next_created_space() -> Option<u64> { NEXT_CREATED.with(|cell| cell.get()) }
+
+    /// `(space, after)` of every desktop-reorder command sent, in order.
+    pub fn space_moves() -> Vec<(u64, u64)> {
+        SENT.with(|sent| {
+            sent.borrow()
+                .iter()
+                .filter(|(op, _)| *op == super::opcode::SPACE_MOVE)
+                .map(|(_, args)| {
+                    (
+                        u64::from_ne_bytes(args[0..8].try_into().unwrap()),
+                        u64::from_ne_bytes(args[8..16].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Every desktop-destruction command sent, in order.
+    pub fn space_destroys() -> Vec<u64> {
+        SENT.with(|sent| {
+            sent.borrow()
+                .iter()
+                .filter(|(op, _)| *op == super::opcode::SPACE_DESTROY)
+                .map(|(_, args)| u64::from_ne_bytes(args[0..8].try_into().unwrap()))
+                .collect()
+        })
+    }
+
+    /// The anchor of every desktop-creation command sent, in order.
+    pub fn space_creations() -> Vec<u64> {
+        SENT.with(|sent| {
+            sent.borrow()
+                .iter()
+                .filter(|(op, _)| *op == super::opcode::SPACE_CREATE)
+                .map(|(_, args)| u64::from_ne_bytes(args[0..8].try_into().unwrap()))
+                .collect()
+        })
     }
 
     pub(super) fn record(op: u8, args: &[u8]) -> bool {
@@ -342,6 +387,32 @@ fn verdict(reply: &[u8]) -> bool { reply.first().is_none_or(|byte| *byte != 0) }
 
 /// Creates a space on the display holding `space`.
 pub fn create_space(space: u64) -> bool { send(opcode::SPACE_CREATE, &space.to_ne_bytes()) }
+
+/// Creates a desktop after `anchor`, on that desktop's display, and says
+/// which one it is: the window server lists it as soon as the addition has
+/// made it, so the space that was not there before is the new one. `None`
+/// when the addition refused or the new desktop cannot be told apart.
+pub fn create_space_after(
+    anchor: crate::sys::screen::SpaceId,
+) -> Option<crate::sys::screen::SpaceId> {
+    #[cfg(test)]
+    {
+        if !create_space(anchor.get()) {
+            return None;
+        }
+        return test_hooks::next_created_space().map(crate::sys::screen::SpaceId::new);
+    }
+    #[allow(unreachable_code)]
+    {
+        let before = crate::sys::space_switch::all_spaces_in_display_order();
+        if !create_space(anchor.get()) {
+            return None;
+        }
+        crate::sys::space_switch::all_spaces_in_display_order()
+            .into_iter()
+            .find(|space| !before.contains(space))
+    }
+}
 
 /// Reorders `space` to sit immediately after `after` on the same display,
 /// optionally focusing it.
