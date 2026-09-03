@@ -2656,8 +2656,9 @@ impl Reactor {
                 // per-app check as every other warp, so an app on
                 // mouse_follows_focus_blacklist is not dragged onto by this
                 // path either.
-                let post_arrange_mouse_warp =
-                    self.main_window().filter(|wid| self.mouse_follows_focus_allowed_for(*wid));
+                let post_arrange_mouse_warp = self
+                    .main_window()
+                    .filter(|wid| self.mouse_follows_focus_permitted_for_app(*wid));
                 let command_space = self.command_context_space();
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
                 return command_workflow::handle_command_layout(
@@ -5222,14 +5223,21 @@ impl Reactor {
     }
 
     fn mouse_follows_focus_allowed_for(&self, wid: WindowId) -> bool {
-        if !self.config.settings.mouse_follows_focus {
+        if !self.mouse_follows_focus_permitted_for_app(wid) {
             return false;
         }
         // Both of these say the same thing: the pointer is already where the
         // user put it, so leave it there.
-        if (self.focus_change_is_pointer_driven() || self.pointer_is_inside(wid))
-            && !self.click_landed_on_the_dock()
-        {
+        !((self.focus_change_is_pointer_driven() || self.pointer_is_inside(wid))
+            && !self.click_landed_on_the_dock())
+    }
+
+    /// The setting and the per-app opt-out alone, without asking where the
+    /// pointer is. For a warp that follows a window the user just moved: the
+    /// pointer was inside it a moment ago by definition, which is no reason
+    /// not to follow it to where it went.
+    fn mouse_follows_focus_permitted_for_app(&self, wid: WindowId) -> bool {
+        if !self.config.settings.mouse_follows_focus {
             return false;
         }
         if self.config.settings.mouse_follows_focus_blacklist.is_empty() {
