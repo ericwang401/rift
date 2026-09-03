@@ -134,9 +134,7 @@ impl ForwardedSpaceState {
         self.screens.iter().filter_map(|screen| screen.space)
     }
 
-    pub fn first_known_space(&self) -> Option<SpaceId> {
-        self.iter_known_spaces().next()
-    }
+    pub fn first_known_space(&self) -> Option<SpaceId> { self.iter_known_spaces().next() }
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +633,21 @@ impl SpacesActor {
                 .filter_map(|screen| screen.space)
                 .any(|space| !unique_spaces.insert(space))
         };
+        #[cfg(test)]
+        {
+            let mut display_space_ids: HashMap<String, Vec<SpaceId>> = HashMap::default();
+            for screen in &screens {
+                if let Some(space) = screen.space {
+                    display_space_ids.entry(screen.display_uuid.clone()).or_default().push(space);
+                }
+            }
+            self.state.display_space_ids = display_space_ids;
+        }
+        #[cfg(not(test))]
+        {
+            self.state.display_space_ids = managed_display_space_ids();
+        }
+
         let allow_space_remap = should_force_refresh_layout
             && !has_duplicate_spaces
             && screens.iter().all(|screen| screen.space.is_some());
@@ -655,21 +668,6 @@ impl SpacesActor {
                         .map(|screen| screen.display_uuid.clone())
                 })
             });
-        #[cfg(test)]
-        {
-            let mut display_space_ids: HashMap<String, Vec<SpaceId>> = HashMap::default();
-            for screen in &screens {
-                if let Some(space) = screen.space {
-                    display_space_ids.entry(screen.display_uuid.clone()).or_default().push(space);
-                }
-            }
-            self.state.display_space_ids = display_space_ids;
-        }
-        #[cfg(not(test))]
-        {
-            self.state.display_space_ids = managed_display_space_ids();
-        }
-
         if !screens.is_empty() {
             self.state.has_seen_display_set = true;
         }
@@ -835,7 +833,22 @@ impl SpacesActor {
                 let source_is_now_owned_by_another_display = current_space_owners
                     .get(&previous_space)
                     .is_some_and(|owner| *owner != display_uuid);
-                if allow_space_remap && !source_is_now_owned_by_another_display {
+                // A remap stands in for a desktop macOS replaced: the old id
+                // gone, a new one in its place. A display that comes back
+                // showing a different desktop than it left on, its old one
+                // still listed, has only switched desktops; remapping would
+                // carry that desktop's layout onto the shown one and leave it
+                // with none.
+                let source_still_exists = self
+                    .state
+                    .display_space_ids
+                    .values()
+                    .flatten()
+                    .any(|listed| *listed == previous_space);
+                if allow_space_remap
+                    && !source_is_now_owned_by_another_display
+                    && !source_still_exists
+                {
                     remaps.push((previous_space, space));
                 }
             }
