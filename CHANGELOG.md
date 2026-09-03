@@ -11,6 +11,10 @@ Entries describe this fork's changes relative to
 
 ## [Unreleased]
 
+## [0.5.3-plus.1] - 2026-09-03
+
+First tagged release of the fork, against upstream `v0.5.3`.
+
 ### Added
 
 - **The trackpad space switch can run on your own timing.** After the fingers
@@ -70,6 +74,30 @@ Entries describe this fork's changes relative to
   `floating` rule floated everything back. Off by default; see
   `[settings.layout_restore]` in `rift.default.toml`.
 
+- **A scripting addition of rift's own.** rift builds, installs and injects its
+  own payload into Dock (`/Library/ScriptingAdditions/rift.osax`, serving
+  `/tmp/rift-sa_$USER.socket`), so moving a window to a space, creating a space
+  and destroying one no longer depend on yabai being installed. New commands:
+  `rift sa status | load | install | uninstall | install-sudoers |
+  uninstall-sudoers`. See [docs/scripting-addition.md](docs/scripting-addition.md).
+- **Display layout restore.** A display's layout is remembered when it
+  disconnects — unplug, sleep, lid close — and restored when the same display
+  returns, including fullscreen windows. `displaced_windows` chooses whether a
+  departed display's windows float over the survivor or join its tree.
+- **Drag improvements.** Dropping on a window's edge splits it rather than only
+  swapping; cross-display drops preview and perform the split; a drop overlay
+  drawn in Liquid Glass shows where a dragged window will land.
+- **Space commands.** Switch to a space by number instantly, move windows
+  between spaces, create and destroy spaces, and toggle layout modes.
+- **Layout commands.** Cycle through a stack and balance the tree; `rotate` and
+  `mirror`; column/row ordering in the query API.
+- **Modifier-drag.** Hold a modifier and drag anywhere in a window to move or
+  resize it; resizing a tiled window adjusts its split ratios.
+- **`manage = true`** lets nominally unmanageable windows into the layout, and
+  a catch-all rule can make floating the default.
+- **An always-on flight recorder** (`sys::trace`) capturing activity from every
+  thread, with a replay harness for reproducing reported sequences.
+
 ### Deprecated
 
 - **`rift-cli` is deprecated** in favour of `rift`, which now takes the same
@@ -80,6 +108,54 @@ Entries describe this fork's changes relative to
   silent.
 
 ### Fixed
+
+- **`rift sa load` re-applies rift's settings to the fresh payload.** rift
+  applies the addition-backed settings, the trackpad space switch animation
+  above all, when it starts; a payload loaded afterwards, after a Dock restart
+  or crash, had none of them until rift was restarted too. Loading the addition
+  now asks the running rift to reload its config, which re-sends them.
+- **The scripting addition no longer takes Dock down over a destroyed
+  desktop.** Asked to move or focus a space the window server had already
+  forgotten — one destroyed in a display reshuffle but still listed by the
+  snapshot in hand — the payload compared a NULL display id and crashed Dock,
+  and the addition was gone until reloaded. The payload now treats a space
+  without a display as nothing to do, refuses to destroy the desktop a display
+  is showing, and rift asks the window server for a display's current desktops
+  before moving any.
+- **No ghost tiles on the laptop after a replug.** A window on a desktop that
+  is not being shown can have its frame reported on another display once the
+  displays are back, and that report was read as a cross-space move: the
+  window was pulled into the visible desktop's tree beside the windows really
+  there, and the tiles split to make room, until discovery put it back a
+  moment later. A frame report for a window the window server has on a
+  hidden desktop no longer changes its desktop.
+- **A display that comes back showing a different desktop keeps its layout.**
+  When a returning display showed a desktop other than the one it left on, the
+  space it left on was treated as replaced and its whole layout remapped onto
+  the shown desktop, leaving the original with no tree at all; the desktop had
+  only been switched, and every restore of that display's layout then failed
+  with a workspace-count mismatch. A remap now happens only when the old
+  desktop is actually gone.
+- **No more flicker after a Mission Control drag between displays.** Frame
+  writes queue on the app's thread, behind animations and slow accessibility
+  calls, and a stale one aimed at the display a window had just left made macOS
+  hand the window back, whose tree wrote it again — the two displays traded the
+  window dozens of times a second. A frame write that a newer one for the same
+  window has superseded is now dropped unapplied.
+- **A dragged tile snaps back on the drop.** The drop's arrange skipped a
+  target that matched a write still pending for the window, and the write that
+  had put it in that very slot usually was, so a dragged tile stayed where it
+  was dropped until a later discovery sweep happened to move it. Taking hold
+  of a window now clears what was pending for it.
+- **No more ghost tiles.** A BSP leaf the tree's window index had lost — after
+  a window identity was replaced onto a window that already had a leaf, or an
+  insert overwrote the entry — stayed in the tree, rendered and given its
+  share of the screen, with nothing able to remove it. Worse, a ghost left in
+  another display's tree had its frame written on that display, which made
+  macOS hand the window over, whose own tree wrote it back — a flicker loop of
+  dozens of moves a second after a Mission Control drag between displays.
+  Inserting, replacing or removing a window now retires every leaf it has,
+  indexed or not.
 
 - **`mouse_follows_focus` follows a space switch onto the other display.**
   `switch-to-space` aimed at a space of the other display, or
@@ -193,46 +269,6 @@ Entries describe this fork's changes relative to
   is now taken from whichever removal still has one to take. A single tiled
   window on its space could not show this; two could.
 
-### Changed
-
-- **`WindowServerAppeared` and `WindowServerDestroyed` are recorded in traces.**
-  They were `#[serde(skip)]`, so `rift execute trace dump` silently omitted
-  them — and since a window's arrival on and departure from a space is where
-  native fullscreen is decided, every bug in that area was invisible to the one
-  tool meant to explain it.
-
-## [0.5.3-plus.1] - 2026-08-31
-
-First tagged release of the fork, against upstream `v0.5.3`.
-
-### Added
-
-- **A scripting addition of rift's own.** rift builds, installs and injects its
-  own payload into Dock (`/Library/ScriptingAdditions/rift.osax`, serving
-  `/tmp/rift-sa_$USER.socket`), so moving a window to a space, creating a space
-  and destroying one no longer depend on yabai being installed. New commands:
-  `rift sa status | load | install | uninstall | install-sudoers |
-  uninstall-sudoers`. See [docs/scripting-addition.md](docs/scripting-addition.md).
-- **Display layout restore.** A display's layout is remembered when it
-  disconnects — unplug, sleep, lid close — and restored when the same display
-  returns, including fullscreen windows. `displaced_windows` chooses whether a
-  departed display's windows float over the survivor or join its tree.
-- **Drag improvements.** Dropping on a window's edge splits it rather than only
-  swapping; cross-display drops preview and perform the split; a drop overlay
-  drawn in Liquid Glass shows where a dragged window will land.
-- **Space commands.** Switch to a space by number instantly, move windows
-  between spaces, create and destroy spaces, and toggle layout modes.
-- **Layout commands.** Cycle through a stack and balance the tree; `rotate` and
-  `mirror`; column/row ordering in the query API.
-- **Modifier-drag.** Hold a modifier and drag anywhere in a window to move or
-  resize it; resizing a tiled window adjusts its split ratios.
-- **`manage = true`** lets nominally unmanageable windows into the layout, and
-  a catch-all rule can make floating the default.
-- **An always-on flight recorder** (`sys::trace`) capturing activity from every
-  thread, with a replay harness for reproducing reported sequences.
-
-### Fixed
-
 - Focus follows the window a Dock click summons, rather than leaving the pointer
   behind.
 - Focus resolves across all visible spaces for same-app windows, and is never
@@ -243,6 +279,46 @@ First tagged release of the fork, against upstream `v0.5.3`.
   system older than macOS 26 loses the overlay rather than the process.
 
 ### Changed
+
+- **A departed display's windows now stay on their own desktops, and
+  everything is put back in one pass when it returns.** The new default for
+  `displaced_windows`, `"spaces"`, records where every window and every
+  desktop was the moment a display leaves. The desktops macOS carries over
+  from an unplugged main display are shown on the survivor as they are; the
+  survivor's own windows, which macOS merges into one of them, get a desktop
+  made for them with their layout, the survivor's own desktops are put first,
+  and the survivor is switched back to the desktop it was showing. Beyond
+  that nothing is done while the display is away, deliberately. The window
+  server reshuffles
+  desktops and windows on its own at both ends of an unplug and not in one
+  consistent way — it destroys the survivor's first desktop and merges its
+  windows into a visitor's, mints a fresh desktop on replug and sometimes puts
+  those windows back on it itself, sends every desktop it filed behind the
+  visitors along with them, and can dump a kept desktop's windows elsewhere
+  while handing that desktop back — so reacting to each of those as it is
+  noticed was a losing game, and every desktop operation asked of Dock during
+  the reshuffle was a chance to take Dock down. On replug, once the topology
+  is quiet, the record is diffed against what the window server reports and
+  the differences are put right: destroyed desktops are paired with the fresh
+  ones that replaced them, strayed desktops go back to their display in order,
+  strayed windows go back to their desktops, each desktop's tree is restored
+  by name, and the made desktop is destroyed once nothing shows it. Windows
+  and desktops the user moved or made in the
+  meantime, by any means including Mission Control, stay as they were left,
+  and so does a desktop whose windows the user rearranged: that desktop keeps
+  the arrangement it was given, scaled to its own screen, instead of the tree
+  from before the unplug. For the times that is not wanted — a desktop
+  shuffled to show something during a short unplug — the new
+  `restore_departure_layout` command (`rift execute space restore-departure`,
+  bindable like any other) puts the active desktop's layout back the way it
+  was at the last departure. The old default, `"float"`, which moved the departed display's windows onto
+  the surviving display's own desktop as floats, is still available, as is
+  `"tile"`. Set `displaced_windows = "float"` to keep the previous behaviour.
+- **`WindowServerAppeared` and `WindowServerDestroyed` are recorded in traces.**
+  They were `#[serde(skip)]`, so `rift execute trace dump` silently omitted
+  them — and since a window's arrival on and departure from a space is where
+  native fullscreen is decided, every bug in that area was invisible to the one
+  tool meant to explain it.
 
 - Parity with yabai for directional focus, cross-display moves and space
   creation.
