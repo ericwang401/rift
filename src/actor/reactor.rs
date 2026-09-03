@@ -1920,8 +1920,27 @@ impl Reactor {
                     .window(wid)
                     .map(|window| (window.info.sys_id, window.frame_monotonic))
                     .unwrap_or((None, new_frame));
-                let old_space = self.geometry_space_for_window(&old_frame, server_id);
-                let new_space = self.geometry_space_for_window(&new_frame, server_id);
+                let mut old_space = self.geometry_space_for_window(&old_frame, server_id);
+                let mut new_space = self.geometry_space_for_window(&new_frame, server_id);
+                // A window the window server has on a desktop that is not
+                // being shown has not changed desktops by moving: nothing on
+                // a hidden desktop is dragged, and a change of desktop is
+                // reported by the server, not by a frame. Its frame only
+                // says which display it will be on when shown, and after a
+                // display change that can differ from where the frame was
+                // before; read as a cross-space move, that pulled the window
+                // into the visible tree of the display it landed on, beside
+                // the windows really there, until discovery put it back.
+                let hidden_desktop = server_id
+                    .and_then(window_server::window_space)
+                    .filter(|space| !self.is_space_active(*space))
+                    .filter(|space| {
+                        self.space_state.display_space_ids.values().flatten().any(|s| s == space)
+                    });
+                if let Some(space) = hidden_desktop {
+                    old_space = Some(space);
+                    new_space = Some(space);
+                }
                 let old_space_active = old_space.is_some_and(|space| self.is_space_active(space));
                 let new_space_active = new_space.is_some_and(|space| self.is_space_active(space));
                 let best_resize_space = self.best_space_for_window(&new_frame, server_id);

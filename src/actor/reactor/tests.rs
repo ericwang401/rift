@@ -9091,6 +9091,62 @@ mod display_archive {
     }
 }
 
+/// A window on a desktop that is not being shown cannot change desktops by
+/// moving. After a display change its frame can land on the other display,
+/// and a frame report read as a cross-space move pulled it into that
+/// display's visible tree beside the windows really there, until discovery
+/// put it back: a ghost tile for a moment.
+#[test]
+fn a_frame_report_for_a_window_on_a_hidden_desktop_does_not_move_it_into_the_visible_tree() {
+    let mut reactor = test_reactor();
+    let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1440., 900.));
+    let screen2 = CGRect::new(CGPoint::new(1440., 0.), CGSize::new(1440., 900.));
+    let space1 = SpaceId::new(1);
+    let space2 = SpaceId::new(2);
+    let hidden = SpaceId::new(5);
+    reactor.handle_event(space_state_event_with(
+        vec![screen1, screen2],
+        vec![Some(space1), Some(space2)],
+        move |state| {
+            state.has_seen_display_set = true;
+            state
+                .display_space_ids
+                .insert("test-display-0".to_string(), vec![space1, hidden]);
+            state.display_space_ids.insert("test-display-1".to_string(), vec![space2]);
+        },
+    ));
+    reactor.add_test_app(1);
+    let wid = WindowId::new(1, 1);
+    let wsid = WindowServerId::new(121);
+    // Last seen with a frame on the second display, now on the first
+    // display's hidden desktop.
+    let old_frame = CGRect::new(CGPoint::new(1500., 100.), CGSize::new(800., 600.));
+    reactor.add_test_window(wid, wsid, Some(hidden), old_frame);
+    let workspace = reactor.test_workspace(hidden, 0);
+    assert!(reactor.assign_test_window_to_workspace(hidden, wid, workspace));
+    crate::sys::window_server::set_window_spaces_override(wsid, Some(vec![hidden.get()]));
+
+    let new_frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(800., 600.));
+    reactor.handle_event(Event::WindowFrameChanged(
+        wid,
+        new_frame,
+        None,
+        Requested(false),
+        Some(MouseState::Up),
+    ));
+
+    assert_eq!(
+        reactor.assigned_space_for_window_id(wid),
+        Some(hidden),
+        "the window stays on the hidden desktop the window server has it on"
+    );
+    assert!(
+        !reactor.layout_manager.layout_engine.is_window_tiled(space1, wid),
+        "it is not tiled into the visible desktop's tree"
+    );
+    crate::sys::window_server::set_window_spaces_override(wsid, None);
+}
+
 /// Same drag, but with the session's origin space known — the normal case.
 /// The float must arrive on the other display still floating, not tiled.
 #[test]
