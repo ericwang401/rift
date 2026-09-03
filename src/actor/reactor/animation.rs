@@ -180,6 +180,10 @@ impl AnimationManager {
                                 .is_some_and(|pending| pending.same_as(target_frame))
                             {
                                 trace!(?wid, ?target_frame, "Skipping redundant layout request");
+                                crate::sys::trace::act(
+                                    "layout_skip",
+                                    &(wid.idx.get(), "redundant"),
+                                );
                                 continue;
                             }
                         }
@@ -329,6 +333,7 @@ impl AnimationManager {
                     .is_some_and(|pending| pending.same_as(target_frame))
                 {
                     trace!(?wid, ?target_frame, "Skipping redundant instant layout request");
+                    crate::sys::trace::act("layout_skip", &(wid.idx.get(), "redundant"));
                     continue;
                 }
             }

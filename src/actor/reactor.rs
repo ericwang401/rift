@@ -1124,6 +1124,41 @@ impl Reactor {
     /// button is still down. Acting on either re-tiled the window on the
     /// destination under the cursor. The drop (`MouseUp`) resolves where it
     /// belongs, once.
+    /// Flight-recorder note for a frame report the user may be dragging:
+    /// which branch handled it and what the reactor believed about the
+    /// window's spaces at the time. Drags that silently produce no drop are
+    /// invisible in the ring otherwise.
+    fn note_frame_change_for_flight_recorder(
+        &self,
+        wid: WindowId,
+        mouse_state: Option<crate::sys::event::MouseState>,
+        branch: &str,
+        spaces: Option<(Option<SpaceId>, Option<SpaceId>, bool, bool)>,
+    ) {
+        if !crate::sys::trace::is_recording()
+            || (mouse_state != Some(crate::sys::event::MouseState::Down)
+                && self.window_in_drag().is_none())
+        {
+            return;
+        }
+        let wsid = self.state.windows.window(wid).and_then(|window| window.info.sys_id);
+        crate::sys::trace::act(
+            "frame_change",
+            &serde_json::json!({
+                "wid": wid.idx.get(),
+                "branch": branch,
+                "mouse": mouse_state,
+                "spaces": spaces,
+                "assigned": self.assigned_space_for_window_id(wid),
+                "fullscreen_suspended": wsid.is_some_and(|wsid| self.is_known_fullscreen_window(wsid)),
+                "mission_control": self.is_mission_control_active(),
+                "modifier_drag": self.modifier_drag.is_some(),
+                "in_drag": self.window_in_drag().map(|w| w.idx.get()),
+                "held": self.drag_manager.held_window.map(|w| w.idx.get()),
+            }),
+        );
+    }
+
     pub(crate) fn window_in_drag(&self) -> Option<WindowId> {
         match &self.drag_manager.drag_state {
             DragState::Active { session } | DragState::PendingSwap { session, .. } => {
@@ -1912,6 +1947,12 @@ impl Reactor {
                             DragState::Active { .. } | DragState::PendingSwap { .. }
                         );
                     outcome.focused_window = raised_window;
+                    self.note_frame_change_for_flight_recorder(
+                        wid,
+                        effective_mouse_state,
+                        "gate",
+                        None,
+                    );
                     return Ok(outcome);
                 }
                 let (server_id, old_frame) = self
@@ -2001,6 +2042,12 @@ impl Reactor {
                     outcome.dispatch_mouse_up = true;
                 }
                 outcome.focused_window = raised_window;
+                self.note_frame_change_for_flight_recorder(
+                    wid,
+                    effective_mouse_state,
+                    "geometry",
+                    Some((old_space, new_space, old_space_active, new_space_active)),
+                );
                 return Ok(outcome);
             }
             Event::WindowTitleChanged(wid, new_title) => {
@@ -2205,6 +2252,18 @@ impl Reactor {
                 }
                 if let Some((space, window)) = focused {
                     outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window));
+                }
+                if crate::sys::trace::is_recording() {
+                    crate::sys::trace::act(
+                        "drop",
+                        &serde_json::json!({
+                            "held": held.map(|w| w.idx.get()),
+                            "session": session.as_ref().map(|s| (s.window.idx.get(), s.origin_space, s.settled_space, s.layout_dirty)),
+                            "pending_swap": pending_swap.map(|(a, b)| (a.idx.get(), b.idx.get())),
+                            "final_space": final_space,
+                            "passes": outcome.arrange.passes,
+                        }),
+                    );
                 }
                 // The drag is over; a refresh sweep deferred while it ran is
                 // due now, as one census instead of one per space flip.

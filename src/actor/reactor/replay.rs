@@ -637,7 +637,35 @@ fn replay_trace_with(
         report.events += 1;
         let mut event = event;
         fill_legacy_inventory_token(&reactor, &mut event);
+        // `RIFT_REPLAY_WATCH=<window idx>`: after every event, where that
+        // window is — which trees hold it and which space it is assigned to.
+        // For chasing a window that two trees are fighting over.
+        let watched = std::env::var("RIFT_REPLAY_WATCH").ok().and_then(|s| s.parse::<u32>().ok());
+        let event_name = watched.map(|_| format!("{event:?}").chars().take(90).collect::<String>());
         reactor.handle_event(event);
+        if let Some(idx) = watched
+            && let Some(wid) = reactor
+                .state
+                .windows
+                .iter_windows()
+                .map(|(wid, _)| wid)
+                .find(|wid| wid.idx.get() == idx)
+        {
+            let engine = &reactor.layout_manager.layout_engine;
+            let tiled: Vec<u64> = engine
+                .virtual_workspace_manager()
+                .initialized_spaces()
+                .into_iter()
+                .filter(|space| engine.is_window_tiled(*space, wid))
+                .map(|space| space.get())
+                .collect();
+            eprintln!(
+                "watch line {index} @{ms}ms {} => tiled_on={tiled:?} assigned={:?} floating={}",
+                event_name.unwrap_or_default(),
+                reactor.assigned_space_for_window_id(wid).map(|s| s.get()),
+                engine.is_window_floating(wid)
+            );
+        }
         if let Some(note) = dropping {
             report.state_changes.push(note);
         }

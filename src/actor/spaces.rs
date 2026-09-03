@@ -1135,12 +1135,22 @@ impl SpacesActor {
 
     fn process_screen_refresh(&mut self, attempt: u8, allow_retry: bool) {
         if self.should_buffer_topology_updates() {
+            crate::sys::trace::act(
+                "screen_refresh",
+                &(
+                    "buffered",
+                    self.state.sleeping,
+                    self.state.session_inactive,
+                    self.state.display_churn_active,
+                ),
+            );
             self.state.refresh_deferred_until_stable = true;
             self.state.refresh_pending = false;
             return;
         }
 
         let Some((screens, converter)) = self.collect_state() else {
+            crate::sys::trace::act("screen_refresh", &("no screens", attempt));
             if allow_retry && attempt < REFRESH_MAX_RETRIES {
                 self.schedule_screen_refresh_after(REFRESH_RETRY_DELAY_NS, attempt + 1);
                 return;
@@ -1150,6 +1160,17 @@ impl SpacesActor {
         };
 
         if !Self::screen_snapshot_is_ready_for_authoritative_commit(&screens, true) {
+            crate::sys::trace::act(
+                "screen_refresh",
+                &(
+                    "not ready",
+                    attempt,
+                    screens
+                        .iter()
+                        .map(|screen| (screen.display_uuid.clone(), screen.space))
+                        .collect::<Vec<_>>(),
+                ),
+            );
             if allow_retry && attempt < REFRESH_MAX_RETRIES {
                 self.schedule_screen_refresh_after(REFRESH_RETRY_DELAY_NS, attempt + 1);
                 return;
@@ -1157,6 +1178,7 @@ impl SpacesActor {
             self.finish_screen_refresh_attempts();
             return;
         }
+        crate::sys::trace::act("screen_refresh", &("forwarding", attempt, screens.len()));
 
         let spaces: Vec<Option<SpaceId>> = screens.iter().map(|screen| screen.space).collect();
         if self.state.awaiting_space_switch_confirmation
@@ -1224,6 +1246,7 @@ impl SpacesActor {
         }
 
         if attempt == 0 && self.state.display_churn_active {
+            crate::sys::trace::act("screen_refresh", &("deferred until stable", attempt));
             self.state.refresh_deferred_until_stable = true;
             return;
         }
@@ -1246,6 +1269,7 @@ impl SpacesActor {
     }
 
     fn handle_display_reconfig_event(&mut self, _display_id: u32, flags: DisplayReconfigFlags) {
+        crate::sys::trace::act("display_reconfig", &(_display_id, flags.bits()));
         if !Self::should_begin_display_churn(flags) {
             return;
         }
@@ -1406,6 +1430,14 @@ impl SpacesActor {
     }
 
     fn finish_display_churn(&mut self, expected_epoch: u64, schedule_refresh: bool) {
+        crate::sys::trace::act(
+            "display_churn_end",
+            &(
+                expected_epoch,
+                self.state.display_churn_epoch,
+                self.state.display_churn_active,
+            ),
+        );
         if expected_epoch != self.state.display_churn_epoch || !self.state.display_churn_active {
             return;
         }
