@@ -130,9 +130,7 @@ pub struct WindowId {
 
 impl serde::ser::Serialize for WindowId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
+    where S: serde::ser::Serializer {
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("WindowId", 2)?;
         s.serialize_field("pid", &self.pid)?;
@@ -143,9 +141,7 @@ impl serde::ser::Serialize for WindowId {
 
 impl<'de> serde::de::Deserialize<'de> for WindowId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
+    where D: serde::de::Deserializer<'de> {
         struct WindowIdVisitor;
         impl<'de> serde::de::Visitor<'de> for WindowIdVisitor {
             type Value = WindowId;
@@ -157,17 +153,13 @@ impl<'de> serde::de::Deserialize<'de> for WindowId {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
+            where E: serde::de::Error {
                 WindowId::from_debug_string(v)
                     .ok_or_else(|| E::custom("invalid WindowId debug string"))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<WindowId, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
+            where A: serde::de::SeqAccess<'de> {
                 let pid: pid_t = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -182,9 +174,7 @@ impl<'de> serde::de::Deserialize<'de> for WindowId {
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: serde::de::MapAccess<'de>,
-            {
+            where M: serde::de::MapAccess<'de> {
                 let mut pid: Option<pid_t> = None;
                 let mut idx: Option<u32> = None;
 
@@ -243,9 +233,7 @@ impl WindowId {
         })
     }
 
-    pub fn to_debug_string(&self) -> String {
-        format!("{:?}", self)
-    }
+    pub fn to_debug_string(&self) -> String { format!("{:?}", self) }
 }
 
 impl AxNotificationKind {
@@ -328,9 +316,7 @@ impl AppThreadHandle {
         this
     }
 
-    pub fn send(&self, req: Request) -> anyhow::Result<()> {
-        Ok(self.requests_tx.send(req))
-    }
+    pub fn send(&self, req: Request) -> anyhow::Result<()> { Ok(self.requests_tx.send(req)) }
 }
 
 impl Debug for AppThreadHandle {
@@ -657,12 +643,43 @@ impl State {
         should_terminate
     }
 
+    /// Whether a frame write for `wid` carrying `txid` has been overtaken:
+    /// the reactor has issued a newer transaction for the window since.
+    ///
+    /// Writes queue behind whatever this thread is doing — an animation, a
+    /// slow accessibility call — and by the time a stale one runs the window
+    /// may have been handed to the other display, whose tree has already
+    /// written it there. Applying the stale frame moves it back, that tree
+    /// writes it again, and the two trade the window at queue speed: the
+    /// flicker after a drag between displays. Only the newest write for a
+    /// window can be right; the rest are dropped unapplied.
+    fn write_superseded(&self, wid: WindowId, txid: TransactionId) -> bool {
+        if txid == TransactionId::default() {
+            return false;
+        }
+        let Some(store) = self.tx_store.as_ref() else {
+            return false;
+        };
+        let Some(wsid) = self.windows.get(&wid).and_then(|window| window.window_server_id) else {
+            return false;
+        };
+        let latest = store.last_txid(&wsid);
+        if latest != TransactionId::default() && latest != txid {
+            crate::sys::trace::act("write_superseded", &(wid.idx.get(), txid, latest));
+            return true;
+        }
+        false
+    }
+
     fn flush_frames(&mut self, wid: WindowId) -> Result<(), AxError> {
         let Some(PendingFrame { span, frame, set_size, txid }) = self.pending_frames.remove(&wid)
         else {
             return Ok(());
         };
         let _guard = span.enter();
+        if self.write_superseded(wid, txid) {
+            return Ok(());
+        }
         let window = self.window_mut(wid)?;
         window.last_seen_txid = txid;
         if set_size {
@@ -907,18 +924,21 @@ impl State {
                 ));
             }
             Request::AnimationFrame { wid, frame, set_size, txid } => {
+                if self.write_superseded(wid, txid) {
+                    return Ok(false);
+                }
                 crate::sys::trace::note_write(wid.pid, wid.idx.get(), frame);
-                self.pending_frames.insert(
-                    wid,
-                    PendingFrame {
-                        span: Span::current(),
-                        frame,
-                        set_size,
-                        txid,
-                    },
-                );
+                self.pending_frames.insert(wid, PendingFrame {
+                    span: Span::current(),
+                    frame,
+                    set_size,
+                    txid,
+                });
             }
             Request::SetWindowFrame(wid, desired, txid, _) => {
+                if self.write_superseded(wid, txid) {
+                    return Ok(false);
+                }
                 debug!(?wid, ?desired, ?txid, "writing window frame");
                 crate::sys::trace::note_write(wid.pid, wid.idx.get(), desired);
                 let elem = match self.window_mut(wid) {
@@ -1264,8 +1284,7 @@ impl State {
                         }
                     },
                 };
-                if crate::sys::trace::is_recording()
-                    && mouse_state == Some(event::MouseState::Down)
+                if crate::sys::trace::is_recording() && mouse_state == Some(event::MouseState::Down)
                 {
                     crate::sys::trace::act(
                         "ax_notif",
@@ -1347,9 +1366,7 @@ enum RaiseError {
 }
 
 impl From<AxError> for RaiseError {
-    fn from(value: AxError) -> Self {
-        Self::AXError(value)
-    }
+    fn from(value: AxError) -> Self { Self::AXError(value) }
 }
 
 impl State {
@@ -1803,20 +1820,17 @@ impl State {
         let hidden_by_app = self.is_hidden;
         let last_seen_txid = self.txid_from_store(window_server_id).unwrap_or_default();
 
-        let old = self.windows.insert(
-            wid,
-            AppWindowState {
-                elem: elem.clone(),
-                notifications_registered,
-                last_seen_txid,
-                hidden_by_app,
-                window_server_id,
-                title: info.title.clone(),
-                is_animating: false,
-                last_animation_frame: None,
-                drag_silenced: false,
-            },
-        );
+        let old = self.windows.insert(wid, AppWindowState {
+            elem: elem.clone(),
+            notifications_registered,
+            last_seen_txid,
+            hidden_by_app,
+            window_server_id,
+            title: info.title.clone(),
+            is_animating: false,
+            last_animation_frame: None,
+            drag_silenced: false,
+        });
         debug_assert!(old.is_none(), "Duplicate window id {wid:?}");
         self.elem_to_wid.insert(elem, wid);
         if hidden_by_app {
@@ -1990,9 +2004,7 @@ impl State {
         }
     }
 
-    fn send_event(&self, event: Event) {
-        self.events_tx.send(event);
-    }
+    fn send_event(&self, event: Event) { self.events_tx.send(event); }
 
     fn window(&self, wid: WindowId) -> Result<&AppWindowState, AxError> {
         assert_eq!(wid.pid, self.pid);
