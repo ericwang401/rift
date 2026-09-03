@@ -81,6 +81,16 @@ Entries describe this fork's changes relative to
 
 ### Fixed
 
+- **`mouse_follows_focus` follows a space switch onto the other display.**
+  `switch-to-space` aimed at a space of the other display, or
+  `move-window-to-space --follow`, switched that display and left the pointer
+  and the key window behind on this one: macOS activates a window on the new
+  space only when the switch is on the active display, and that activation is
+  the focus change the pointer follows. rift now finishes such a switch
+  itself — the window last used on the new space is focused, and the pointer
+  goes to it as with any focus; an empty space gets its desktop focused and
+  the pointer in the middle of the display. A switch on the display the
+  pointer or the key window is already on is left to macOS as before.
 - **The layout is actually saved, so it is actually restored.** The restart
   restore never fired: on any machine with a desktop rift had listed but never
   shown since starting — a spare desktop on the other display, say — every

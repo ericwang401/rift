@@ -3264,6 +3264,7 @@ impl Reactor {
             &space_state,
         );
         let pending_space_state = space_state.clone();
+        let spaces_by_display_before = self.spaces_by_display();
         let ForwardedSpaceState {
             screens,
             fullscreen_spaces,
@@ -3403,11 +3404,93 @@ impl Reactor {
         let active_windows = self.authoritative_active_space_windows();
         self.finalize_space_change(&spaces, active_windows, releases_lifecycle_refresh_quarantine);
         self.settle_displaced_windows();
+        if !releases_lifecycle_refresh_quarantine {
+            self.follow_space_switch_across_displays(&spaces_by_display_before, &mut outcome);
+        }
         self.try_apply_pending_space_change();
         if should_force_refresh_layout {
             outcome = outcome.with_force_window_refresh().with_arrange_passes(1);
         }
         Ok(outcome)
+    }
+
+    /// The space each display currently shows, keyed by display uuid.
+    fn spaces_by_display(&self) -> HashMap<String, SpaceId> {
+        self.space_state
+            .screens
+            .iter()
+            .filter_map(|screen| Some((screen.display_uuid_owned()?, screen.space?)))
+            .collect()
+    }
+
+    /// A space switch that lands on another display moves nothing the
+    /// pointer could follow. macOS activates a window on the new space only
+    /// when the switch is on the active display, and that activation is what
+    /// `mouse_follows_focus` follows. `switch-to-space` aimed at a space of
+    /// the other display, or `move-window-to-space --follow`, switches a
+    /// display the pointer is not on, so nothing was activated and the
+    /// pointer stayed behind. Finish the switch the way one on the active
+    /// display ends: focus the window last used on the new space, which pulls
+    /// the pointer to it like any focus does, or, when the space has nothing
+    /// rift knows of, focus its desktop and put the pointer in the middle of
+    /// the display.
+    ///
+    /// Only for a switch, as opposed to a display coming or going or a wake
+    /// replaying the topology: exactly one display changed its space and the
+    /// rest kept theirs. And only when neither the pointer nor the key window
+    /// is on that display — otherwise the pointer is there already, or
+    /// macOS's own activation is on its way and will be followed as usual.
+    fn follow_space_switch_across_displays(
+        &mut self,
+        before: &HashMap<String, SpaceId>,
+        outcome: &mut EventOutcome,
+    ) {
+        if !self.config.settings.mouse_follows_focus
+            || self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input
+            || self.is_mission_control_active()
+            || self.is_in_drag()
+            || self.modifier_drag.is_some()
+        {
+            return;
+        }
+        let mut switched = self.space_state.screens.iter().filter_map(|screen| {
+            let space = screen.space?;
+            let previous = *before.get(screen.display_uuid_opt()?)?;
+            (previous != space).then_some((previous, space, screen.frame))
+        });
+        let (Some((previous, space, frame)), None) = (switched.next(), switched.next()) else {
+            return;
+        };
+        if window_server::current_cursor_location().is_ok_and(|point| frame.contains(point)) {
+            return;
+        }
+        let key_window_space =
+            self.main_window().and_then(|wid| self.best_space_for_window_id(wid));
+        if key_window_space.is_some_and(|key| key == space || key == previous) {
+            return;
+        }
+
+        if let Some(wid) = self.visible_focus_candidate_in_active_workspace(space, None) {
+            debug!(
+                ?wid,
+                space = space.get(),
+                "Following a space switch onto another display"
+            );
+            self.handle_layout_response(
+                layout::EventResponse {
+                    focus_window: Some(wid),
+                    ..Default::default()
+                },
+                None,
+            );
+            return;
+        }
+        debug!(
+            space = space.get(),
+            "Following a space switch onto another display's empty space"
+        );
+        self.focus_desktop_if_active_workspace_empty(space);
+        *outcome = std::mem::take(outcome).with_mouse_warp(frame.mid());
     }
 
     fn try_apply_pending_space_change(&mut self) {

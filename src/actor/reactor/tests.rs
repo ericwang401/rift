@@ -6283,6 +6283,157 @@ mod mouse_follows_focus {
         );
         crate::sys::window_server::set_cursor_location_override(None);
     }
+
+    /// Two displays, the pointer and the key window on the left one. Windows
+    /// on both, the right one's remembered as that space's last focus.
+    fn two_displays_focused_on_left() -> (Apps, Reactor, actor::Receiver<raise_manager::Event>) {
+        let (mut apps, mut reactor) = test_context();
+        let (raise_manager_tx, mut raise_manager_rx) = actor::channel();
+        reactor.communication_manager.raise_manager_tx = raise_manager_tx;
+        reactor.config.settings.mouse_follows_focus = true;
+        // What the window server shows on each space, so the test does not
+        // ask the real one: window 1 on space 1, window 2 on space 2, nothing
+        // on space 3. The harness numbers window-server ids pid × 10000 + index.
+        use crate::sys::window_server::set_space_window_list_for_space_override as show;
+        show(1, Some(vec![10001]));
+        show(2, Some(vec![10002]));
+        show(3, Some(vec![]));
+        let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(space_state_event_with(
+            vec![left, right],
+            vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
+            |state| state.has_seen_display_set = true,
+        ));
+        crate::sys::window_server::set_cursor_location_override(Some(left.mid()));
+
+        let mut windows = make_windows(2);
+        windows[1].frame.origin = CGPoint::new(1100., 100.);
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            windows,
+            Some(WindowId::new(1, 1)),
+            true,
+            true,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.send_layout_event(LayoutEvent::WindowFocused(SpaceId::new(2), WindowId::new(1, 2)));
+        reactor.send_layout_event(LayoutEvent::WindowFocused(SpaceId::new(1), WindowId::new(1, 1)));
+        assert_eq!(reactor.main_window(), Some(WindowId::new(1, 1)));
+        while raise_manager_rx.try_recv().is_ok() {}
+        reactor.test_mouse_warps.clear();
+        (apps, reactor, raise_manager_rx)
+    }
+
+    /// The right display switches to `space`; the left keeps the pointer,
+    /// the key window and the command space.
+    fn switch_right_display_to(reactor: &mut Reactor, space: SpaceId) {
+        let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(space_state_event_with(
+            vec![left, right],
+            vec![Some(SpaceId::new(1)), Some(space)],
+            |state| {
+                state.has_seen_display_set = true;
+                state.command_space = Some(SpaceId::new(1));
+                state.menu_bar_space = Some(SpaceId::new(1));
+            },
+        ));
+    }
+
+    /// A space switch on the other display activates nothing, so there is no
+    /// focus change to follow. The switch is finished here: the space's last
+    /// window is focused, and the pointer goes to it.
+    #[test]
+    fn a_space_switch_on_the_other_display_focuses_its_last_window_and_warps_there() {
+        let (_apps, mut reactor, mut raise_manager_rx) = two_displays_focused_on_left();
+        let b = WindowId::new(1, 2);
+
+        switch_right_display_to(&mut reactor, SpaceId::new(3));
+        while raise_manager_rx.try_recv().is_ok() {}
+        reactor.test_mouse_warps.clear();
+        switch_right_display_to(&mut reactor, SpaceId::new(2));
+        let msg = raise_manager_rx.try_recv().expect("the switch focuses the space's window").1;
+        let raise_manager::Event::RaiseRequest(RaiseRequest { focus_window, .. }) = msg else {
+            panic!("unexpected raise manager event: {msg:?}");
+        };
+        let b_center = reactor.live_frame_for(b).unwrap().mid();
+        assert_eq!(
+            focus_window,
+            Some((b, Some(b_center))),
+            "the window last used on the space is focused, with the pointer warped onto it"
+        );
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// When the space has nothing rift knows of, the pointer still crosses
+    /// over: to the middle of that display.
+    #[test]
+    fn a_space_switch_on_the_other_display_warps_to_its_centre_when_the_space_is_empty() {
+        let (_apps, mut reactor, mut raise_manager_rx) = two_displays_focused_on_left();
+        let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+
+        switch_right_display_to(&mut reactor, SpaceId::new(3));
+
+        assert_eq!(reactor.test_mouse_warps, vec![right.mid()]);
+        assert!(
+            raise_manager_rx.try_recv().is_err(),
+            "nothing on the space, so nothing to focus"
+        );
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// The pointer is already on the display that switched: a swipe there, or
+    /// rift's own gesture fallback, which parks the pointer first. Nothing
+    /// to bring over, and the focus stays with whatever macOS decides.
+    #[test]
+    fn a_space_switch_under_the_pointer_is_left_alone() {
+        let (_apps, mut reactor, mut raise_manager_rx) = two_displays_focused_on_left();
+        let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+        crate::sys::window_server::set_cursor_location_override(Some(right.mid()));
+
+        switch_right_display_to(&mut reactor, SpaceId::new(3));
+
+        assert!(reactor.test_mouse_warps.is_empty());
+        assert!(raise_manager_rx.try_recv().is_err());
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// A switch on the display that holds the key window is macOS's to
+    /// finish: it activates a window on the new space, and that activation
+    /// is followed like any other. Doing it here too would fight it.
+    #[test]
+    fn a_space_switch_on_the_key_windows_display_is_left_to_macos() {
+        let (_apps, mut reactor, mut raise_manager_rx) = two_displays_focused_on_left();
+        let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+        crate::sys::window_server::set_cursor_location_override(Some(right.mid()));
+        let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+
+        reactor.handle_event(space_state_event_with(
+            vec![left, right],
+            vec![Some(SpaceId::new(3)), Some(SpaceId::new(2))],
+            |state| state.has_seen_display_set = true,
+        ));
+
+        assert!(reactor.test_mouse_warps.is_empty());
+        assert!(raise_manager_rx.try_recv().is_err());
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
+
+    /// With the setting off, a cross-display switch changes nothing about
+    /// where the pointer or the focus is.
+    #[test]
+    fn a_space_switch_on_the_other_display_does_nothing_when_the_setting_is_off() {
+        let (_apps, mut reactor, mut raise_manager_rx) = two_displays_focused_on_left();
+        reactor.config.settings.mouse_follows_focus = false;
+
+        switch_right_display_to(&mut reactor, SpaceId::new(3));
+
+        assert!(reactor.test_mouse_warps.is_empty());
+        assert!(raise_manager_rx.try_recv().is_err());
+        crate::sys::window_server::set_cursor_location_override(None);
+    }
 }
 
 mod floating_placement {
