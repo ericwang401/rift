@@ -22,7 +22,7 @@ use tempfile::NamedTempFile;
 use tracing::Span;
 
 use super::{Event, Reactor};
-use crate::actor::app::{AppThreadHandle, Request, WindowId};
+use crate::actor::app::{AppThreadHandle, Request, WindowId, WindowInventoryToken};
 use crate::actor::{self};
 use crate::common::config::Config;
 use crate::layout_engine::LayoutEngine;
@@ -164,6 +164,43 @@ type ReadTrace = (
 );
 
 /// Reads a trace, giving every app in it `handle` to send its requests to.
+/// The token a `WindowsDiscovered` gets when the trace predates tokens.
+/// Live tokens start at request id 1, so this never collides with one.
+const LEGACY_INVENTORY_TOKEN: WindowInventoryToken = WindowInventoryToken {
+    request_id: 0,
+    topology_revision: 0,
+};
+
+/// Traces recorded before an inventory carried a token (or a `successful`
+/// flag) still replay: the missing fields are filled in here, and the
+/// placeholder token is swapped for the one the replayed reactor has in
+/// flight when the event is fed to it — see `fill_legacy_inventory_token`.
+fn legacy_windows_discovered(json: &str) -> Option<Event> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let fields = value.get_mut("WindowsDiscovered")?.as_object_mut()?;
+    if !fields.contains_key("token") {
+        fields.insert(
+            "token".to_string(),
+            serde_json::to_value(LEGACY_INVENTORY_TOKEN).ok()?,
+        );
+    }
+    fields.entry("successful").or_insert(serde_json::Value::Bool(true));
+    serde_json::from_value(value).ok()
+}
+
+/// A recorded reactor accepted every inventory it was handed; the replayed
+/// one only accepts the request it has in flight for that app, so answer
+/// that one. With nothing in flight the placeholder stays and the reactor
+/// discards the inventory as unsolicited, as it would live.
+fn fill_legacy_inventory_token(reactor: &Reactor, event: &mut Event) {
+    if let Event::WindowsDiscovered { pid, token, .. } = event
+        && *token == LEGACY_INVENTORY_TOKEN
+        && let Some(in_flight) = reactor.window_inventory_manager.in_flight.get(pid)
+    {
+        *token = *in_flight;
+    }
+}
+
 fn read_trace_with_handle(path: &Path, handle: AppThreadHandle) -> anyhow::Result<ReadTrace> {
     let file = BufReader::new(File::open(path)?);
     DESERIALIZE_THREAD_HANDLE.with(|h| h.borrow_mut().replace(handle));
@@ -192,13 +229,16 @@ fn read_trace_with_handle(path: &Path, handle: AppThreadHandle) -> anyhow::Resul
             let (ms, event) = rest.split_once(' ').expect("Ev line without an event");
             let event = match serde_json::from_str(event) {
                 Ok(event) => event,
-                Err(json_error) => ron::de::from_str(event).map_err(|_| {
-                    anyhow::anyhow!(
-                        "line {}: event does not deserialize: {json_error}: {}",
-                        number + 3,
-                        &event[..event.len().min(160)]
-                    )
-                })?,
+                Err(json_error) => match legacy_windows_discovered(event) {
+                    Some(event) => event,
+                    None => ron::de::from_str(event).map_err(|_| {
+                        anyhow::anyhow!(
+                            "line {}: event does not deserialize: {json_error}: {}",
+                            number + 3,
+                            &event[..event.len().min(160)]
+                        )
+                    })?,
+                },
             };
             out.push(TraceLine::Event { ms: ms.parse()?, event });
         } else if let Some(rest) = line.strip_prefix("Sys ") {
@@ -595,6 +635,8 @@ fn replay_trace_with(
             )
         });
         report.events += 1;
+        let mut event = event;
+        fill_legacy_inventory_token(&reactor, &mut event);
         reactor.handle_event(event);
         if let Some(note) = dropping {
             report.state_changes.push(note);

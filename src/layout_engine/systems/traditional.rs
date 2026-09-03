@@ -1,5 +1,6 @@
 use objc2_core_foundation::CGRect;
 use serde::{Deserialize, Serialize};
+use slotmap::Key;
 use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
@@ -1711,11 +1712,13 @@ impl TraditionalLayoutSystem {
             let window = system.window_at(node);
             let info = system.tree.data.layout.info[node];
             rift_protocol::ContainerTreeNode {
+                node_id: node.data().as_ffi(),
                 node_type: if window.is_some() {
                     rift_protocol::ContainerNodeType::Window
                 } else {
                     rift_protocol::ContainerNodeType::Container
                 },
+                frame: Default::default(),
                 layout_kind: window.is_none().then_some(info.kind),
                 weight: node.parent(system.map()).map(|_| f64::from(info.size)),
                 window_id: window.map(Into::into),

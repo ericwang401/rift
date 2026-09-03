@@ -26,6 +26,7 @@ pub struct LayoutCommandPayload {
     pub command_space: Option<SpaceId>,
     pub visible_spaces: Vec<SpaceId>,
     pub visible_space_centers: HashMap<SpaceId, objc2_core_foundation::CGPoint>,
+    pub post_arrange_mouse_warp: Option<WindowId>,
 }
 
 pub fn handle_command_layout(
@@ -39,8 +40,11 @@ pub fn handle_command_layout(
         command_space,
         visible_spaces,
         visible_space_centers,
+        post_arrange_mouse_warp,
     } = payload;
     info!(?cmd);
+    let is_move_node = matches!(cmd, LayoutCommand::MoveNode(_));
+    let is_selection_command = matches!(cmd, LayoutCommand::Ascend | LayoutCommand::Descend);
     let is_workspace_switch = matches!(
         cmd,
         LayoutCommand::NextWorkspace(_)
@@ -137,10 +141,16 @@ pub fn handle_command_layout(
         return Ok(EventOutcome::no_change());
     }
 
+    let selection_changed = is_selection_command && response.changed;
     let arrange_space_scope = is_workspace_switch.then_some(workspace_space).flatten();
-    Ok(EventOutcome::layout_changed(false)
+    let mut outcome = EventOutcome::layout_changed(false)
         .with_layout_response(response, workspace_space)
-        .with_arrange_space_scope(arrange_space_scope))
+        .with_arrange_space_scope(arrange_space_scope);
+    outcome.broadcast_selection_changed = selection_changed;
+    if is_move_node && let Some(window) = post_arrange_mouse_warp {
+        outcome = outcome.with_post_arrange_mouse_warp(window);
+    }
+    Ok(outcome)
 }
 
 fn current_floating_positions(
@@ -319,11 +329,7 @@ pub struct DisplayFocusPayload {
     pub focus_window_center: Option<objc2_core_foundation::CGPoint>,
 }
 
-/// Build a raise request that moves real (window server) focus to `window`,
-/// mirroring what `handle_command_reactor_focus_window` emits. Without this,
-/// display-focus commands only update the layout engine's internal selection
-/// and macOS keyboard focus stays on the previous display.
-fn display_focus_raise_request(apps: &AppManager, window: WindowId) -> raise_manager::Event {
+fn focus_window_raise_request(apps: &AppManager, window: WindowId) -> raise_manager::Event {
     let mut app_handles: HashMap<i32, AppThreadHandle> = HashMap::default();
     if let Some(app) = apps.apps.get(&window.pid) {
         app_handles.insert(window.pid, app.handle.clone());
@@ -351,7 +357,7 @@ pub fn handle_move_mouse_to_display(
     if let (Some(space), Some(window)) = (screen.space, payload.focus_window) {
         outcome = outcome
             .with_layout_event(LayoutEvent::WindowFocused(space, window))
-            .with_raise_request(display_focus_raise_request(apps, window));
+            .with_raise_request(focus_window_raise_request(apps, window));
     }
     Ok(outcome)
 }
@@ -373,7 +379,7 @@ pub fn handle_focus_display(
         // engine's selection onto the other display.
         return Ok(EventOutcome::focus_changed(None, false)
             .with_layout_event(LayoutEvent::WindowFocused(space, window))
-            .with_raise_request(display_focus_raise_request(apps, window))
+            .with_raise_request(focus_window_raise_request(apps, window))
             .with_mouse_warp(payload.focus_window_center.unwrap_or_else(|| screen.frame.mid())));
     }
     Ok(EventOutcome::focus_changed(None, false).with_mouse_warp(screen.frame.mid()))
@@ -402,17 +408,7 @@ pub fn handle_command_reactor_focus_window(
         }
         outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window_id));
 
-        let mut app_handles: HashMap<i32, AppThreadHandle> = HashMap::default();
-        if let Some(app) = apps.apps.get(&window_id.pid) {
-            app_handles.insert(window_id.pid, app.handle.clone());
-        }
-        let request = raise_manager::Event::RaiseRequest(raise_manager::RaiseRequest {
-            raise_windows: Vec::new(),
-            focus_window: Some((window_id, None)),
-            app_handles,
-            focus_quiet: Quiet::No,
-        });
-        outcome = outcome.with_raise_request(request);
+        outcome = outcome.with_raise_request(focus_window_raise_request(apps, window_id));
     } else if let Some(wsid) = window_server_id {
         outcome = outcome.with_make_key_window(window_id.pid, wsid);
     }

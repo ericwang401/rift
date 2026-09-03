@@ -95,19 +95,19 @@ impl WindowId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Size {
     pub width: f64,
     pub height: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub origin: Point,
     pub size: Size,
@@ -182,8 +182,6 @@ pub struct LayoutStateData {
     pub selected_window: Option<WindowId>,
     /// Normalized topology for the queried workspace's tiled layout.
     ///
-    /// Internal node IDs are intentionally omitted because they are not stable across layout
-    /// mutations. Consumers can identify leaves by `window_id` and other nodes by their path.
     pub container_tree: ContainerTreeNode,
 }
 
@@ -200,7 +198,14 @@ pub enum ContainerNodeType {
 /// A platform-neutral view of one node in a tiled layout.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContainerTreeNode {
+    /// Stable identity for this node for as long as it exists in the workspace.
+    pub node_id: u64,
     pub node_type: ContainerNodeType,
+    /// The layout target for this node, in the same coordinate space as `WindowData::frame`.
+    ///
+    /// Container frames describe the space allocated by the layout engine, before any window
+    /// animation. Window frames are the target frames emitted by that same layout calculation.
+    pub frame: Rect,
     /// Split/stack behavior for a container. Window and placeholder nodes use `None`.
     pub layout_kind: Option<LayoutKind>,
     /// This node's relative share within its parent, when the layout engine has one.

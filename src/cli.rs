@@ -492,12 +492,12 @@ pub enum DisplayCommands {
 pub enum SubscribeCommands {
     /// Subscribe to Mach IPC events
     Mach {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, *)
         event: String,
     },
     /// Subscribe to events via CLI command execution
     Cli {
-        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, *)
+        /// Event to subscribe to (workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, *)
         #[arg(long)]
         event: String,
         /// Command to execute when event occurs
@@ -882,9 +882,10 @@ fn parse_event_kind(input: &str) -> Result<EventKind, String> {
         "focused_window_changed" => Ok(EventKind::FocusedWindowChanged),
         "stacks_changed" => Ok(EventKind::StacksChanged),
         "layout_changed" => Ok(EventKind::LayoutChanged),
+        "selection_changed" => Ok(EventKind::SelectionChanged),
         "*" => Ok(EventKind::All),
         other => Err(format!(
-            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, or *",
+            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, or *",
             other
         )),
     }

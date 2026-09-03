@@ -877,6 +877,6 @@ impl Reactor {
         if size.width > 0.0 && size.height > 0.0 {
             outcome = outcome.with_layout_event(LayoutEvent::SpaceExposed(space, size));
         }
-        outcome.with_force_window_refresh().with_arrange_passes(1)
+        outcome.with_window_inventory_refresh().with_arrange_passes(1)
     }
 }
