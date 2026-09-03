@@ -244,6 +244,57 @@ impl BspLayoutSystem {
         self.window_insertion_point = value;
     }
 
+    /// Every leaf holding `wid`, wherever it sits. `window_to_node` is meant
+    /// to hold one node per window, but a leaf that lost its index entry —
+    /// an identity replaced onto a window that already had a leaf, an insert
+    /// that overwrote the entry — stays in the tree, rendered and given
+    /// space, with nothing able to reach it: the "ghost tile".
+    fn leaves_holding(&self, wid: WindowId) -> Vec<NodeId> {
+        self.kind
+            .iter()
+            .filter_map(|(node, kind)| match kind {
+                NodeKind::Leaf { window: Some(window), .. } if *window == wid => Some(node),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Takes every leaf for `wid` out of the tree, indexed or not, so that
+    /// an insert that follows leaves exactly one — and a removal leaves none.
+    /// A leaf the index has lost is otherwise unreachable: it stays in the
+    /// tree, is laid out with the rest, and its frame writes drag the window
+    /// back to a space it has left.
+    fn retire_all_leaves(&mut self, wid: WindowId) {
+        let indexed = self.node_for_window(wid);
+        for node in self.leaves_holding(wid) {
+            if self.kind.get(node).is_none() {
+                continue;
+            }
+            if indexed != Some(node) {
+                // Worth knowing about after the fact: which window, and
+                // whether the index pointed elsewhere or nowhere.
+                crate::sys::trace::act("ghost_leaf", &(wid.idx.get(), indexed.is_some()));
+            }
+            self.window_to_node.insert(wid, node);
+            self.remove_indexed_window(wid);
+        }
+        self.unindex_window(wid);
+    }
+
+    /// Removes the leaf the index points at for `wid`, if any.
+    fn remove_indexed_window(&mut self, wid: WindowId) {
+        if let Some(node_id) = self.node_for_window_mut(wid) {
+            let root = self.find_layout_root(node_id);
+            let layout = self
+                .layouts
+                .iter()
+                .find_map(|(id, s)| if s.root == root { Some(id) } else { None });
+            if let Some(l) = layout {
+                self.remove_window_internal(l, wid);
+            }
+        }
+    }
+
     fn index_window(&mut self, wid: WindowId, node: NodeId) {
         debug_assert!(
             matches!(self.kind.get(node), Some(NodeKind::Leaf { .. })),
@@ -252,9 +303,7 @@ impl BspLayoutSystem {
         self.window_to_node.insert(wid, node);
     }
 
-    fn unindex_window(&mut self, wid: WindowId) {
-        self.window_to_node.remove(&wid);
-    }
+    fn unindex_window(&mut self, wid: WindowId) { self.window_to_node.remove(&wid); }
 
     fn node_for_window(&self, wid: WindowId) -> Option<NodeId> {
         self.window_to_node.get(&wid).copied()
@@ -272,15 +321,12 @@ impl BspLayoutSystem {
 
     fn make_leaf(&mut self, window: Option<WindowId>) -> NodeId {
         let id = self.tree.mk_node().into_id();
-        self.kind.insert(
-            id,
-            NodeKind::Leaf {
-                window,
-                fullscreen: false,
-                fullscreen_within_gaps: false,
-                preselected: None,
-            },
-        );
+        self.kind.insert(id, NodeKind::Leaf {
+            window,
+            fullscreen: false,
+            fullscreen_within_gaps: false,
+            preselected: None,
+        });
         if let Some(w) = window {
             self.index_window(w, id);
         }
@@ -413,15 +459,12 @@ impl BspLayoutSystem {
                 if let Some(w) = window {
                     self.index_window(w, parent_id);
                 }
-                self.kind.insert(
-                    parent_id,
-                    NodeKind::Leaf {
-                        window,
-                        fullscreen,
-                        fullscreen_within_gaps,
-                        preselected,
-                    },
-                );
+                self.kind.insert(parent_id, NodeKind::Leaf {
+                    window,
+                    fullscreen,
+                    fullscreen_within_gaps,
+                    preselected,
+                });
             }
         }
 
@@ -841,8 +884,57 @@ impl Components {
 mod tests {
     use super::*;
 
-    fn w(idx: u32) -> WindowId {
-        WindowId::new(1, idx)
+    fn w(idx: u32) -> WindowId { WindowId::new(1, idx) }
+
+    /// A leaf the index no longer points at is invisible to every removal,
+    /// so the next insert of the same window used to leave two leaves: one
+    /// live, one a ghost that kept its share of the screen.
+    #[test]
+    fn inserting_a_window_retires_a_leaf_the_index_lost() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        system.window_to_node.remove(&w(2));
+
+        system.add_window_after_selection(layout, w(2));
+        assert_eq!(system.leaves_holding(w(2)).len(), 1);
+        assert_eq!(system.windows_for_app(layout, 1), vec![w(1), w(2)]);
+
+        system.window_to_node.remove(&w(2));
+        assert!(system.insert_window_next_to(layout, w(1), Direction::Left, w(2)));
+        assert_eq!(system.leaves_holding(w(2)).len(), 1);
+        assert_eq!(system.windows_for_app(layout, 1).len(), 2);
+    }
+
+    /// A removal takes out a leaf the index has lost too: left in, it is
+    /// laid out with the rest, and its frame writes fight the tree the
+    /// window has moved to.
+    #[test]
+    fn removing_a_window_retires_a_leaf_the_index_lost() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        system.window_to_node.remove(&w(2));
+
+        system.remove_window(w(2));
+        assert!(system.leaves_holding(w(2)).is_empty());
+        assert_eq!(system.windows_for_app(layout, 1), vec![w(1)]);
+    }
+
+    /// Replacing an identity onto a window that already has a leaf keeps
+    /// one leaf, not the old one as a ghost.
+    #[test]
+    fn replacing_onto_a_window_with_a_leaf_keeps_one_leaf() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        system.replace_window(w(1), w(2));
+        assert_eq!(system.leaves_holding(w(2)).len(), 1);
+        assert_eq!(system.windows_for_app(layout, 1), vec![w(2)]);
     }
 
     #[test]
@@ -1083,14 +1175,11 @@ mod tests {
             .filter(|line| line.contains("Split"))
             .map(|line| line.trim().to_string())
             .collect();
-        assert_eq!(
-            ratios,
-            [
-                "Split Horizontal 0.33",
-                "Split Vertical 0.50",
-                "Split Horizontal 0.50"
-            ]
-        );
+        assert_eq!(ratios, [
+            "Split Horizontal 0.33",
+            "Split Vertical 0.50",
+            "Split Horizontal 0.50"
+        ]);
     }
 
     #[test]
@@ -1577,9 +1666,7 @@ impl LayoutSystem for BspLayoutSystem {
         self.layouts.insert(state)
     }
 
-    fn contains_layout(&self, layout: LayoutId) -> bool {
-        self.layouts.contains_key(layout)
-    }
+    fn contains_layout(&self, layout: LayoutId) -> bool { self.layouts.contains_key(layout) }
 
     /// shallow
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
@@ -1826,14 +1913,14 @@ impl LayoutSystem for BspLayoutSystem {
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
-        if self.windows_for_app(layout, wid.pid).contains(&wid) {
-            // Re-adding an existing window means "move it to the selection", so
-            // retire the old leaf first. window_to_node holds one node per
-            // window, so inserting without this strands the previous leaf: the
-            // tree goes on rendering it and dividing space for it, while
-            // nothing can reach it to take it out again.
-            self.remove_window(wid);
-        }
+        // Re-adding an existing window means "move it to the selection", so
+        // retire the old leaf first. window_to_node holds one node per
+        // window, so inserting without this strands the previous leaf: the
+        // tree goes on rendering it and dividing space for it, while
+        // nothing can reach it to take it out again. Every leaf, not only
+        // the indexed one: a leaf the index has already lost is exactly the
+        // one that would otherwise survive as a ghost.
+        self.retire_all_leaves(wid);
         if self.layouts.get(layout).is_some() {
             if self.window_insertion_point == WindowInsertionPoint::EndOfTree {
                 let root = self.layouts[layout].root;
@@ -1859,6 +1946,10 @@ impl LayoutSystem for BspLayoutSystem {
         if from == to {
             return;
         }
+        // `to` may already have a leaf of its own; re-pointing the index at
+        // `from`'s leaf would strand it. Retired first: the removal reshapes
+        // the tree, and `from`'s node is looked up after it settles.
+        self.retire_all_leaves(to);
         let Some(node) = self.window_to_node.remove(&from) else {
             return;
         };
@@ -1870,18 +1961,7 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    fn remove_window(&mut self, wid: WindowId) {
-        if let Some(node_id) = self.node_for_window_mut(wid) {
-            let root = self.find_layout_root(node_id);
-            let layout = self
-                .layouts
-                .iter()
-                .find_map(|(id, s)| if s.root == root { Some(id) } else { None });
-            if let Some(l) = layout {
-                self.remove_window_internal(l, wid);
-            }
-        }
-    }
+    fn remove_window(&mut self, wid: WindowId) { self.retire_all_leaves(wid); }
 
     fn remove_windows_for_app(&mut self, pid: pid_t) {
         let windows: Vec<_> =
@@ -2285,9 +2365,7 @@ impl LayoutSystem for BspLayoutSystem {
         vec![]
     }
 
-    fn parent_of_selection_is_stacked(&self, _layout: LayoutId) -> bool {
-        false
-    }
+    fn parent_of_selection_is_stacked(&self, _layout: LayoutId) -> bool { false }
 
     fn unstack_parent_of_selection(
         &mut self,
@@ -2375,9 +2453,7 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    fn can_insert_next_to(&self) -> bool {
-        true
-    }
+    fn can_insert_next_to(&self) -> bool { true }
 
     fn insert_window_next_to(
         &mut self,
@@ -2399,7 +2475,7 @@ impl LayoutSystem for BspLayoutSystem {
         // It is normally already somewhere in this tree, so it has to leave
         // before it can be re-inserted; splitting first would strand its old
         // leaf, since window_to_node holds one node per window.
-        self.remove_window(window);
+        self.retire_all_leaves(window);
         // Re-read the target: removing a window collapses its parent split, so
         // the node the target lives in may not be the one seen above.
         let Some(&leaf) = self.window_to_node.get(&target) else {
