@@ -685,6 +685,9 @@ static inline uint64_t get_space_id(id space)
 
 static inline id space_for_display_with_id(CFStringRef display_uuid, uint64_t space_id)
 {
+    // NOTE(rift): a space the window server no longer knows has no display;
+    // its uuid comes back NULL, and Dock's lookups must not see it.
+    if (display_uuid == NULL) return nil;
     NSArray *spaces_for_display = ((NSArray *(*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(spacesForDisplay:), display_uuid);
     for (id space in spaces_for_display) {
         if (space_id == get_space_id(space)) {
@@ -697,6 +700,7 @@ static inline id space_for_display_with_id(CFStringRef display_uuid, uint64_t sp
 static inline id display_space_for_display_uuid(CFStringRef display_uuid)
 {
     id result = nil;
+    if (display_uuid == NULL) return nil;
 
     NSArray *display_spaces = get_ivar_value(dock_spaces, "_displaySpaces");
     if (display_spaces != nil) {
@@ -704,6 +708,7 @@ static inline id display_space_for_display_uuid(CFStringRef display_uuid)
             id display_source_space = get_ivar_value(display_space, "_currentSpace");
             uint64_t sid = get_space_id(display_source_space);
             CFStringRef uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), sid);
+            if (uuid == NULL) continue;
             bool match = CFEqual(uuid, display_uuid);
             CFRelease(uuid);
             if (match) {
@@ -743,10 +748,17 @@ static void do_space_move(char *message)
     unpack(focus_dest_space);
 
     CFStringRef source_display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), source_space_id);
+    CFStringRef dest_display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
+    // NOTE(rift): either space gone (a destroyed desktop) is a move with
+    // nothing to do, not a crash inside Dock.
+    if (source_display_uuid == NULL || dest_display_uuid == NULL) {
+        if (source_display_uuid) CFRelease(source_display_uuid);
+        if (dest_display_uuid) CFRelease(dest_display_uuid);
+        return;
+    }
     id source_space = space_for_display_with_id(source_display_uuid, source_space_id);
     id source_display_space = display_space_for_display_uuid(source_display_uuid);
 
-    CFStringRef dest_display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
     id dest_space = space_for_display_with_id(dest_display_uuid, dest_space_id);
     unsigned dest_display_id = ((unsigned (*)(id, SEL, id)) objc_msgSend)(dock_spaces, @selector(displayIDForSpace:), dest_space);
     id dest_display_space = display_space_for_display_uuid(dest_display_uuid);
@@ -794,6 +806,7 @@ static void do_space_destroy(char *message)
     unpack(space_id);
 
     CFStringRef display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), space_id);
+    if (display_uuid == NULL) return;
     uint64_t active_space_id = SLSManagedDisplayGetCurrentSpace(SLSMainConnectionID(), display_uuid);
 
     id space = space_for_display_with_id(display_uuid, space_id);
@@ -820,6 +833,7 @@ static void do_space_create(char *message)
     unpack(space_id);
 
     CFStringRef __block display_uuid = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), space_id);
+    if (display_uuid == NULL) return;
     dispatch_sync(dispatch_get_main_queue(), ^{
         id new_space = macOSSequoia
                      ? [[objc_getClass("ManagedSpace") alloc] init]
@@ -876,6 +890,7 @@ static bool do_space_focus(char *message)
 
     bool focused = false;
     CFStringRef dest_display = SLSCopyManagedDisplayForSpace(SLSMainConnectionID(), dest_space_id);
+    if (dest_display == NULL) return false;
     id source_space = macOSSequoia
                     ? ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceForDisplayUUID:), dest_display)
                     : ((id (*)(id, SEL, CFStringRef)) objc_msgSend)(dock_spaces, @selector(currentSpaceforDisplayUUID:), dest_display);
