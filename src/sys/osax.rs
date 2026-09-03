@@ -608,13 +608,34 @@ fn load() -> Result<String, String> {
         )),
         Some(handshake) if !handshake.missing().is_empty() => Ok(format!(
             "scripting addition v{OSAX_VERSION} loaded, but it could not find {} in this Dock; \
-             the matching commands will not work",
-            handshake.missing().join(", ")
+             the matching commands will not work{}",
+            handshake.missing().join(", "),
+            reapply_to_running_rift()
         )),
         Some(handshake) => Ok(format!(
-            "scripting addition v{} loaded and healthy",
-            handshake.version
+            "scripting addition v{} loaded and healthy{}",
+            handshake.version,
+            reapply_to_running_rift()
         )),
+    }
+}
+
+/// A rift already running applied its addition-backed settings — the space
+/// switch animation above all — when *it* started, to whatever payload was
+/// in Dock then. A payload loaded afterwards (a Dock restart, a crash, this
+/// very command) has none of that until told again. Reloading rift's config
+/// re-sends it; done here so `sa load` leaves a working setup, not one that
+/// needs rift restarted too. Best effort: rift may not be running.
+fn reapply_to_running_rift() -> &'static str {
+    let request = rift_protocol::RiftRequest::ExecuteCommand {
+        command: rift_protocol::RiftCommand::Config(rift_protocol::ConfigCommand::ReloadConfig),
+    };
+    match crate::ipc::RiftMachClient::connect().and_then(|client| client.send_request(&request)) {
+        Ok(_) => "; rift re-applied its settings to it",
+        Err(_) => {
+            "; rift is not running or could not be reached, so restart it to apply the \
+                   space switch animation"
+        }
     }
 }
 
