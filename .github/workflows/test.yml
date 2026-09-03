@@ -54,7 +54,7 @@ jobs:
       # satisfy current nightly rustfmt, and reformatting a hundred untouched
       # files to make CI green would destroy the ability to rebase onto
       # upstream. So this gate holds new work to the standard without
-      # relitigating the old: only files this push or PR actually touched.
+      # relitigating the old: only files this fork's own commits touched.
       #
       # --skip-children is part of that: rustfmt follows `mod` declarations, so
       # without it a one-line change to src/lib.rs drags the whole crate in.
@@ -72,9 +72,33 @@ jobs:
             exit 0
           fi
 
-          files="$(git diff --name-only --diff-filter=d "$base" HEAD -- '*.rs')"
+          # A sync merge lands the whole of upstream's history in this range at
+          # once, so diffing the endpoints hands rustfmt every file upstream
+          # touched -- exactly the relitigation this gate exists to avoid.
+          # Fetch upstream so its commits can be subtracted below. Only the
+          # commit graph is needed, hence blob:none.
+          git remote add upstream https://github.com/acsandmann/rift.git 2>/dev/null || true
+          git fetch --quiet --no-tags --filter=blob:none upstream '+refs/heads/*:refs/remotes/upstream/*'
+          git rev-parse --verify --quiet refs/remotes/upstream/main >/dev/null
+
+          tmp="$(mktemp -d)"
+
+          # Files this fork authored: everything in the range that upstream does
+          # not already carry. Merges are skipped -- one that only reconciles
+          # two sides wrote nothing itself, and its combined diff would flag
+          # every clean auto-merge alongside any real conflict resolution.
+          git log "$base..HEAD" --no-merges --not --remotes=upstream \
+            --name-only --pretty=format: -- '*.rs' \
+            | sed '/^$/d' | sort -u > "$tmp/ours"
+
+          # Intersect with the endpoint diff, so a file that was touched and
+          # then reverted, renamed away or deleted drops back out.
+          git diff --name-only --diff-filter=d "$base" HEAD -- '*.rs' \
+            | sort -u > "$tmp/touched"
+
+          files="$(comm -12 "$tmp/ours" "$tmp/touched")"
           if [ -z "$files" ]; then
-            echo "no Rust files changed"
+            echo "no Rust files changed by this fork's own commits"
             exit 0
           fi
 
