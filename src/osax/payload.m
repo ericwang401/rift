@@ -24,6 +24,9 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <dlfcn.h>
+#include <mach/mach_time.h>
+#include <math.h>
+#include <libkern/OSCacheControl.h>
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -91,6 +94,11 @@ static uint64_t remove_space_fp;
 static uint64_t move_space_fp;
 static uint64_t set_front_window_fp;
 static uint64_t animation_time_addr;
+
+// rift addition: Dock's trackpad space-switch step routine, hooked so rift can
+// set the animation's timing. Zero when this Dock does not have it. See
+// space_step_resolve and the block above init_instances.
+static uint64_t space_step_addr;
 static bool macOSSequoia;
 
 static pthread_t daemon_thread;
@@ -270,6 +278,263 @@ static bool verify_os_version(NSOperatingSystemVersion os_version)
     return false;
 }
 
+#if __arm64__
+//
+// rift addition: custom timing for the trackpad space switch.
+//
+// When a swipe between spaces is released, Dock animates the rest of the way
+// with a velocity spring that a routine on DockCore.SpaceSwitcher steps from a
+// timer: it reads the target space index and the current scroll position,
+// integrates the spring, stores the new position, pushes it to the window
+// server and answers whether the animation is over. There is no duration in
+// it to change, and its coefficients sit in a literal pool that three other
+// Dock animations share, so the routine's body is hooked instead. Its
+// prologue and its tail are left alone; the math between them is replaced by
+// a jump into space_step_thunk, which asks space_step for the position and
+// jumps back to the tail with it, so Dock still stores, applies and commits
+// exactly as before. Dock keeps tracking the finger and rendering; only the
+// curve after the fingers lift is rift's, a duration and a cubic bezier that
+// arrive on SA_OPCODE_SPACE_SWITCH_ANIMATION.
+//
+// Nothing is patched until rift asks. Until then, and again after a duration
+// of zero puts the original bytes back, the routine is Dock's own.
+//
+
+// The five prologue instructions stay; the detour goes where `mov v8, v0` was.
+#define SPACE_STEP_DETOUR_OFFSET 0x14
+// ldr x16, #8 ; br x16 ; .quad space_step_thunk
+#define SPACE_STEP_PATCH_LEN     16
+
+static uint64_t space_step_resume_delta;
+static uint8_t space_step_original[SPACE_STEP_PATCH_LEN];
+static bool space_step_hooked;
+
+static ptrdiff_t space_step_off_position;
+static ptrdiff_t space_step_off_index;
+static ptrdiff_t space_step_off_count;
+static ptrdiff_t space_step_off_last_time;
+static ptrdiff_t space_step_off_velocity;
+
+static double space_step_duration;
+static double space_step_bezier[4];
+
+static struct {
+    bool active;
+    double start_time;
+    double start_position;
+    double target;
+    double expected_position;
+} space_step_anim;
+
+// Read from the thunk, so it has to survive the optimizer as a real symbol.
+__attribute__((used, visibility("hidden"))) uint64_t space_step_resume;
+
+// CACurrentMediaTime without QuartzCore: the same clock, in seconds, which is
+// what Dock keeps in lastAnimationTime.
+static double space_step_now(void)
+{
+    static mach_timebase_info_data_t timebase;
+    if (timebase.denom == 0) mach_timebase_info(&timebase);
+    return (double) mach_absolute_time() * timebase.numer / timebase.denom / 1e9;
+}
+
+// y at x on the cubic bezier through (0,0), (x1,y1), (x2,y2), (1,1): the CSS
+// timing function. Newton on the x polynomial, bisection if it strays.
+static double space_step_ease(double x)
+{
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+
+    double x1 = space_step_bezier[0], y1 = space_step_bezier[1];
+    double x2 = space_step_bezier[2], y2 = space_step_bezier[3];
+    double cx = 3.0 * x1, bx = 3.0 * (x2 - x1) - cx, ax = 1.0 - cx - bx;
+    double cy = 3.0 * y1, by = 3.0 * (y2 - y1) - cy, ay = 1.0 - cy - by;
+
+    double t = x;
+    bool converged = false;
+    for (int i = 0; i < 8; ++i) {
+        double error = ((ax * t + bx) * t + cx) * t - x;
+        if (fabs(error) < 1e-6) { converged = true; break; }
+        double slope = (3.0 * ax * t + 2.0 * bx) * t + cx;
+        if (fabs(slope) < 1e-9) break;
+        t -= error / slope;
+    }
+    if (!converged || t < 0.0 || t > 1.0) {
+        double lo = 0.0, hi = 1.0;
+        t = x;
+        for (int i = 0; i < 32; ++i) {
+            double xt = ((ax * t + bx) * t + cx) * t;
+            if (fabs(xt - x) < 1e-6) break;
+            if (xt < x) lo = t; else hi = t;
+            t = (lo + hi) * 0.5;
+        }
+    }
+    return ((ay * t + by) * t + cy) * t;
+}
+
+// The replacement for the spring. Runs inside Dock's own frame for the
+// routine, on its animation timer, with `self` the SpaceSwitcher and `dt` the
+// timestep Dock passes (unused: the curve is over wall-clock time). Writes the
+// new scroll position and returns whether the animation is finished, which
+// the tail stores and returns as the routine always did.
+__attribute__((used, visibility("hidden"))) int space_step(void *self, double dt, double *out_position)
+{
+    (void) dt;
+    char *fields = (char *) self;
+    double position = *(double *) (fields + space_step_off_position);
+    int64_t index = *(int64_t *) (fields + space_step_off_index);
+    int64_t count = *(int64_t *) (fields + space_step_off_count);
+    double target = count >= 2 ? (double) index / (double) (count - 1) : 0.0;
+    double now = space_step_now();
+
+    // A fresh animation: the first step after a release, a release toward a
+    // different space, or a position Dock moved without us -- the finger
+    // came back down and dragged the spaces itself.
+    if (!space_step_anim.active
+        || space_step_anim.target != target
+        || position != space_step_anim.expected_position) {
+        space_step_anim.active = true;
+        space_step_anim.start_time = now;
+        space_step_anim.start_position = position;
+        space_step_anim.target = target;
+    }
+
+    double t = space_step_duration > 0.0 ? (now - space_step_anim.start_time) / space_step_duration : 1.0;
+    bool finished = t >= 1.0;
+    double next = finished
+                ? target
+                : space_step_anim.start_position + (target - space_step_anim.start_position) * space_step_ease(t);
+
+    *(double *) (fields + space_step_off_last_time) = now;
+    if (finished) {
+        *(double *) (fields + space_step_off_velocity) = 0.0;
+        space_step_anim.active = false;
+    }
+    space_step_anim.expected_position = next;
+    *out_position = next;
+    return finished ? 1 : 0;
+}
+
+// Entered from the detour with Dock's frame in place: x20 is self, d0 the
+// timestep, and x19, d1 are what the tail expects -- the finished flag and
+// the new position. x19 and x20 are callee-saved, so they survive the call;
+// x30 was saved by the prologue and is restored by the epilogue.
+__attribute__((naked)) static void space_step_thunk(void)
+{
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "mov x0, x20\n"
+        "mov x1, sp\n"
+        "bl _space_step\n"
+        "mov w19, w0\n"
+        "ldr d1, [sp]\n"
+        "add sp, sp, #16\n"
+        "adrp x16, _space_step_resume@PAGE\n"
+        "ldr x16, [x16, _space_step_resume@PAGEOFF]\n"
+        "br x16\n"
+    );
+}
+
+static bool space_step_write(uint64_t addr, const void *bytes, size_t len)
+{
+    vm_address_t start = page_align(addr);
+    vm_size_t size = page_align(addr + len - 1) + vm_page_size - start;
+    if (vm_protect(mach_task_self(), start, size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+        return false;
+    }
+    memcpy((void *) addr, bytes, len);
+    vm_protect(mach_task_self(), start, size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate((void *) addr, len);
+    return true;
+}
+
+// Installs or removes the detour. Called on the main queue, which is where
+// Dock's animation timer runs, so the routine is not mid-flight while its
+// bytes change.
+static void space_step_set_hooked(bool hooked)
+{
+    if (!space_step_addr || hooked == space_step_hooked) return;
+    uint64_t site = space_step_addr + SPACE_STEP_DETOUR_OFFSET;
+
+    if (hooked) {
+        uint8_t patch[SPACE_STEP_PATCH_LEN];
+        uint32_t ldr = 0x58000050; // ldr x16, #8
+        uint32_t br = 0xD61F0200;  // br x16
+        uint64_t thunk = (uint64_t) ptrauth_strip((void *) &space_step_thunk, ptrauth_key_asia);
+        memcpy(patch, &ldr, sizeof(ldr));
+        memcpy(patch + 4, &br, sizeof(br));
+        memcpy(patch + 8, &thunk, sizeof(thunk));
+        memcpy(space_step_original, (void *) site, SPACE_STEP_PATCH_LEN);
+        if (space_step_write(site, patch, sizeof(patch))) {
+            space_step_hooked = true;
+            NSLog(@"[rift-sa] space switch step hooked at 0x%llx", site);
+        } else {
+            NSLog(@"[rift-sa] space switch step vm_protect failed; unable to hook!");
+        }
+    } else {
+        if (space_step_write(site, space_step_original, SPACE_STEP_PATCH_LEN)) {
+            space_step_hooked = false;
+            NSLog(@"[rift-sa] space switch step restored");
+        } else {
+            NSLog(@"[rift-sa] space switch step vm_protect failed; unable to restore!");
+        }
+    }
+}
+
+static void space_step_resolve(uint64_t baseaddr, NSOperatingSystemVersion os_version)
+{
+    const char *pattern = get_space_step_pattern(os_version);
+    if (!pattern) return;
+
+    uint64_t addr = hex_find_seq(baseaddr + get_space_step_offset(os_version), pattern);
+    if (addr == 0) {
+        NSLog(@"[rift-sa] failed to get pointer to space switch step..");
+        return;
+    }
+
+    // The routine reads the switcher through fixed offsets and so does the
+    // hook, but the hook takes them from the runtime rather than from a
+    // table, since the Swift class still lists them as ivars.
+    Class switcher = objc_getClass("_TtC8DockCore13SpaceSwitcher");
+    struct { const char *name; ptrdiff_t *offset; } ivars[] = {
+        { "scrollPosition",    &space_step_off_position },
+        { "currentSpaceIndex", &space_step_off_index },
+        { "_spacesCount",      &space_step_off_count },
+        { "lastAnimationTime", &space_step_off_last_time },
+        { "_velocity",         &space_step_off_velocity },
+    };
+    for (size_t i = 0; i < sizeof(ivars) / sizeof(ivars[0]); ++i) {
+        Ivar ivar = switcher ? class_getInstanceVariable(switcher, ivars[i].name) : NULL;
+        if (!ivar) {
+            NSLog(@"[rift-sa] SpaceSwitcher has no ivar %s; space switch step will not be hooked", ivars[i].name);
+            return;
+        }
+        *ivars[i].offset = ivar_getOffset(ivar);
+    }
+
+    // The tail the hook returns to has to be `str d1, [x20, #scrollPosition]`
+    // -- the one store the hook feeds -- or the resume delta is for a
+    // different Dock than this one.
+    uint64_t resume = addr + get_space_step_resume_delta(os_version);
+    uint32_t expected = 0xFD000000 | ((uint32_t) (space_step_off_position / 8) << 10) | (20 << 5) | 1;
+    if (*(uint32_t *) resume != expected) {
+        NSLog(@"[rift-sa] space switch step tail at 0x%llx is 0x%x, expected 0x%x; not hooking", resume, *(uint32_t *) resume, expected);
+        return;
+    }
+
+    space_step_addr = addr;
+    space_step_resume = resume;
+    space_step_resume_delta = resume - addr;
+    NSLog(@"[rift-sa] (0x%llx) space switch step found at address 0x%llX (0x%llx)", baseaddr, addr, addr - baseaddr);
+}
+#else
+static void space_step_resolve(uint64_t baseaddr, NSOperatingSystemVersion os_version)
+{
+    (void) baseaddr;
+    (void) os_version;
+}
+#endif
+
 static void init_instances()
 {
     NSOperatingSystemVersion os_version = [[NSProcessInfo processInfo] operatingSystemVersion];
@@ -397,6 +662,8 @@ static void init_instances()
             NSLog(@"[rift-sa] animation_time_addr vm_protect failed; unable to patch instruction!");
         }
     }
+
+    space_step_resolve(baseaddr, os_version);
 }
 
 static inline id get_ivar_value(id instance, const char *name)
@@ -976,6 +1243,31 @@ static void do_window_move_to_space(char *message)
     CFRelease(window_list_ref);
 }
 
+// [f64 duration seconds][f64 x1][f64 y1][f64 x2][f64 y2]. A positive duration
+// installs the hook (if this Dock has the routine) and sets the curve; zero
+// restores Dock's own animation. Applied on the main queue, where the
+// animation timer runs, so the timing never changes under a running step.
+static void do_space_switch_animation(char *message)
+{
+    double duration;
+    unpack(duration);
+
+    // A struct rather than an array: a block cannot capture an array.
+    struct { double points[4]; } curve;
+    unpack(curve);
+
+#if __arm64__
+    if (!space_step_addr) return;
+
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        space_step_duration = duration > 0.0 ? duration : 0.0;
+        memcpy(space_step_bezier, curve.points, sizeof(space_step_bezier));
+        space_step_anim.active = false;
+        space_step_set_hooked(duration > 0.0);
+    });
+#endif
+}
+
 static void do_handshake(int sockfd)
 {
     uint32_t attrib = 0;
@@ -987,6 +1279,7 @@ static void do_handshake(int sockfd)
     if (move_space_fp)                     attrib |= OSAX_ATTRIB_MOV_SPACE;
     if (set_front_window_fp)               attrib |= OSAX_ATTRIB_SET_WINDOW;
     if (animation_time_addr)               attrib |= OSAX_ATTRIB_ANIM_TIME;
+    if (space_step_addr)                   attrib |= OSAX_ATTRIB_SPACE_STEP;
 
     char bytes[BUFSIZ] = {};
     int version_length = strlen(OSAX_VERSION);
@@ -1056,6 +1349,9 @@ static void handle_message(int sockfd, char *message)
     } break;
     case SA_OPCODE_WINDOW_ORDER_IN: {
         do_window_order_in(message);
+    } break;
+    case SA_OPCODE_SPACE_SWITCH_ANIMATION: {
+        do_space_switch_animation(message);
     } break;
     case SA_OPCODE_WINDOW_LIST_TO_SPACE: {
         do_window_list_move_to_space(message);

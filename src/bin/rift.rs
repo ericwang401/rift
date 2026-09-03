@@ -207,6 +207,10 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     }
 
     execute_startup_commands(&config.settings.run_on_start);
+    // After run_on_start, since that is where `sudo rift sa load` usually is.
+    rift_wm::sys::scripting_addition::apply_space_switch_animation(
+        &config.settings.space_switch_animation,
+    );
 
     let (broadcast_tx, broadcast_rx) = rift_wm::actor::channel();
 

@@ -248,3 +248,41 @@ const char *get_set_front_window_pattern(NSOperatingSystemVersion os_version) {
 
     return NULL;
 }
+
+//
+// rift additions below: the routine Dock steps its trackpad space-switch
+// animation with, hooked by payload.m so rift can supply the timing. Only
+// the versions the hook has been checked against are listed; anywhere else
+// the pattern is NULL and the feature reports itself absent.
+//
+
+uint64_t get_space_step_offset(NSOperatingSystemVersion os_version) {
+    if (os_version.majorVersion == 26) {
+        return 0x140000;
+    }
+
+    return 0;
+}
+
+// The prologue (d8/d9, x19/x20, the frame) and then the first of the body:
+// `mov v8, v0` keeping the timestep, the call to CACurrentMediaTime,
+// `ldr d2, [x20, #lastAnimationTime]`, `fsub`, `fdiv d0, d0, d8`.
+const char *get_space_step_pattern(NSOperatingSystemVersion os_version) {
+    if (os_version.majorVersion == 26) {
+        return "7F 23 03 D5 E9 23 BD 6D F4 4F 01 A9 FD 7B 02 A9 FD 83 00 91 08 1C A0 4E ?? ?? ?? 94 82 16 40 FD 00 38 62 1E 00 18 68 1E";
+    }
+
+    return NULL;
+}
+
+// From the match to the tail the hook jumps back to: `str d1, [x20,
+// #scrollPosition]`, the call that pushes the position to the window server,
+// `mov x0, x19` for the finished flag, and the epilogue. payload.m checks the
+// store is really there before it patches anything.
+uint64_t get_space_step_resume_delta(NSOperatingSystemVersion os_version) {
+    if (os_version.majorVersion == 26) {
+        return 0x1c4;
+    }
+
+    return 0;
+}

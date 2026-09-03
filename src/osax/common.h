@@ -20,7 +20,7 @@
 // way a running Dock would have to pick up: `rift sa load` compares this
 // against what the payload answers with and reinstalls when they differ.
 //
-#define OSAX_VERSION                "1.2.0"
+#define OSAX_VERSION                "1.3.0"
 
 #define OSAX_ATTRIB_DOCK_SPACES     0x01
 #define OSAX_ATTRIB_DPPM            0x02
@@ -29,6 +29,9 @@
 #define OSAX_ATTRIB_MOV_SPACE       0x10
 #define OSAX_ATTRIB_SET_WINDOW      0x20
 #define OSAX_ATTRIB_ANIM_TIME       0x40
+// rift's own: the routine Dock steps the trackpad space switch with, hooked
+// on SA_OPCODE_SPACE_SWITCH_ANIMATION.
+#define OSAX_ATTRIB_SPACE_STEP      0x80
 
 #define OSAX_ATTRIB_ALL             (OSAX_ATTRIB_DOCK_SPACES | \
                                      OSAX_ATTRIB_DPPM | \
@@ -36,7 +39,8 @@
                                      OSAX_ATTRIB_REM_SPACE | \
                                      OSAX_ATTRIB_MOV_SPACE | \
                                      OSAX_ATTRIB_SET_WINDOW | \
-                                     OSAX_ATTRIB_ANIM_TIME)
+                                     OSAX_ATTRIB_ANIM_TIME | \
+                                     OSAX_ATTRIB_SPACE_STEP)
 
 enum sa_opcode
 {
@@ -59,6 +63,9 @@ enum sa_opcode
     SA_OPCODE_WINDOW_ORDER_IN       = 0x11,
     SA_OPCODE_WINDOW_LIST_TO_SPACE  = 0x12,
     SA_OPCODE_WINDOW_TO_SPACE       = 0x13,
+    // rift's own, past yabai's numbering: [f64 duration seconds][f64 x1, y1,
+    // x2, y2]. A duration of zero restores Dock's animation.
+    SA_OPCODE_SPACE_SWITCH_ANIMATION = 0x14,
 };
 
 #endif

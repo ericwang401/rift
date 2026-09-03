@@ -13,6 +13,27 @@ Entries describe this fork's changes relative to
 
 ### Added
 
+- **The trackpad space switch can run on your own timing.** After the fingers
+  lift from a swipe between macOS spaces, Dock finishes the slide with a
+  velocity spring of its own, and nothing in it is a duration to change. With
+  the scripting addition loaded, a new setting replaces that spring with a
+  fixed duration and a curve, while Dock keeps tracking the fingers, rendering,
+  and committing the switch itself:
+
+  ```toml
+  [settings.space_switch_animation]
+  enabled = true
+  duration_ms = 200
+  easing = "ease-out"   # linear | ease | ease-in | ease-out | ease-in-out |
+                        # apple-default, or a cubic bezier: [0.4, 0, 0.2, 1]
+  ```
+
+  The payload hooks Dock's step routine for the animation (found by pattern;
+  macOS 26 on Apple silicon for now) and reports it as the `space switch step`
+  attribute. Nothing is patched until the setting is on, and turning it off
+  puts Dock's original instructions back. rift sends the setting at startup
+  and on every config reload, so after a `sudo rift sa load` while rift is
+  running, reload the config once. `OSAX_VERSION` is `1.3.0`.
 - **`rift` now accepts every `rift-cli` subcommand**: `rift query windows`,
   `rift execute …` and `rift subscribe …` work exactly as their `rift-cli`
   spellings do, so the one binary covers running the window manager, managing

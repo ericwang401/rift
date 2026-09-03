@@ -447,6 +447,95 @@ pub enum SpaceSwitchMethod {
     ScriptingAddition,
 }
 
+/// The timing of the animation that finishes a trackpad space switch.
+///
+/// After the fingers lift from a swipe between macOS spaces, Dock slides the
+/// rest of the way with a velocity spring of its own. With this enabled, the
+/// scripting addition replaces that spring with a fixed duration and a curve,
+/// while Dock keeps tracking the fingers, rendering, and committing the switch.
+/// It is applied at startup and on every config reload; `rift sa status` says
+/// whether the addition found the routine in this Dock (`space switch step`).
+///
+/// ```toml
+/// [settings.space_switch_animation]
+/// enabled = true
+/// duration_ms = 200
+/// easing = "ease-out"        # or a cubic bezier: [0.25, 0.1, 0.25, 1.0]
+/// ```
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SpaceSwitchAnimationSettings {
+    /// Replace Dock's spring with the duration and curve below. Needs the
+    /// scripting addition.
+    #[serde(default = "no")]
+    pub enabled: bool,
+    /// How long the slide takes once the fingers lift, whatever the distance
+    /// left to cover.
+    #[serde(default = "default_space_switch_duration_ms")]
+    pub duration_ms: u64,
+    /// The curve of that slide. See `Easing`.
+    #[serde(default)]
+    pub easing: Easing,
+}
+
+fn default_space_switch_duration_ms() -> u64 { 250 }
+
+impl Default for SpaceSwitchAnimationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duration_ms: default_space_switch_duration_ms(),
+            easing: Easing::default(),
+        }
+    }
+}
+
+/// A timing curve: one of the CSS names, or a cubic bezier given as its two
+/// control points `[x1, y1, x2, y2]`, the way `cubic-bezier()` takes them.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(untagged)]
+pub enum Easing {
+    Named(EasingName),
+    Bezier([f64; 4]),
+}
+
+impl Default for Easing {
+    fn default() -> Self { Easing::Named(EasingName::default()) }
+}
+
+impl Easing {
+    /// The control points, with the names resolved to their CSS definitions.
+    pub fn bezier(self) -> [f64; 4] {
+        match self {
+            Easing::Bezier(points) => points,
+            Easing::Named(name) => match name {
+                EasingName::Linear => [0.0, 0.0, 1.0, 1.0],
+                EasingName::Ease => [0.25, 0.1, 0.25, 1.0],
+                EasingName::EaseIn => [0.42, 0.0, 1.0, 1.0],
+                EasingName::EaseOut => [0.0, 0.0, 0.58, 1.0],
+                EasingName::EaseInOut => [0.42, 0.0, 0.58, 1.0],
+                EasingName::AppleDefault => [0.25, 0.1, 0.25, 1.0],
+            },
+        }
+    }
+}
+
+/// The CSS timing-function names, plus Core Animation's default.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EasingName {
+    Linear,
+    Ease,
+    EaseIn,
+    #[default]
+    EaseOut,
+    EaseInOut,
+    /// `kCAMediaTimingFunctionDefault`, the curve Core Animation uses when
+    /// nothing else is asked for. The same points as `ease`, under the name
+    /// people look for.
+    AppleDefault,
+}
+
 /// What a modifier-held drag of a mouse button does.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
@@ -572,6 +661,10 @@ pub struct Settings {
     /// How to change the active macOS space. See `SpaceSwitchMethod`.
     #[serde(default)]
     pub space_switch_method: SpaceSwitchMethod,
+    /// The timing of the trackpad space switch. See
+    /// `SpaceSwitchAnimationSettings`.
+    #[serde(default)]
+    pub space_switch_animation: SpaceSwitchAnimationSettings,
     /// Remember a display's layout when it disconnects (unplug, sleep, lid
     /// close) and put it back when the same display returns, moving its
     /// windows home through the scripting addition. macOS hands a returning
@@ -1266,6 +1359,22 @@ impl Settings {
         }
 
         issues.extend(self.layout.validate());
+
+        if self.space_switch_animation.enabled && self.space_switch_animation.duration_ms == 0 {
+            issues.push(
+                "space_switch_animation.duration_ms must be positive when enabled (0 would \
+                 hand the animation back to Dock)"
+                    .to_string(),
+            );
+        }
+        if let Easing::Bezier([x1, _, x2, _]) = self.space_switch_animation.easing
+            && !((0.0..=1.0).contains(&x1) && (0.0..=1.0).contains(&x2))
+        {
+            issues.push(format!(
+                "space_switch_animation.easing control points need x1 and x2 within 0..=1, got \
+                 {x1} and {x2}"
+            ));
+        }
 
         if self.gestures.swipe_vertical_tolerance < 0.0 {
             issues.push(format!(

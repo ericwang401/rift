@@ -99,6 +99,38 @@ for bytes the first one already replaced. On a machine that also has yabai's
 addition loaded, `0x3f` is the expected, healthy answer, and
 `move_window_to_space` — the command that matters most — needs no flag at all.
 
+`SPACE_STEP` (`0x80`) is rift's own and also optional. It says the payload
+found the routine Dock steps the trackpad space-switch animation with, which
+the `space_switch_animation` setting hooks (see below). Unlike `ANIM_TIME`,
+finding it changes nothing: the routine is only patched once rift asks.
+
+## The space switch animation hook
+
+When a swipe between spaces is released, Dock finishes the slide with a
+velocity spring that a routine on `DockCore.SpaceSwitcher` steps from a timer:
+read the target space index and the scroll position, integrate, store the
+position, push it to the window server, answer whether it is done. There is no
+duration in it, and its coefficients sit in a literal pool three other Dock
+animations share, so the payload hooks the routine's body instead. The
+prologue and the tail stay; the math between them becomes a jump into the
+payload, which computes the position from a duration and a cubic bezier and
+jumps back into the tail, so Dock stores, applies and commits as it always
+did. Finger tracking before the release is untouched.
+
+`SA_OPCODE_SPACE_SWITCH_ANIMATION` (`0x14`) carries the duration in seconds and
+the four bezier control points as `f64`s. A positive duration installs the
+detour and sets the curve; zero restores the original sixteen bytes. rift sends
+it at startup and on every config reload, from `space_switch_animation` in the
+config. The payload keeps the setting until it is told otherwise or Dock
+restarts.
+
+The pattern for the routine is in `arm64_payload.m` next to the others, with a
+delta from the match to the tail; the payload refuses to hook unless the
+instruction at that delta is the store it expects (`str d1, [x20,
+#scrollPosition]`, with the ivar offset taken from the runtime), so a Dock the
+pattern happens to match but the delta does not is left alone. Only macOS 26 on
+Apple silicon is listed so far.
+
 ## What the payload answers
 
 Every command is one short-lived connection: rift writes the frame, the

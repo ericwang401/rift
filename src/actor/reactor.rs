@@ -2844,6 +2844,9 @@ impl Reactor {
             {
                 warn!(%error, "failed to update menu bar config");
             }
+            crate::sys::scripting_addition::apply_space_switch_animation(
+                &config.settings.space_switch_animation,
+            );
             if let Some(wm) = &self.communication_manager.wm_sender {
                 wm.send(crate::actor::wm_controller::WmEvent::ConfigUpdated(config));
             }

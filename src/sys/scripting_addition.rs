@@ -49,6 +49,7 @@ mod opcode {
     pub const SPACE_MOVE: u8 = 0x05;
     pub const SPACE_DESTROY: u8 = 0x04;
     pub const WINDOW_TO_SPACE: u8 = 0x13;
+    pub const SPACE_SWITCH_ANIMATION: u8 = 0x14;
 }
 
 /// Which Dock internals the payload managed to find, one flag each, matching
@@ -66,6 +67,10 @@ pub mod attrib {
     /// The instruction the payload patches to zero out Dock's space-change
     /// animation. rift never asks for this and does not need it.
     pub const ANIM_TIME: u32 = 0x40;
+    /// The routine Dock steps the trackpad space switch with, which
+    /// [`super::set_space_switch_animation`] hooks. Optional: only the
+    /// `space_switch_animation` setting needs it.
+    pub const SPACE_STEP: u32 = 0x80;
 
     /// The flags whose absence would actually cost rift a command, and the
     /// command each one is for:
@@ -94,6 +99,7 @@ pub mod attrib {
             (MOV_SPACE, "move space"),
             (SET_WINDOW, "set front window"),
             (ANIM_TIME, "animation time"),
+            (SPACE_STEP, "space switch step"),
         ]
         .into_iter()
         .filter(|(flag, _)| wanted & flag != 0 && reported & flag == 0)
@@ -353,6 +359,55 @@ pub fn move_space_after_space(space: u64, after: u64, focus: bool) -> bool {
 
 /// Destroys a space by id.
 pub fn destroy_space(space: u64) -> bool { send(opcode::SPACE_DESTROY, &space.to_ne_bytes()) }
+
+/// Sets the timing of the trackpad space switch, or gives Dock its own back.
+///
+/// After a swipe between spaces is released, Dock finishes the slide with a
+/// velocity spring it steps from a timer. The payload hooks that step and,
+/// while a duration is set, moves the spaces along `bezier` — a CSS-style
+/// cubic bezier through (0,0), (x1,y1), (x2,y2), (1,1) — over `duration`
+/// instead. `None` restores the original instructions. The finger tracking
+/// before the release is Dock's either way.
+///
+/// The payload keeps the setting until it is told otherwise or Dock restarts,
+/// so this is sent at startup and on every config reload rather than per
+/// switch. Needs [`attrib::SPACE_STEP`], which the payload only reports on a
+/// Dock whose routine it recognised.
+pub fn set_space_switch_animation(animation: Option<(Duration, [f64; 4])>) -> bool {
+    let (duration, bezier) = match animation {
+        Some((duration, bezier)) => (duration.as_secs_f64(), bezier),
+        None => (0.0, [0.0; 4]),
+    };
+    let mut args = Vec::with_capacity(5 * size_of::<f64>());
+    args.extend_from_slice(&duration.to_ne_bytes());
+    for point in bezier {
+        args.extend_from_slice(&point.to_ne_bytes());
+    }
+    send(opcode::SPACE_SWITCH_ANIMATION, &args)
+}
+
+/// Applies the `space_switch_animation` setting to the payload.
+///
+/// Disabled means asking for Dock's own animation back, which matters after a
+/// reload that turned the setting off. When the setting is on and nothing
+/// answers, that is worth a warning: the user asked for a timing they are not
+/// getting, and `rift sa status` says why.
+pub fn apply_space_switch_animation(
+    settings: &crate::common::config::SpaceSwitchAnimationSettings,
+) {
+    let animation = settings.enabled.then(|| {
+        (
+            Duration::from_millis(settings.duration_ms),
+            settings.easing.bezier(),
+        )
+    });
+    if !set_space_switch_animation(animation) && settings.enabled {
+        warn!(
+            "space_switch_animation is enabled but the scripting addition did not take it; \
+             it needs the addition loaded in a Dock it recognises (see 'rift sa status')"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
