@@ -235,6 +235,14 @@ pub fn classify_window_frame_change(
     // lost whole drags: no session, no drop resolution, and a stale frame
     // stored at release.
     let user_is_dragging = *mouse_state == Some(MouseState::Down);
+    // The user has the window, so whatever write was still pending for it
+    // aimed at a slot it is no longer in. Left on the books, it matched the
+    // drop's own target — the same slot — and the arrange skipped the write
+    // as already requested: the window stayed where it was dropped until a
+    // later sweep happened to clear the entry.
+    if user_is_dragging && let Some(server) = server_id {
+        transactions.clear_target_for_window(server);
+    }
     if let Some(server) = server_id
         && !user_is_dragging
         && let Some(target) = transactions.get_target_frame(server)

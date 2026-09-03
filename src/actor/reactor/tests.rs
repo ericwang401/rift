@@ -1384,6 +1384,62 @@ fn dropping_with_no_swap_still_arranges_the_window_back() {
     );
 }
 
+/// A tile drag leaves the window off its slot. The drop's arrange skips a
+/// target that matches the write still pending for the window — and the last
+/// arrange's write for that very slot was still on the books — so the drop
+/// wrote nothing and the window stayed where it was dropped until a later
+/// sweep happened to clear the entry. Taking hold of a window clears it.
+#[test]
+fn drop_after_a_drag_writes_the_slot_even_when_that_write_was_still_pending() {
+    let (mut reactor, wid, wsid, space1, _space2, screen) = reactor_with_window_on_space1();
+    reactor.send_layout_event(crate::actor::reactor::LayoutEvent::WindowAdded(space1, wid));
+    let (app_tx, mut app_rx) = crate::actor::channel();
+    reactor.app_manager.apps.get_mut(&wid.pid).unwrap().handle =
+        crate::actor::app::AppThreadHandle::new_for_test(app_tx);
+    let slot = crate::sys::geometry::Round::round(
+        &test_layout(&mut reactor, space1, screen)
+            .into_iter()
+            .find(|(w, _)| *w == wid)
+            .map(|(_, frame)| frame)
+            .expect("the window is tiled"),
+    );
+    // In its slot, with the write that put it there still pending.
+    reactor.state.windows.window_mut(wid).unwrap().frame_monotonic = slot;
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, slot);
+    while app_rx.try_recv().is_ok() {}
+
+    let moved = CGRect::new(CGPoint::new(slot.origin.x + 40., slot.origin.y + 30.), slot.size);
+    crate::sys::event::set_mouse_state_override(Some(crate::sys::event::MouseState::Down));
+    reactor.handle_event(Event::WindowFrameChanged(
+        wid,
+        moved,
+        Some(txid),
+        crate::model::reactor::Requested(false),
+        Some(crate::sys::event::MouseState::Down),
+    ));
+    assert_eq!(reactor.window_in_drag(), Some(wid), "the drag is tracked");
+    crate::sys::event::set_mouse_state_override(Some(crate::sys::event::MouseState::Up));
+    reactor.handle_event(Event::MouseUp);
+    crate::sys::event::set_mouse_state_override(None);
+
+    let written = std::iter::from_fn(|| app_rx.try_recv().ok())
+        .filter_map(|(_, request)| match request {
+            Request::SetWindowFrame(w, frame, _, _) if w == wid => Some(frame),
+            Request::AnimationFrame { wid: w, frame, .. } if w == wid => Some(frame),
+            Request::SetBatchWindowFrame(frames, _, _) => {
+                frames.into_iter().find(|(w, _)| *w == wid).map(|(_, frame)| frame)
+            }
+            _ => None,
+        })
+        .last();
+    assert_eq!(
+        written,
+        Some(slot),
+        "the drop must put the window back in its slot"
+    );
+}
+
 /// A modifier resize moves the edges the press landed nearest, so the window
 /// follows the cursor. Growing from the origin instead moves the right and
 /// bottom edges whichever way the cursor goes, which reads as the window
