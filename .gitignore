@@ -3,3 +3,4 @@ target
 rift.toml
 src/bin/dev.rs
 .idea
+.claude/worktrees/
