@@ -57,12 +57,32 @@ impl Reactor {
         // by the second removal it sits wherever that path dropped it: a window
         // tiled on the left records itself as the right-hand one. Later
         // removals find the work already done.
-        if self.fullscreen_slots.slots.contains_key(&window) {
-            return;
-        }
         let Some(space) = self.space_of_tiled_window(window) else {
+            crate::sys::trace::act(
+                "fullscreen_slot",
+                &(window.idx.get(), "not tiled; not recorded"),
+            );
             return;
         };
+        // A slot for another space is a leftover: the window was put back
+        // there by a path that never consulted it, and it would only be
+        // dropped on the way back as "landed elsewhere". Its truth is gone;
+        // this removal's is the one to keep.
+        if let Some(existing) = self.fullscreen_slots.slots.get(&window) {
+            if existing.space == space {
+                return;
+            }
+            crate::sys::trace::act(
+                "fullscreen_slot",
+                &(
+                    window.idx.get(),
+                    "stale slot replaced",
+                    existing.space.get(),
+                    space.get(),
+                ),
+            );
+            self.fullscreen_slots.slots.remove(&window);
+        }
         let engine = &mut self.layout_manager.layout_engine;
         if engine.is_window_floating(window) {
             // A float comes back as a float; its frame is kept elsewhere.
@@ -76,6 +96,15 @@ impl Reactor {
                 return;
             }
         };
+        crate::sys::trace::act(
+            "fullscreen_slot",
+            &(
+                window.idx.get(),
+                "recorded",
+                space.get(),
+                anchor.map(|slot| slot.anchor.idx.get()),
+            ),
+        );
         self.fullscreen_slots
             .slots
             .insert(window, FullscreenSlot { space, snapshot, anchor });
@@ -138,6 +167,15 @@ impl Reactor {
         };
         if slot.space != space {
             debug!(?window, "Fullscreen exit landed on another space; slot dropped");
+            crate::sys::trace::act(
+                "fullscreen_slot",
+                &(
+                    window.idx.get(),
+                    "landed elsewhere; dropped",
+                    slot.space.get(),
+                    space.get(),
+                ),
+            );
             return false;
         }
 
@@ -160,6 +198,10 @@ impl Reactor {
                     matched = report.matched,
                     "Fullscreen exit: layout put back as it was"
                 );
+                crate::sys::trace::act(
+                    "fullscreen_slot",
+                    &(window.idx.get(), "restored", report.matched),
+                );
                 return true;
             }
             Ok(report) => debug!(
@@ -177,8 +219,10 @@ impl Reactor {
             && self.layout_manager.layout_engine.restore_slot(space, anchor, window)
         {
             info!(?window, anchor = ?anchor.anchor, side = ?anchor.side, "Fullscreen exit: window put back beside its old neighbour");
+            crate::sys::trace::act("fullscreen_slot", &(window.idx.get(), "re-anchored"));
             return true;
         }
+        crate::sys::trace::act("fullscreen_slot", &(window.idx.get(), "nothing matched"));
         false
     }
 
