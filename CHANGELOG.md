@@ -90,6 +90,17 @@ Entries describe this fork's changes relative to
   issued the switch, and the gesture runs only on a refusal — the readback,
   its deadline, and the miss counter and 30s cooldown that came with them are
   gone. `OSAX_VERSION` is `1.1.0`; run `rift sa load` after updating.
+- **The Dock comes back when a scripting-addition switch leaves a fullscreen
+  space, and hides when one enters it.** Dock decides its own visibility from a
+  controller that tracks which space the bar is on, and only Dock's own switch
+  transition told that controller about a new space. The addition switches
+  through the window server directly, so the controller kept the old answer:
+  from a fullscreen space to a desktop the Dock stayed hidden, and the other
+  way it stayed up over the fullscreen app. The payload now hands the new
+  space to that controller after every switch, which is the same call Dock's
+  own space-change listener makes. Switches still teleport; nothing falls
+  back to the swipe. `OSAX_VERSION` is `1.2.0`; run `sudo rift sa load` after
+  updating.
 
 - **The drop overlay no longer promises a move a stack cannot make.** Dragging
   a window on a space in stack mode drew a screen-sized drop region for the

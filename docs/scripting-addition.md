@@ -113,6 +113,15 @@ space too far — so the fallback decision has to rest on the payload's own
 word, not on rift reading the window server back afterwards, which can stall
 under a fullscreen game long enough to look like a miss.
 
+`SPACE_FOCUS` also does one thing beyond yabai's version of it: after the
+window server has switched, it hands the new space to Dock's visibility
+controller (`-[DockBar setDockVisibleOnSpace:alreadyLocked:]`, reached through
+the spaces object's `delegate`), which is what Dock's own space-change listener
+does. That controller keeps its own idea of which space the bar is on, and it
+is what hides the Dock on a fullscreen space and brings it back on a desktop;
+without the call, a teleport out of a fullscreen space arrived with no Dock
+and one into it left the Dock up over the app.
+
 ## Versioning
 
 `OSAX_VERSION` appears twice — in `src/osax/common.h`, compiled into the

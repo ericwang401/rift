@@ -570,6 +570,35 @@ static void do_space_create(char *message)
 // come from here rather than from watching the window server afterwards.
 // "Already there" counts as done: there is nothing for a fallback to do.
 //
+// Dock shows and hides itself around fullscreen spaces from a visibility
+// controller that keeps its own idea of which space the bar is on, and only
+// Dock's own switch transition hands that controller the new space. The SLS
+// calls in do_space_focus move the display without that transition, so a
+// switch out of a fullscreen space arrived with the bar still hidden and one
+// into a fullscreen space left it up over the app. This is the call Dock's
+// own space-change listener makes: the spaces object's delegate is the
+// DockBar, which forwards to the controller, and the controller ignores a
+// space on a display the Dock is not on. It goes to the main queue like the
+// other Dock mutations here; the switch has already been issued by then, so
+// the verdict does not wait on it.
+static void dock_update_visibility_for_space(id space)
+{
+    if (![dock_spaces respondsToSelector:@selector(delegate)]) return;
+    id delegate = ((id (*)(id, SEL)) objc_msgSend)(dock_spaces, @selector(delegate));
+    if (delegate == nil) return;
+
+    SEL update = @selector(setDockVisibleOnSpace:alreadyLocked:);
+    if (![delegate respondsToSelector:update]) return;
+
+    [delegate retain];
+    [space retain];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ((void (*)(id, SEL, id, BOOL)) objc_msgSend)(delegate, update, space, NO);
+        [space release];
+        [delegate release];
+    });
+}
+
 static bool do_space_focus(char *message)
 {
     if (dock_spaces == nil) return false;
@@ -598,6 +627,7 @@ static bool do_space_focus(char *message)
                 SLSHideSpaces(SLSMainConnectionID(), (__bridge CFArrayRef) ns_source_space);
                 SLSManagedDisplaySetCurrentSpace(SLSMainConnectionID(), dest_display, dest_space_id);
                 set_ivar_value(display_space, "_currentSpace", [dest_space retain]);
+                dock_update_visibility_for_space(dest_space);
                 [ns_dest_space release];
                 [ns_source_space release];
                 focused = true;
