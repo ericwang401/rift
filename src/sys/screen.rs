@@ -627,14 +627,21 @@ pub fn current_space_for_display_uuid(display_uuid: &str) -> Option<SpaceId> {
     }
 
     crate::sys::trace::observe("display_current_space", display_uuid, || {
-        let uuid = CFString::from_str(display_uuid);
-        let id = unsafe {
-            CGSManagedDisplayGetCurrentSpace(
-                SLSMainConnectionID(),
-                CFRetained::<CFString>::as_ptr(&uuid).as_ptr(),
-            )
-        };
-        (id != 0).then_some(id as u64)
+        // Under test the window server is never asked; a display a test
+        // invented shows whatever desktop the test gave it, and nothing else.
+        #[cfg(test)]
+        return None;
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            let uuid = CFString::from_str(display_uuid);
+            let id = unsafe {
+                CGSManagedDisplayGetCurrentSpace(
+                    SLSMainConnectionID(),
+                    CFRetained::<CFString>::as_ptr(&uuid).as_ptr(),
+                )
+            };
+            (id != 0).then_some(id as u64)
+        }
     })
     .map(SpaceId::new)
 }

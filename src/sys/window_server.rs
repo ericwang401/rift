@@ -402,21 +402,52 @@ pub fn mission_control_dock_overlay_visible() -> bool {
         })
 }
 
+/// The window server's answer, except under test, where `inert` stands in.
+///
+/// Same reasoning as [`window_spaces`], and the same rule for every question
+/// below it: tests invent window and space ids, so a live answer is either
+/// meaningless or — when an invented id collides with something real on the
+/// machine running the suite — decides the test. It is also unsafe in the
+/// plainest sense. The suite runs its tests on many threads at once, and a
+/// headless CI runner has aborted the whole binary partway through when two
+/// of them drove SkyLight's window-management bridge concurrently. A test
+/// that needs an answer here states it with an override.
+#[inline]
+fn live_answer<T>(live: impl FnOnce() -> T, inert: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    {
+        let _ = live;
+        return inert();
+    }
+    #[cfg(not(test))]
+    {
+        let _ = inert;
+        live()
+    }
+}
+
 pub fn window_parent(id: WindowServerId) -> Option<WindowServerId> {
     trace::observe("window_parent", id.as_u32(), || {
-        let query = WindowIterator::new(&[id])?;
-        if query.count() == 1 {
-            let p = query.advance()?.parent_id();
-            (p != 0).then_some(p)
-        } else {
-            None
-        }
+        live_answer(
+            || {
+                let query = WindowIterator::new(&[id])?;
+                if query.count() == 1 {
+                    let p = query.advance()?.parent_id();
+                    (p != 0).then_some(p)
+                } else {
+                    None
+                }
+            },
+            || None,
+        )
     })
     .map(WindowServerId::new)
 }
 
 pub fn window_is_sticky(id: WindowServerId) -> bool {
-    trace::observe("window_is_sticky", id.as_u32(), || window_is_sticky_raw(id))
+    trace::observe("window_is_sticky", id.as_u32(), || {
+        live_answer(|| window_is_sticky_raw(id), || false)
+    })
 }
 
 fn window_is_sticky_raw(id: WindowServerId) -> bool {
@@ -495,10 +526,15 @@ pub fn window_ordered_in(id: WindowServerId) -> Option<bool> {
     }
 
     trace::observe("window_ordered_in", id.as_u32(), || {
-        let mut ordered: u8 = 0;
-        cg_ok(unsafe { SLSWindowIsOrderedIn(*G_CONNECTION, id.as_u32(), &mut ordered) })
-            .ok()
-            .map(|_| ordered != 0)
+        live_answer(
+            || {
+                let mut ordered: u8 = 0;
+                cg_ok(unsafe { SLSWindowIsOrderedIn(*G_CONNECTION, id.as_u32(), &mut ordered) })
+                    .ok()
+                    .map(|_| ordered != 0)
+            },
+            || None,
+        )
     })
 }
 
@@ -690,11 +726,16 @@ fn is_own_window(cid: i32) -> bool { *G_CONNECTION == cid }
 
 pub fn get_window_at_point(mut point: CGPoint) -> Option<WindowServerId> {
     trace::observe("window_at_point", trace::point_to(point), || {
-        let (mut wid, cid) = find_window_at_point(&mut point, None)?;
-        if is_own_window(cid) {
-            wid = find_window_at_point(&mut point, Some(wid))?.0;
-        }
-        Some(wid)
+        live_answer(
+            || {
+                let (mut wid, cid) = find_window_at_point(&mut point, None)?;
+                if is_own_window(cid) {
+                    wid = find_window_at_point(&mut point, Some(wid))?.0;
+                }
+                Some(wid)
+            },
+            || None,
+        )
     })
     .map(WindowServerId)
 }
@@ -776,10 +817,15 @@ pub fn current_cursor_location() -> Result<CGPoint, CGError> {
         return Ok(point);
     }
     trace::observe("cursor", (), || {
-        let mut point = CGPoint::new(0.0, 0.0);
-        cg_ok(unsafe { SLSGetCurrentCursorLocation(*G_CONNECTION, &mut point) })
-            .ok()
-            .map(|_| trace::point_to(point))
+        live_answer(
+            || {
+                let mut point = CGPoint::new(0.0, 0.0);
+                cg_ok(unsafe { SLSGetCurrentCursorLocation(*G_CONNECTION, &mut point) })
+                    .ok()
+                    .map(|_| trace::point_to(point))
+            },
+            || None,
+        )
     })
     .map(trace::point_from)
     .ok_or(CGError::Failure)
@@ -909,7 +955,12 @@ pub fn space_window_list_for_connection(
     trace::observe(
         "space_window_list",
         (spaces.to_vec(), owner, include_minimized),
-        || space_window_list_for_connection_raw(spaces, owner, include_minimized),
+        || {
+            live_answer(
+                || space_window_list_for_connection_raw(spaces, owner, include_minimized),
+                Vec::new,
+            )
+        },
     )
 }
 
@@ -979,7 +1030,10 @@ fn space_window_list_for_connection_raw(
 /// a newly materialized native tab.
 pub fn key_focused_window(space: SpaceId) -> Option<WindowId> {
     trace::observe("key_focused_window", space.get(), || {
-        key_focused_window_raw(&[space.get()]).map(|wid| (wid.pid, wid.idx.get()))
+        live_answer(
+            || key_focused_window_raw(&[space.get()]).map(|wid| (wid.pid, wid.idx.get())),
+            || None,
+        )
     })
     .and_then(|(pid, idx)| {
         Some(WindowId {
@@ -1001,7 +1055,10 @@ pub fn key_focused_window(space: SpaceId) -> Option<WindowId> {
 pub fn key_focused_window_across(spaces: &[SpaceId]) -> Option<WindowId> {
     let raw: Vec<u64> = spaces.iter().map(|space| space.get()).collect();
     trace::observe("key_focused_window_across", &raw, || {
-        key_focused_window_raw(&raw).map(|wid| (wid.pid, wid.idx.get()))
+        live_answer(
+            || key_focused_window_raw(&raw).map(|wid| (wid.pid, wid.idx.get())),
+            || None,
+        )
     })
     .and_then(|(pid, idx)| {
         Some(WindowId {
@@ -1013,10 +1070,12 @@ pub fn key_focused_window_across(spaces: &[SpaceId]) -> Option<WindowId> {
 
 /// The spaces currently shown, one per display (plus fullscreen spaces).
 pub fn visible_spaces() -> Vec<SpaceId> {
-    trace::observe("visible_spaces", (), visible_spaces_raw)
-        .into_iter()
-        .map(SpaceId::new)
-        .collect()
+    trace::observe("visible_spaces", (), || {
+        live_answer(visible_spaces_raw, Vec::new)
+    })
+    .into_iter()
+    .map(SpaceId::new)
+    .collect()
 }
 
 fn visible_spaces_raw() -> Vec<u64> {
@@ -1069,8 +1128,8 @@ fn key_focused_window_raw(spaces: &[u64]) -> Option<WindowId> {
 
 /// The space on the display currently holding WindowServer focus.
 pub fn active_space() -> SpaceId {
-    SpaceId::new(trace::observe("active_space", (), || unsafe {
-        CGSGetActiveSpace(*G_CONNECTION)
+    SpaceId::new(trace::observe("active_space", (), || {
+        live_answer(|| unsafe { CGSGetActiveSpace(*G_CONNECTION) }, || 0)
     }))
 }
 
@@ -1117,12 +1176,19 @@ pub fn set_window_ordered_in_override(id: WindowServerId, ordered: Option<bool>)
 
 pub fn app_window_suitability(id: WindowServerId) -> Option<bool> {
     trace::observe("app_window_suitability", id.as_u32(), || {
-        let query = WindowIterator::new(&[id])?;
-        if query.count() > 0 && query.advance().is_some() {
-            Some(iterator_window_suitable(query.iter))
-        } else {
-            Some(false)
-        }
+        live_answer(
+            || {
+                let query = WindowIterator::new(&[id])?;
+                if query.count() > 0 && query.advance().is_some() {
+                    Some(iterator_window_suitable(query.iter))
+                } else {
+                    Some(false)
+                }
+            },
+            // What the window server answers for an id it does not know: the
+            // question was asked and nothing suitable is there.
+            || Some(false),
+        )
     })
 }
 
@@ -1131,18 +1197,28 @@ pub fn app_window_suitable(id: WindowServerId) -> bool {
 }
 
 pub fn space_is_user(sid: u64) -> bool {
-    trace::observe("space_is_user", sid, || unsafe {
-        SLSSpaceGetType(*G_CONNECTION, sid) == 0
+    trace::observe("space_is_user", sid, || {
+        // Inert answer: every space a test invents is an ordinary desktop
+        // unless the test says otherwise.
+        live_answer(|| unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 0 }, || true)
     })
 }
 pub fn space_is_fullscreen(sid: u64) -> bool {
-    trace::observe("space_is_fullscreen", sid, || unsafe {
-        SLSSpaceGetType(*G_CONNECTION, sid) == 4
+    trace::observe("space_is_fullscreen", sid, || {
+        live_answer(|| unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 4 }, || false)
     })
 }
 
 // credit: https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
+#[cfg_attr(test, allow(unreachable_code))]
 pub fn make_key_window(pid: pid_t, wsid: WindowServerId) -> Result<(), CGError> {
+    // Never post synthetic focus events at whatever process happens to own an
+    // invented pid on the machine running the suite.
+    #[cfg(test)]
+    {
+        let _ = (pid, wsid);
+        return Ok(());
+    }
     #[allow(non_upper_case_globals)]
     const kCPSUserGenerated: u32 = 0x200;
 
@@ -1184,10 +1260,18 @@ pub fn allow_hide_mouse() -> Result<(), CGError> {
 // fast space switching with no animations
 // credit: https://gist.github.com/amaanq/6991c7054b6c9816fafa9e29814b1509
 #[allow(unsafe_op_in_unsafe_fn)]
+#[cfg_attr(test, allow(unreachable_code))]
 pub unsafe fn switch_space(
     direction: crate::layout_engine::Direction,
     method: crate::common::config::SpaceSwitchMethod,
 ) {
+    // A test does not get to move the desktop out from under whoever is
+    // running it.
+    #[cfg(test)]
+    {
+        let _ = (direction, method);
+        return;
+    }
     unsafe { crate::sys::space_switch::switch_space(direction, method) };
 }
 
