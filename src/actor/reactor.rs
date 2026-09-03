@@ -87,7 +87,9 @@ use tracing::{debug, info, instrument, trace, warn};
 use transaction_manager::TransactionId;
 
 use super::{event_tap, gesture_tap};
-use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
+use crate::actor::app::{
+    AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, WindowInventoryToken, pid_t,
+};
 use crate::actor::raise_manager::{self, RaiseManager, RaiseRequest};
 use crate::actor::reactor::events::window_discovery;
 use crate::actor::spaces::{ForwardedSpaceState, TopologyWindowDelta};
@@ -285,8 +287,17 @@ pub enum Event {
 
     WindowsDiscovered {
         pid: pid_t,
+        token: WindowInventoryToken,
+        successful: bool,
         new: Vec<(WindowId, WindowInfo)>,
         known_visible: Vec<WindowId>,
+    },
+    #[serde(skip)]
+    WindowInventoryRefreshRequested(pid_t),
+    #[serde(skip)]
+    RaiseTargetsMissing {
+        windows: Vec<WindowId>,
+        sequence_id: u64,
     },
     WindowCreated(
         WindowId,
@@ -466,6 +477,7 @@ pub struct Reactor {
     focus_left_from: Option<WindowId>,
     menu_manager: managers::MenuManager,
     mission_control_manager: managers::MissionControlManager,
+    window_inventory_manager: managers::WindowInventoryManager,
     refocus_manager: managers::RefocusManager,
     refresh_quarantine_manager: managers::RefreshQuarantineManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
@@ -623,7 +635,13 @@ impl Reactor {
             },
             mission_control_manager: managers::MissionControlManager {
                 mission_control_state: MissionControlState::Inactive,
-                pending_mission_control_refresh: HashSet::default(),
+            },
+            window_inventory_manager: managers::WindowInventoryManager {
+                topology_revision: 0,
+                next_request_id: 0,
+                in_flight: HashMap::default(),
+                pending: HashSet::default(),
+                refocus_after_refresh: HashMap::default(),
             },
             refocus_manager: managers::RefocusManager {
                 stale_cleanup_state: StaleCleanupState::Enabled,
@@ -635,8 +653,7 @@ impl Reactor {
                 display_churn_active: false,
                 awaiting_post_wake_snapshot: false,
                 awaiting_post_session_snapshot: false,
-                pending_visible_refresh: false,
-                deferred_refresh_tracks_mission_control: false,
+                pending_inventory_refresh: false,
                 suppress_auto_workspace_switch_until_input: false,
             },
             pending_space_change_manager: managers::PendingSpaceChangeManager {
@@ -663,6 +680,87 @@ impl Reactor {
 
     fn iter_active_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
         self.active_spaces.iter().copied()
+    }
+
+    fn advance_window_inventory_revision_if_needed(&mut self, incoming: &ForwardedSpaceState) {
+        let topology_changed = self.space_state.screens != incoming.screens
+            || self.space_state.active_spaces != incoming.active_spaces
+            || self.space_state.display_space_ids != incoming.display_space_ids
+            || self.space_state.active_window_spaces != incoming.active_window_spaces;
+        if !topology_changed {
+            return;
+        }
+
+        self.window_inventory_manager.topology_revision =
+            self.window_inventory_manager.topology_revision.wrapping_add(1);
+        self.window_inventory_manager
+            .pending
+            .extend(self.window_inventory_manager.in_flight.keys().copied());
+    }
+
+    fn abandon_window_inventories_from_instability(&mut self) {
+        // AX requests issued before sleep or display teardown are not guaranteed to
+        // reply. Keeping them in `in_flight` prevents the authoritative recovery
+        // snapshot from requesting replacement AX elements, leaving every affected
+        // window unusable until its application is activated manually.
+        let abandoned = self
+            .window_inventory_manager
+            .in_flight
+            .drain()
+            .map(|(pid, _)| pid)
+            .collect::<Vec<_>>();
+        self.window_inventory_manager.pending.extend(abandoned);
+    }
+
+    fn request_window_inventory(&mut self, pid: pid_t) {
+        if self.refreshes_blocked() || self.window_inventory_manager.in_flight.contains_key(&pid) {
+            self.window_inventory_manager.pending.insert(pid);
+            return;
+        }
+
+        let Some(app) = self.app_manager.apps.get(&pid) else {
+            self.window_inventory_manager.pending.remove(&pid);
+            return;
+        };
+        self.window_inventory_manager.next_request_id =
+            self.window_inventory_manager.next_request_id.wrapping_add(1);
+        let token = WindowInventoryToken {
+            request_id: self.window_inventory_manager.next_request_id,
+            topology_revision: self.window_inventory_manager.topology_revision,
+        };
+        if app.handle.send(Request::RefreshWindowInventory(token)).is_ok() {
+            self.window_inventory_manager.in_flight.insert(pid, token);
+            self.window_inventory_manager.pending.remove(&pid);
+        }
+    }
+
+    fn forget_window_inventory(&mut self, pid: pid_t) {
+        self.window_inventory_manager.in_flight.remove(&pid);
+        self.window_inventory_manager.pending.remove(&pid);
+        self.window_inventory_manager.refocus_after_refresh.remove(&pid);
+    }
+
+    fn finish_window_inventory(
+        &mut self,
+        pid: pid_t,
+        token: WindowInventoryToken,
+        successful: bool,
+    ) -> bool {
+        if self.window_inventory_manager.in_flight.get(&pid).copied() != Some(token) {
+            return false;
+        }
+        self.window_inventory_manager.in_flight.remove(&pid);
+
+        let accepted = successful
+            && !self.refreshes_blocked()
+            && token.topology_revision == self.window_inventory_manager.topology_revision;
+        if !accepted && successful {
+            self.window_inventory_manager.pending.insert(pid);
+        }
+        if self.window_inventory_manager.pending.remove(&pid) {
+            self.request_window_inventory(pid);
+        }
+        accepted
     }
 
     fn active_space_ids(&self) -> Vec<u64> {
@@ -760,7 +858,7 @@ impl Reactor {
 
         if !activated.is_empty() || !deactivated.is_empty() {
             self.refresh_window_server_snapshot_for_active_spaces();
-            self.check_for_new_windows();
+            self.request_window_inventories();
         }
 
         if !activated.is_empty() {
@@ -772,18 +870,19 @@ impl Reactor {
         let activated_set: HashSet<SpaceId> = activated.iter().copied().collect();
         let mut windows_by_pid: HashMap<pid_t, Vec<WindowId>> = HashMap::default();
 
-        for (wid, state) in self.state.windows.iter_windows() {
-            if !state.can_reconcile_admission() {
-                continue;
-            }
-            let Some(space) = self.best_space_for_window_id(wid) else {
-                continue;
-            };
-
+        for (&wsid, &space) in &self.space_state.active_window_spaces {
             if !activated_set.contains(&space) {
                 continue;
             }
-
+            let Some(wid) = self.state.windows.tracked_window_id(wsid) else {
+                continue;
+            };
+            let Some(state) = self.state.windows.window(wid) else {
+                continue;
+            };
+            if !state.can_reconcile_admission() {
+                continue;
+            }
             windows_by_pid.entry(wid.pid).or_default().push(wid);
         }
 
@@ -792,13 +891,13 @@ impl Reactor {
                 continue;
             };
 
-            self.process_windows_for_app_rules(pid, window_ids, app_state.info.clone(), false);
+            self.process_windows_for_app_rules(window_ids, app_state.info.clone(), false);
         }
     }
 
     fn refresh_window_server_snapshot_for_active_spaces(&mut self) {
         let active_windows = self.authoritative_active_space_windows();
-        self.reconcile_authoritative_active_window_snapshot(active_windows, false);
+        self.reconcile_authoritative_active_window_snapshot(active_windows, true);
     }
 
     fn authoritative_active_space_windows(&self) -> Vec<(WindowServerId, Option<SpaceId>)> {
@@ -935,6 +1034,7 @@ impl Reactor {
         active_windows: Vec<(WindowServerId, Option<SpaceId>)>,
         preserve_missing_assignments: bool,
     ) {
+        let observed_windows = active_windows.clone();
         let previously_visible_wsids: Vec<_> =
             self.state.windows.iter_visible_window_server_ids().collect();
         self.refresh_active_space_window_membership(active_windows);
@@ -942,7 +1042,7 @@ impl Reactor {
             previously_visible_wsids,
             preserve_missing_assignments,
         );
-        self.reconcile_windows_with_authoritative_spaces();
+        self.reconcile_windows_in_authoritative_active_snapshot(&observed_windows);
     }
 
     fn is_login_window_pid(&self, pid: pid_t) -> bool {
@@ -1280,23 +1380,18 @@ impl Reactor {
 
     fn refreshes_blocked(&self) -> bool { self.refresh_quarantine_manager.blocks_refreshes() }
 
-    fn defer_visible_refresh(&mut self, track_mission_control_refresh: bool) {
-        self.refresh_quarantine_manager.pending_visible_refresh = true;
-        self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control |=
-            track_mission_control_refresh;
+    fn defer_window_inventory_refresh(&mut self) {
+        self.refresh_quarantine_manager.pending_inventory_refresh = true;
     }
 
-    fn flush_deferred_visible_refresh(&mut self) {
+    fn flush_deferred_window_inventory_refresh(&mut self) {
         if self.refreshes_blocked() {
             return;
         }
 
-        if self.refresh_quarantine_manager.pending_visible_refresh {
-            let track_mission_control_refresh =
-                self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control;
-            self.refresh_quarantine_manager.pending_visible_refresh = false;
-            self.refresh_quarantine_manager.deferred_refresh_tracks_mission_control = false;
-            self.request_visible_windows_for_apps(track_mission_control_refresh);
+        if self.refresh_quarantine_manager.pending_inventory_refresh {
+            self.refresh_quarantine_manager.pending_inventory_refresh = false;
+            self.request_window_inventories();
         }
     }
 
@@ -1304,8 +1399,8 @@ impl Reactor {
     // only remembers that one visibility refresh is owed, then flushes it once
     // every upstream gate is open again.
     fn request_refresh_when_spaces_actor_stabilizes(&mut self) {
-        self.defer_visible_refresh(true);
-        self.flush_deferred_visible_refresh();
+        self.defer_window_inventory_refresh();
+        self.flush_deferred_window_inventory_refresh();
     }
 
     fn release_post_instability_quarantine_after_authoritative_snapshot(&mut self) {
@@ -1324,7 +1419,7 @@ impl Reactor {
         if released_session {
             self.refresh_quarantine_manager.session_inactive = false;
         }
-        self.flush_deferred_visible_refresh();
+        self.flush_deferred_window_inventory_refresh();
     }
 
     #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
@@ -1400,7 +1495,7 @@ impl Reactor {
                 self.refresh_quarantine_manager.awaiting_post_wake_snapshot = true;
                 self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = true;
                 let outcome = system_workflow::handle_system_woke()?;
-                self.defer_visible_refresh(true);
+                self.defer_window_inventory_refresh();
                 return Ok(outcome);
             }
             Event::SessionDidResignActive => {
@@ -1412,7 +1507,7 @@ impl Reactor {
                 self.refresh_quarantine_manager.session_inactive = true;
                 self.refresh_quarantine_manager.awaiting_post_session_snapshot = true;
                 self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = true;
-                self.defer_visible_refresh(true);
+                self.defer_window_inventory_refresh();
                 return Ok(EventOutcome::default());
             }
             Event::DisplayChurnBegin => {
@@ -1470,6 +1565,7 @@ impl Reactor {
                 main_window,
             } => {
                 let _ = (is_frontmost, main_window);
+                self.forget_window_inventory(pid);
                 let mut outcome = application_workflow::handle_application_launched(
                     &mut self.app_manager,
                     application_workflow::ApplicationLaunchedPayload {
@@ -1490,6 +1586,7 @@ impl Reactor {
                 return application_workflow::handle_application_terminated(pid);
             }
             Event::ApplicationThreadTerminated(pid) => {
+                self.forget_window_inventory(pid);
                 self.clear_menu_state_for_pid(pid);
                 return application_workflow::handle_application_thread_terminated(
                     &mut self.app_manager,
@@ -1536,9 +1633,7 @@ impl Reactor {
                     return Ok(EventOutcome::default());
                 }
                 if !self.state.windows.contains_window(window) {
-                    if let Some(app) = self.app_manager.apps.get(&window.pid) {
-                        let _ = app.handle.send(Request::GetVisibleWindows);
-                    }
+                    self.request_window_inventory(window.pid);
                     return Ok(EventOutcome::default());
                 }
                 return Ok(if self.is_space_active(reported_space) {
@@ -1554,19 +1649,46 @@ impl Reactor {
                     sender,
                 )?);
             }
-            Event::WindowsDiscovered { pid, new, known_visible } => {
-                if self.refreshes_blocked() {
-                    debug!(
-                        pid,
-                        state = ?self.refresh_quarantine_state(),
-                        "Ignoring windows discovery while refresh quarantine is active"
-                    );
-                    self.defer_visible_refresh(true);
+            Event::WindowInventoryRefreshRequested(pid) => {
+                self.request_window_inventory(pid);
+                return Ok(EventOutcome::default());
+            }
+            Event::RaiseTargetsMissing { windows, sequence_id } => {
+                let Some(first) = windows.first() else {
+                    return Ok(EventOutcome::default());
+                };
+                self.window_inventory_manager.refocus_after_refresh.insert(first.pid, *first);
+                self.request_window_inventory(first.pid);
+                let mut outcome = EventOutcome::default();
+                for window_id in windows {
+                    outcome
+                        .raise_requests
+                        .push(raise_manager::Event::RaiseCompleted { window_id, sequence_id });
+                }
+                return Ok(outcome);
+            }
+            Event::WindowsDiscovered {
+                pid,
+                token,
+                successful,
+                new,
+                known_visible,
+            } => {
+                if !self.finish_window_inventory(pid, token, successful) {
+                    debug!(pid, ?token, successful, "Discarding stale AX window inventory");
                     return Ok(EventOutcome::default());
                 }
+                let refocus = self
+                    .window_inventory_manager
+                    .refocus_after_refresh
+                    .remove(&pid)
+                    .is_some_and(|target| new.iter().any(|(wid, _)| *wid == target));
                 let mut outcome = application_workflow::handle_windows_discovered(
                     application_workflow::WindowsDiscoveredPayload { pid, new, known_visible },
                 )?;
+                if refocus {
+                    outcome = outcome.with_arrange_passes(1);
+                }
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
@@ -1865,17 +1987,33 @@ impl Reactor {
                 return Ok(outcome);
             }
             Event::SpaceStateChanged(space_state) => {
+                self.advance_window_inventory_revision_if_needed(&space_state);
                 let releases_lifecycle_refresh_quarantine =
                     space_state.releases_lifecycle_refresh_quarantine;
                 let releases_display_churn_refresh_quarantine =
                     space_state.releases_display_churn_refresh_quarantine;
-                let outcome = self.handle_authoritative_space_snapshot(space_state)?;
+                let releases_instability = (releases_lifecycle_refresh_quarantine
+                    && (self.refresh_quarantine_manager.awaiting_post_wake_snapshot
+                        || self.refresh_quarantine_manager.awaiting_post_session_snapshot))
+                    || (releases_display_churn_refresh_quarantine
+                        && self.refresh_quarantine_manager.display_churn_active);
+                if releases_instability {
+                    self.abandon_window_inventories_from_instability();
+                }
+                let mut outcome = self.handle_authoritative_space_snapshot(space_state)?;
                 if releases_lifecycle_refresh_quarantine {
                     self.release_post_instability_quarantine_after_authoritative_snapshot();
                 }
                 if releases_display_churn_refresh_quarantine {
                     self.refresh_quarantine_manager.display_churn_active = false;
                     self.request_refresh_when_spaces_actor_stabilizes();
+                }
+                if releases_instability {
+                    // Releasing either recovery gate already flushes the deferred
+                    // all-app refresh. A topology-changing snapshot requests the
+                    // same refresh through its outcome; leave only one request per
+                    // app instead of immediately scheduling a redundant follow-up.
+                    outcome.refresh_window_inventories = false;
                 }
                 return Ok(outcome);
             }
@@ -2045,7 +2183,7 @@ impl Reactor {
                 }
                 // The drag is over; a refresh sweep deferred while it ran is
                 // due now, as one census instead of one per space flip.
-                self.flush_deferred_visible_refresh();
+                self.flush_deferred_window_inventory_refresh();
                 return Ok(outcome);
             }
             Event::MenuOpened(pid) => {
@@ -2480,17 +2618,13 @@ impl Reactor {
                 self.sync_layout_focus_for_command(&command);
                 // Moving a window doesn't change focus, so mouse_follows_focus
                 // never fires and the cursor gets left behind on the window's
-                // old position. Defer a warp to the moved window's post-layout
-                // frame, reusing the workspace-switch deferred-warp hook.
-                // Goes through the same per-app check as every other warp, so
-                // an app on mouse_follows_focus_blacklist is not dragged onto
-                // by this path either.
-                if matches!(command, layout::LayoutCommand::MoveNode(_))
-                    && let Some(wid) = self.main_window()
-                    && self.mouse_follows_focus_allowed_for(wid)
-                {
-                    self.workspace_switch_manager.pending_workspace_mouse_warp = Some(wid);
-                }
+                // old position. The command handler warps to the moved window's
+                // post-arrange frame for MoveNode; it goes through the same
+                // per-app check as every other warp, so an app on
+                // mouse_follows_focus_blacklist is not dragged onto by this
+                // path either.
+                let post_arrange_mouse_warp =
+                    self.main_window().filter(|wid| self.mouse_follows_focus_allowed_for(*wid));
                 let command_space = self.command_context_space();
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
                 return command_workflow::handle_command_layout(
@@ -2502,6 +2636,7 @@ impl Reactor {
                         command_space,
                         visible_spaces,
                         visible_space_centers,
+                        post_arrange_mouse_warp,
                     },
                 );
             }
@@ -2634,8 +2769,8 @@ impl Reactor {
         if outcome.refresh_after_mission_control {
             self.refresh_windows_after_mission_control();
         }
-        if outcome.force_refresh_all_windows {
-            self.force_refresh_all_windows();
+        if outcome.refresh_window_inventories {
+            self.request_window_inventories();
         }
         // Discovery responses reconcile model state before layout. Requests
         // which schedule new discovery are deferred to the final phase below.
@@ -2667,12 +2802,7 @@ impl Reactor {
                 if let Some(app_info) =
                     self.app_manager.apps.get(&window.pid).map(|app| app.info.clone())
                 {
-                    if let Some(window_server_id) =
-                        self.state.windows.window(window).and_then(|state| state.info.sys_id)
-                    {
-                        self.state.windows.mark_wsids_recent(std::iter::once(window_server_id));
-                    }
-                    self.process_windows_for_app_rules(window.pid, vec![window], app_info, false);
+                    self.process_windows_for_app_rules(vec![window], app_info, false);
                 }
                 if self.state.windows.window(window).is_some_and(WindowState::is_admitted) {
                     self.send_layout_event(LayoutEvent::WindowAdded(space, window));
@@ -2770,6 +2900,18 @@ impl Reactor {
             self.broadcast_layout_changed(
                 outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
             );
+        }
+        if outcome.broadcast_selection_changed {
+            self.broadcast_selection_changed(
+                outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
+            );
+        }
+
+        if layout_changed
+            && let Some(window) = outcome.post_arrange_mouse_warp
+            && let Some(center) = self.window_center_on_known_screen(window)
+        {
+            self.warp_mouse(center);
         }
 
         for request in outcome.raise_requests {
@@ -2904,6 +3046,9 @@ impl Reactor {
                 warn!(pid, %error, "failed to send deferred application request");
             }
         }
+        for pid in outcome.window_inventory_requests {
+            self.request_window_inventory(pid);
+        }
     }
 
     fn create_window_data(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
@@ -2962,14 +3107,10 @@ impl Reactor {
         }
     }
 
-    fn check_for_new_windows(&mut self) {
+    fn request_window_inventories(&mut self) {
         // AX discovery remains the source of truth for enumerating app windows.
         // Native-space membership/visibility is supplied separately by the spaces
         // actor; do not replace this with the global CG on-screen window list.
-        self.request_visible_windows_for_apps(false);
-    }
-
-    fn request_visible_windows_for_apps(&mut self, track_mission_control_refresh: bool) {
         // A drag in flight defers the sweep too: the window server flips the
         // dragged window between spaces as it crosses a display seam, and
         // answering every one of those SpaceStateChanged snapshots with a
@@ -2979,22 +3120,13 @@ impl Reactor {
         // the dragged window is frozen in its tree, and the drop flushes the
         // one refresh that is owed.
         if self.refreshes_blocked() || self.window_in_drag().is_some() {
-            self.defer_visible_refresh(track_mission_control_refresh);
+            self.defer_window_inventory_refresh();
             return;
         }
 
-        let mut refreshed_pids = Vec::new();
-        for (&pid, app) in &self.app_manager.apps {
-            // Errors mean the app terminated (and a termination event is coming); ignore.
-            if app.handle.send(Request::GetVisibleWindows).is_ok() {
-                refreshed_pids.push(pid);
-            }
-        }
-
-        if track_mission_control_refresh {
-            self.mission_control_manager
-                .pending_mission_control_refresh
-                .extend(refreshed_pids);
+        let pids: Vec<_> = self.app_manager.apps.keys().copied().collect();
+        for pid in pids {
+            self.request_window_inventory(pid);
         }
     }
 
@@ -3027,14 +3159,7 @@ impl Reactor {
                     .windows
                     .restore_window_from_native_fullscreen(record.current_window_id);
 
-                if let Some(app) = self.app_manager.apps.get(&record.current_window_id.pid) {
-                    if let Err(e) = app.handle.send(Request::GetVisibleWindows) {
-                        warn!(
-                            "Failed to send GetVisibleWindows to app {}: {}",
-                            record.current_window_id.pid, e
-                        );
-                    }
-                }
+                self.request_window_inventory(record.current_window_id.pid);
 
                 let live_window_id = record
                     .window_server_id
@@ -3104,7 +3229,7 @@ impl Reactor {
             active_windows,
             preserve_missing_assignments,
         );
-        self.check_for_new_windows();
+        self.request_window_inventories();
 
         if let Some(space) = self.workspace_command_space() {
             self.focus_desktop_if_active_workspace_empty(space);
@@ -3190,6 +3315,18 @@ impl Reactor {
     }
 
     fn broadcast_layout_changed(&self, space: Option<SpaceId>) {
+        self.broadcast_layout_state_changed(space, rift_protocol::EventKind::LayoutChanged);
+    }
+
+    fn broadcast_selection_changed(&self, space: Option<SpaceId>) {
+        self.broadcast_layout_state_changed(space, rift_protocol::EventKind::SelectionChanged);
+    }
+
+    fn broadcast_layout_state_changed(
+        &self,
+        space: Option<SpaceId>,
+        kind: rift_protocol::EventKind,
+    ) {
         if let Some(space) = space
             && self.is_space_active(space)
             && let Some(workspace_id) = self.layout_manager.layout_engine.active_workspace(space)
@@ -3201,13 +3338,27 @@ impl Reactor {
                 .layout_engine
                 .workspace_name(space, workspace_id)
                 .unwrap_or_else(|| format!("Workspace {:?}", workspace_id));
-            let event = BroadcastEvent::LayoutChanged {
-                workspace_id: protocol_workspace_id(workspace_id),
-                workspace_index,
-                workspace_name,
-                space_id: space.get(),
-                display_uuid: self.display_uuid_for_space(space),
-                layout,
+            let workspace_id = protocol_workspace_id(workspace_id);
+            let space_id = space.get();
+            let display_uuid = self.display_uuid_for_space(space);
+            let event = match kind {
+                rift_protocol::EventKind::LayoutChanged => BroadcastEvent::LayoutChanged {
+                    workspace_id,
+                    workspace_index,
+                    workspace_name,
+                    space_id,
+                    display_uuid,
+                    layout,
+                },
+                rift_protocol::EventKind::SelectionChanged => BroadcastEvent::SelectionChanged {
+                    workspace_id,
+                    workspace_index,
+                    workspace_name,
+                    space_id,
+                    display_uuid,
+                    layout,
+                },
+                _ => return,
             };
             let _ = self.communication_manager.event_broadcaster.send(event);
         }
@@ -3225,10 +3376,8 @@ impl Reactor {
             return;
         }
 
-        let (is_rule_candidate, wsid) = match self.state.windows.window(window_id) {
-            Some(window_state) => {
-                (window_state.can_reconcile_admission(), window_state.info.sys_id)
-            }
+        let is_rule_candidate = match self.state.windows.window(window_id) {
+            Some(window_state) => window_state.can_reconcile_admission(),
             None => return,
         };
 
@@ -3241,11 +3390,7 @@ impl Reactor {
             None => return,
         };
 
-        if let Some(window_server_id) = wsid {
-            self.state.windows.mark_wsids_recent(std::iter::once(window_server_id));
-        }
-
-        self.process_windows_for_app_rules(window_id.pid, vec![window_id], app_info, true);
+        self.process_windows_for_app_rules(vec![window_id], app_info, true);
     }
 
     fn handle_authoritative_space_snapshot(
@@ -3402,7 +3547,7 @@ impl Reactor {
         self.settle_displaced_windows();
         self.try_apply_pending_space_change();
         if should_force_refresh_layout {
-            outcome = outcome.with_force_window_refresh().with_arrange_passes(1);
+            outcome = outcome.with_window_inventory_refresh().with_arrange_passes(1);
         }
         Ok(outcome)
     }
@@ -3477,10 +3622,6 @@ impl Reactor {
             })
             .collect();
         let stale_snapshot = window_discovery::StaleCleanupSnapshot {
-            pending_refresh: self
-                .mission_control_manager
-                .pending_mission_control_refresh
-                .contains(&pid),
             suppressed: matches!(
                 self.refocus_manager.stale_cleanup_state,
                 StaleCleanupState::Suppressed
@@ -3490,7 +3631,14 @@ impl Reactor {
             inactive_windows,
             server_observations,
         };
-        let (stale_windows, pending_refresh) = window_discovery::identify_stale_windows(
+        // AX can replace a window's process-local identity while preserving its
+        // WindowServer id. Treat the currently tracked identity as visible for
+        // stale cleanup so the state survives long enough to be rekeyed below.
+        let mut cleanup_visible = known_visible.clone();
+        cleanup_visible.extend(new.iter().filter_map(|(_, info)| {
+            info.sys_id.and_then(|wsid| self.state.windows.tracked_window_id(wsid))
+        }));
+        let stale_windows = window_discovery::identify_stale_windows(
             &self.state,
             pid,
             &cleanup_visible,
@@ -3500,10 +3648,7 @@ impl Reactor {
             &mut self.state,
             &self.transaction_manager,
             &mut self.drag_manager,
-            &mut self.mission_control_manager,
-            pid,
             stale_windows,
-            pending_refresh,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -3534,7 +3679,6 @@ impl Reactor {
             &mut self.state,
             &mut self.layout_manager,
             observed_windows,
-            &app_info,
         );
         outcome.absorb(process_outcome);
         window_discovery::update_window_states(&mut self.state, new_windows);
@@ -4297,7 +4441,7 @@ impl Reactor {
             *outcome = std::mem::take(outcome)
                 .with_layout_event(LayoutEvent::WindowRemoved(original_window));
         }
-        *outcome = std::mem::take(outcome).with_app_request(owner.pid, Request::GetVisibleWindows);
+        *outcome = std::mem::take(outcome).with_window_inventory_request(owner.pid);
         Some(if self.assigned_space_for_window_id(owner) == Some(space) {
             self.is_space_active(space)
                 && self.restore_window_to_layout_after_fullscreen(owner, space)
@@ -4438,23 +4582,45 @@ impl Reactor {
         !was_on_active_space && self.is_window_on_active_space(wid)
     }
 
-    fn reconcile_windows_with_authoritative_spaces(&mut self) -> bool {
+    fn reconcile_windows_in_authoritative_active_snapshot(
+        &mut self,
+        active_windows: &[(WindowServerId, Option<SpaceId>)],
+    ) -> bool {
         if self.refreshes_blocked() {
-            self.defer_visible_refresh(true);
+            self.defer_window_inventory_refresh();
             return false;
         }
 
-        let windows: Vec<_> = self.state.windows.iter_windows().map(|(wid, _)| wid).collect();
+        let windows: Vec<_> = active_windows
+            .iter()
+            .filter_map(|&(wsid, observed_space)| {
+                let wid = self.state.windows.tracked_window_id(wsid)?;
+                let authoritative_space =
+                    self.state.windows.window_server_space(wsid).or(observed_space)?;
+                Some((wid, authoritative_space))
+            })
+            .collect();
         let mut layout_changed = false;
 
-        for wid in windows {
-            let Some(authoritative_space) = self.authoritative_space_for_window_id(wid) else {
-                continue;
-            };
+        for (wid, authoritative_space) in windows {
             layout_changed |= self.reassign_window_to_authoritative_space(wid, authoritative_space);
         }
 
         layout_changed
+    }
+
+    #[cfg(test)]
+    fn reconcile_windows_with_authoritative_spaces(&mut self) -> bool {
+        let active_windows: Vec<_> = self
+            .state
+            .windows
+            .iter_windows()
+            .filter_map(|(wid, state)| {
+                let wsid = state.info.sys_id?;
+                Some((wsid, self.authoritative_space_for_window_id(wid)))
+            })
+            .collect();
+        self.reconcile_windows_in_authoritative_active_snapshot(&active_windows)
     }
 
     fn current_reported_space_for_window_id(&self, wid: WindowId) -> Option<SpaceId> {
@@ -5263,7 +5429,6 @@ impl Reactor {
 
     fn process_windows_for_app_rules(
         &mut self,
-        pid: pid_t,
         window_ids: Vec<WindowId>,
         app_info: AppInfo,
         reapply_effects: bool,
@@ -5321,16 +5486,30 @@ impl Reactor {
                             window.info.ax_subrole.clone(),
                         )
                     });
-                    self.layout_manager.layout_engine.assign_window_with_app_info(
-                        &mut self.state.windows,
-                        *wid,
-                        space,
-                        app_info.bundle_id.as_deref(),
-                        app_info.localized_name.as_deref(),
-                        window_metadata.as_ref().map(|metadata| metadata.0.as_str()),
-                        window_metadata.as_ref().and_then(|metadata| metadata.1.as_deref()),
-                        window_metadata.as_ref().and_then(|metadata| metadata.2.as_deref()),
-                    )
+                    let engine = &mut self.layout_manager.layout_engine;
+                    if reapply_effects {
+                        engine.reapply_window_with_app_info(
+                            &mut self.state.windows,
+                            *wid,
+                            space,
+                            app_info.bundle_id.as_deref(),
+                            app_info.localized_name.as_deref(),
+                            window_metadata.as_ref().map(|metadata| metadata.0.as_str()),
+                            window_metadata.as_ref().and_then(|metadata| metadata.1.as_deref()),
+                            window_metadata.as_ref().and_then(|metadata| metadata.2.as_deref()),
+                        )
+                    } else {
+                        engine.assign_window_with_app_info(
+                            &mut self.state.windows,
+                            *wid,
+                            space,
+                            app_info.bundle_id.as_deref(),
+                            app_info.localized_name.as_deref(),
+                            window_metadata.as_ref().map(|metadata| metadata.0.as_str()),
+                            window_metadata.as_ref().and_then(|metadata| metadata.1.as_deref()),
+                            window_metadata.as_ref().and_then(|metadata| metadata.2.as_deref()),
+                        )
+                    }
                 };
 
                 match assign_result {
@@ -5365,22 +5544,15 @@ impl Reactor {
                 continue;
             }
 
-            let windows = windows_needing_layout_refresh
-                .into_iter()
-                .filter_map(|(wid, effects)| {
-                    self.state.windows.window(wid).map(|window| ResolvedWindow {
-                        info: window.layout_info(wid),
-                        effects,
-                    })
-                })
-                .collect();
-
-            self.send_layout_event(LayoutEvent::WindowsOnScreenUpdated(
-                space,
-                pid,
-                windows,
-                Some(app_info.clone()),
-            ));
+            for (wid, effects) in windows_needing_layout_refresh {
+                let Some(window) = self.state.windows.window(wid) else {
+                    continue;
+                };
+                self.send_layout_event(LayoutEvent::WindowObserved(space, ResolvedWindow {
+                    info: window.layout_info(wid),
+                    effects,
+                }));
+            }
         }
     }
 
@@ -6348,11 +6520,8 @@ impl Reactor {
             LayoutEvent::WindowAdded(space, wid) => {
                 self.request_refocus_if_hidden(*space, *wid);
             }
-            LayoutEvent::WindowsOnScreenUpdated(space, _, windows, _) => {
-                let hidden_exists = windows
-                    .iter()
-                    .any(|window| self.window_in_non_active_workspace(*space, window.info.0));
-                if hidden_exists {
+            LayoutEvent::WindowObserved(space, window) => {
+                if self.window_in_non_active_workspace(*space, window.info.0) {
                     self.refocus_manager.refocus_state = RefocusState::Pending(*space);
                 }
             }
@@ -6444,11 +6613,8 @@ impl Reactor {
 
     fn refresh_windows_after_mission_control(&mut self) {
         debug!("Refreshing window state after Mission Control");
-        // Skip when on a fullscreen space: kAXWindowsAttribute is space-filtered, so
-        // apps omit their Desktop windows. check_for_new_windows sends an untracked
-        // GetVisibleWindows whose response bypasses pending_mission_control_refresh,
-        // causing those Desktop windows to be dropped from the layout, and other
-        // windows in the layout to be incorrecctly resized.
+        // AX inventories are space-filtered, so only request one when a user Space
+        // is active. The inventory coordinator rejects replies from older topology.
         if !self.has_user_space_context() {
             return;
         }
@@ -6461,7 +6627,7 @@ impl Reactor {
         active_windows: Vec<(WindowServerId, Option<SpaceId>)>,
     ) {
         if self.refreshes_blocked() {
-            self.defer_visible_refresh(true);
+            self.defer_window_inventory_refresh();
             return;
         }
 
@@ -6470,17 +6636,10 @@ impl Reactor {
         // spaces from the same space-aware WS-id list used everywhere else so we do
         // not depend on the global CG on-screen window list during recovery.
         self.reconcile_authoritative_active_window_snapshot(active_windows, false);
-        self.mission_control_manager.pending_mission_control_refresh.clear();
-        self.force_refresh_all_windows();
-        self.check_for_new_windows();
+        self.request_window_inventories();
         self.update_layout_or_warn(false, false, None);
         self.maybe_send_menu_update();
     }
-
-    // Uses the same "pending refresh" path as Mission Control recovery so a bulk
-    // visibility rediscovery can reconcile tracked windows without treating a
-    // transient empty AX window list as authoritative removal.
-    fn force_refresh_all_windows(&mut self) { self.request_visible_windows_for_apps(true); }
 
     fn has_user_space_context(&self) -> bool {
         self.raw_command_space().is_some_and(|space| !self.is_fullscreen_space(space))

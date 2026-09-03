@@ -23,7 +23,7 @@ use tracing::{Instrument, Span, debug, info, instrument, trace, warn};
 use crate::actor;
 use crate::actor::reactor::transaction_manager::TransactionId;
 use crate::actor::reactor::{self, Event, Requested};
-use crate::common::collections::HashMap;
+use crate::common::collections::{HashMap, HashSet};
 use crate::model::tx_store::WindowTxStore;
 use crate::sys::app::NSRunningApplicationExt;
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
@@ -311,6 +311,17 @@ pub struct AppThreadHandle {
     requests_tx: actor::Sender<Request>,
 }
 
+/// Identifies the world snapshot for which an AX window inventory was requested.
+///
+/// AX window enumeration is asynchronous and space-filtered. A response is only
+/// safe to reconcile while both this request and its topology revision are still
+/// current in the reactor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WindowInventoryToken {
+    pub request_id: u64,
+    pub topology_revision: u64,
+}
+
 impl AppThreadHandle {
     pub(crate) fn new_for_test(requests_tx: actor::Sender<Request>) -> Self {
         let this = AppThreadHandle { requests_tx };
@@ -331,7 +342,7 @@ impl Debug for AppThreadHandle {
 #[derive(Debug)]
 pub enum Request {
     Terminate,
-    GetVisibleWindows,
+    RefreshWindowInventory(WindowInventoryToken),
     /// Reconcile the authoritative Carbon front-process change with AX state.
     ///
     /// Carbon supplies the activation edge, while the app thread resolves the
@@ -456,12 +467,14 @@ struct PendingFrame {
 }
 
 impl State {
-    fn refresh_visible_windows(&mut self) -> Result<(), AxError> {
+    fn refresh_window_inventory(&mut self, token: WindowInventoryToken) -> Result<(), AxError> {
         let window_elems = match self.app.windows() {
             Ok(elems) => elems,
             Err(e) => {
                 self.send_event(Event::WindowsDiscovered {
                     pid: self.pid,
+                    token,
+                    successful: false,
                     new: Default::default(),
                     known_visible: Default::default(),
                 });
@@ -471,6 +484,7 @@ impl State {
         let server_info_by_id = self.visible_window_server_info_map(&window_elems);
         let mut new = Vec::with_capacity(window_elems.len());
         let mut known_visible = Vec::with_capacity(window_elems.len());
+        let mut seen_wids = HashSet::default();
 
         for elem in window_elems {
             let wsid = WindowServerId::try_from(&elem).ok();
@@ -488,17 +502,19 @@ impl State {
                 continue;
             }
 
-            let Some(wid) = self.id(&elem).ok().or_else(|| {
-                self.register_window(elem.clone(), hint).map(|(info, wid, _)| {
-                    if !info.is_minimized {
-                        known_visible.push(wid);
-                    }
-                    new.push((wid, info));
-                    wid
-                })
+            let Some((wid, info)) = self.id(&elem).ok().map(|wid| (wid, info)).or_else(|| {
+                self.register_window(elem.clone(), hint)
+                    .map(|(registered_info, wid, _)| (wid, registered_info))
             }) else {
                 continue;
             };
+
+            // AXWindows can expose the same stable WindowServer window more than once while a
+            // transient child window is being created. Reconcile each identity once per
+            // inventory so a duplicate cannot overwrite its admission classification.
+            if !seen_wids.insert(wid) {
+                continue;
+            }
 
             // The WindowServer id is stable across sleep/display transitions, but
             // the corresponding AXUIElement is not. `id` intentionally resolves the
@@ -515,10 +531,11 @@ impl State {
 
         self.send_event(Event::WindowsDiscovered {
             pid: self.pid,
+            token,
+            successful: true,
             new,
             known_visible,
         });
-        self.on_main_window_changed(None, true);
         Ok(())
     }
 
@@ -671,11 +688,19 @@ impl State {
     async fn handle_raises(this: &RefCell<Self>, mut rx: actor::Receiver<RaiseRequest>) {
         while let Some((span, raise)) = rx.recv().await {
             let RaiseRequest(wids, token, sequence_id, quiet) = raise;
-            if let Err(e) = Self::handle_raise_request(this, wids, &token, sequence_id, quiet)
+            if let Err(e) = Self::handle_raise_request(this, &wids, &token, sequence_id, quiet)
                 .instrument(span)
                 .await
             {
                 debug!("Raise request failed: {e:?}");
+                if matches!(
+                    e,
+                    RaiseError::AXError(AxError::NotFound)
+                        | RaiseError::AXError(AxError::Ax(AXError::InvalidUIElement))
+                ) {
+                    this.borrow()
+                        .send_event(Event::RaiseTargetsMissing { windows: wids, sequence_id });
+                }
             }
         }
     }
@@ -807,9 +832,9 @@ impl State {
                     return Ok(false);
                 }
 
-                // Trigger a visible windows refresh. If the window is gone, the reactor
-                // will detect it via missing membership and tear down state.
-                self.refresh_visible_windows()?;
+                // Destruction is verified by the reactor's revisioned inventory
+                // coordinator. Do not enumerate AX windows independently here.
+                self.send_event(Event::WindowInventoryRefreshRequested(self.pid));
                 return Ok(false);
             }
             Request::CloseWindow(window_server_id) => {
@@ -823,8 +848,8 @@ impl State {
                     warn!(pid = self.pid, ?window_server_id, "Failed to post Command-W");
                 }
             }
-            Request::GetVisibleWindows => {
-                self.refresh_visible_windows()?;
+            Request::RefreshWindowInventory(token) => {
+                self.refresh_window_inventory(token)?;
             }
             Request::ApplicationGloballyActivated(pid) => {
                 if pid == self.pid {
@@ -1330,7 +1355,7 @@ impl From<AxError> for RaiseError {
 impl State {
     async fn handle_raise_request(
         this_ref: &RefCell<Self>,
-        wids: Vec<WindowId>,
+        wids: &[WindowId],
         token: &CancellationToken,
         sequence_id: u64,
         quiet: Quiet,
@@ -1887,11 +1912,17 @@ impl State {
             .iter()
             .filter_map(|elem| WindowServerId::try_from(elem).ok())
             .collect();
-        let mut info_by_id = HashMap::with_capacity_and_hasher(wsids.len(), Default::default());
-        for info in window_server::get_windows(&wsids) {
-            info_by_id.insert(info.id, info);
-        }
-        info_by_id
+        collect_visible_window_server_info(
+            window_server::get_windows(&wsids),
+            window_server::window_ordered_in,
+            |wsid| {
+                trace!(
+                    pid = ?self.pid,
+                    ?wsid,
+                    "Ignoring AX window whose WindowServer peer is explicitly ordered out"
+                );
+            },
+        )
     }
 
     #[inline]
@@ -2050,6 +2081,29 @@ impl State {
         }
         Some(window)
     }
+}
+
+/// An ID-targeted WindowServer query can return a retained record even after the user closes an
+/// Electron window and WindowServer orders it out. Treat only an explicit negative ordering result
+/// as authoritative: a failed private query remains inconclusive during display/lifecycle churn.
+fn window_server_peer_is_visible(ordered_in: Option<bool>) -> bool {
+    !matches!(ordered_in, Some(false))
+}
+
+fn collect_visible_window_server_info(
+    infos: Vec<WindowServerInfo>,
+    mut ordered_in: impl FnMut(WindowServerId) -> Option<bool>,
+    mut on_ordered_out: impl FnMut(WindowServerId),
+) -> HashMap<WindowServerId, WindowServerInfo> {
+    let mut info_by_id = HashMap::with_capacity_and_hasher(infos.len(), Default::default());
+    for info in infos {
+        if window_server_peer_is_visible(ordered_in(info.id)) {
+            info_by_id.insert(info.id, info);
+        } else {
+            on_ordered_out(info.id);
+        }
+    }
+    info_by_id
 }
 
 impl Drop for State {

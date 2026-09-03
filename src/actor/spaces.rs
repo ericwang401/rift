@@ -310,11 +310,17 @@ impl SpacesActor {
                 self.schedule_screen_refresh();
             }
             Event::SessionDidResignActive => {
+                if self.state.session_inactive {
+                    return;
+                }
                 self.state.session_inactive = true;
                 self.state.release_reactor_quarantine_on_next_forward = false;
                 self.reactor_tx.send(reactor::Event::SessionDidResignActive);
             }
             Event::SessionDidBecomeActive => {
+                if !self.state.session_inactive {
+                    return;
+                }
                 self.state.session_inactive = false;
                 self.reactor_tx.send(reactor::Event::SessionDidBecomeActive);
                 if let Some(screen_cache) = self.state.screen_cache.as_mut() {
@@ -1005,21 +1011,16 @@ impl SpacesActor {
                     return;
                 }
 
-                // `space_window_list_for_connection([space])` is the authoritative
-                // source for "window X is visible in active space Y". The extra
-                // `window_space(wsid)` lookup is only used to disambiguate the rare
-                // case where the same WSID appears in more than one active-space
-                // query (for example during native transitions). If that secondary
-                // lookup races and returns `None`, preserve the last known active
-                // assignment instead of synthesizing a disappearance.
-                let resolved = authoritative_space
+                // Conflicting per-space results are transitional and therefore
+                // ambiguous. Preserve a still-active accepted assignment until one
+                // per-space query becomes unique. `window_space(wsid)` can return
+                // several user spaces in an unstable order during display churn, so
+                // it is only a fallback when there is no accepted active assignment.
+                let resolved = previous_visible
+                    .get(&wsid)
+                    .copied()
                     .filter(|space| active_spaces.contains(space))
-                    .or_else(|| {
-                        previous_visible
-                            .get(&wsid)
-                            .copied()
-                            .filter(|space| active_spaces.contains(space))
-                    })
+                    .or_else(|| authoritative_space.filter(|space| active_spaces.contains(space)))
                     .unwrap_or(*entry.get());
 
                 entry.insert(resolved);
@@ -1362,7 +1363,7 @@ impl SpacesActor {
         };
 
         if hits >= DISPLAY_STABLE_REQUIRED_HITS {
-            if !Self::screen_snapshot_is_valid_for_commit(&screens) {
+            if !Self::screen_snapshot_is_ready_for_authoritative_commit(&screens, true) {
                 self.state.display_topology_state = None;
                 if !self.retry_display_stabilization(expected_epoch, attempt) {
                     self.finish_display_churn(expected_epoch, true);
