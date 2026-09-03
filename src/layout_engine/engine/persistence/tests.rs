@@ -195,6 +195,56 @@ fn save_and_load_arms_fingerprint_reconciliation() {
     assert!(loaded.restored_location_for_window(window).is_some());
 }
 
+/// A desktop rift has listed workspaces for but never shown has no layout
+/// state. The loader rejects a file containing one, and the save used to
+/// validate the live engine against the loader's rules, so on any machine
+/// with a spare desktop every heartbeat and shutdown save failed and nothing
+/// was ever there to restore.
+#[test]
+fn save_prunes_desktops_never_shown_and_the_file_loads() {
+    let mut engine = test_engine();
+    let mut window_store = WindowStore::default();
+    let shown = SpaceId::new(31);
+    let spare = SpaceId::new(57);
+    let window = WindowId::new(42, 8);
+    let _ = engine.handle_event(
+        &mut window_store,
+        LayoutEvent::SpaceExposed(shown, CGSize::new(1200.0, 800.0)),
+    );
+    let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowAdded(shown, window));
+    engine.persistence.windows.insert(window, WindowFingerprint {
+        window_server_id: Some(9002),
+        title: Some("Project".into()),
+        width: 900.0,
+        height: 700.0,
+        app_id: Some("com.example.editor".into()),
+    });
+    // Listing is what a space query or a workspace switch on another display
+    // does; it creates the workspaces without laying the desktop out.
+    let _ = engine.virtual_workspace_manager.list_workspaces(spare);
+    let spare_workspace = engine.virtual_workspace_manager.existing_workspaces(spare)[0].0;
+    assert!(!engine.workspace_layouts.has_state(spare, spare_workspace));
+
+    let path = std::env::temp_dir().join(format!(
+        "rift-layout-restore-test-{}-{}.ron",
+        std::process::id(),
+        window.idx.get()
+    ));
+    engine.save_current_layout(path.clone(), &window_store, Some(shown)).unwrap();
+    let loaded = LayoutEngine::load(path.clone()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert!(loaded.restored_location_for_window(window).is_some());
+    assert!(
+        !loaded.virtual_workspace_manager.initialized_spaces().contains(&spare),
+        "the desktop without layout state is left out of the file"
+    );
+    assert!(
+        engine.virtual_workspace_manager.initialized_spaces().contains(&spare),
+        "saving leaves the live engine's workspaces alone"
+    );
+}
+
 #[test]
 fn full_save_records_floating_window_in_its_inactive_workspace() {
     let mut engine = test_engine();

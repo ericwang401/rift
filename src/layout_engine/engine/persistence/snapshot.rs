@@ -2,9 +2,7 @@ use super::*;
 
 pub(super) const CURRENT_SCHEMA_VERSION: u32 = 2;
 
-fn legacy_schema_version() -> u32 {
-    0
-}
+fn legacy_schema_version() -> u32 { 0 }
 
 /// Owned, versioned representation of the layout file.
 ///
@@ -78,6 +76,8 @@ impl PersistedLayout {
     /// listed but never shown (an inactive desktop on some display) is in
     /// that state, and the loader rejects a file that contains one — which
     /// made every snapshot taken on a machine with a spare desktop useless.
+    /// The live engine is never pruned: it lays the space out on exposure,
+    /// and so will the restored one.
     pub(super) fn prune_spaces_without_layout_state(&mut self) {
         let unexposed: Vec<SpaceId> = self
             .virtual_workspace_manager
@@ -91,10 +91,26 @@ impl PersistedLayout {
             .collect();
         for space in unexposed {
             self.virtual_workspace_manager.forget_space(space);
+            self.workspace_layouts.remove_space(space);
             self.floating_positions.remove_space(space);
             self.space_display_map.remove(&space);
             self.display_last_space.retain(|_, candidate| *candidate != space);
         }
+    }
+
+    /// The checks the loader runs before layout code indexes into slotmaps.
+    /// A save runs the same ones, so a file rift writes is one it can read.
+    pub(super) fn validate(&self) -> anyhow::Result<()> {
+        self.virtual_workspace_manager
+            .validate_persisted_topology()
+            .map_err(|error| anyhow::anyhow!("invalid workspace topology: {error}"))?;
+        self.workspace_layouts
+            .validate_persisted(&self.virtual_workspace_manager)
+            .map_err(|error| anyhow::anyhow!("invalid workspace layouts: {error}"))?;
+        self.floating_positions
+            .validate_persisted(&self.virtual_workspace_manager)
+            .map_err(|error| anyhow::anyhow!("invalid floating positions: {error}"))?;
+        self.persistence.validate()
     }
 
     pub(super) fn into_engine(self) -> LayoutEngine {

@@ -81,6 +81,17 @@ Entries describe this fork's changes relative to
 
 ### Fixed
 
+- **The layout is actually saved, so it is actually restored.** The restart
+  restore never fired: on any machine with a desktop rift had listed but never
+  shown since starting — a spare desktop on the other display, say — every
+  heartbeat save, the save on SIGTERM and `save layout` all failed with
+  "workspace … has no layout state", the file on disk only aged, and the
+  next start declined it as older than `max_age_secs`. The save checked the
+  live engine against the loader's rules, which reject a desktop without
+  layout state; the in-memory snapshot the display archive takes already
+  prunes such desktops from a copy, and the file now gets the same treatment.
+  A pruned desktop is laid out afresh on exposure, as it would have been
+  anyway.
 - **A window that goes native fullscreen and comes back lands where it was**,
   not beside whatever is selected, and without passing through the wrong place
   on the way. A browser tiled left of an editor came back on the right after a

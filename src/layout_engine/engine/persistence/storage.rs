@@ -131,15 +131,7 @@ impl LayoutEngine {
                 }
             }
         }
-        persisted
-            .workspace_layouts
-            .validate_persisted(&persisted.virtual_workspace_manager)
-            .map_err(|error| anyhow::anyhow!("invalid workspace layouts: {error}"))?;
-        persisted
-            .floating_positions
-            .validate_persisted(&persisted.virtual_workspace_manager)
-            .map_err(|error| anyhow::anyhow!("invalid floating positions: {error}"))?;
-        persisted.persistence.validate()?;
+        persisted.validate()?;
         let schema_version = persisted.schema_version;
         let mut engine = persisted.into_engine();
         engine.normalize_loaded_floating_state();
@@ -182,19 +174,23 @@ impl LayoutEngine {
         Ok((engine, schema_version))
     }
 
+    /// Write the layout as a file the loader will accept.
+    ///
+    /// The live engine is not directly loadable: it lists workspaces for every
+    /// desktop it has seen, and a desktop never shown since startup has no
+    /// layout state, which the loader rejects. Validating the engine itself
+    /// here, as this once did, failed every save — the heartbeat, the SIGTERM
+    /// save, `save layout` — on any machine with a spare desktop, so the file
+    /// on disk only ever aged and the restore at the next start declined it.
+    /// The owned snapshot the display archive already writes prunes those
+    /// desktops away; the file gets the same treatment.
     pub fn save(&self, path: PathBuf) -> std::io::Result<()> {
-        self.virtual_workspace_manager
-            .validate_persisted_topology()
-            .and_then(|_| {
-                self.workspace_layouts.validate_persisted(&self.virtual_workspace_manager)
-            })
-            .and_then(|_| {
-                self.floating_positions.validate_persisted(&self.virtual_workspace_manager)
-            })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        self.persistence
-            .validate()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let invalid = |error: anyhow::Error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        };
+        let persisted = self.loadable_snapshot().map_err(invalid)?;
+        persisted.validate().map_err(invalid)?;
+        let serialized = persisted.serialize();
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -202,7 +198,6 @@ impl LayoutEngine {
         if let Some(parent) = &parent {
             fs::create_dir_all(parent)?;
         }
-        let serialized = self.serialize_to_string();
         let (temporary, mut file) = loop {
             let sequence = SAVE_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
             let temporary_extension = path
@@ -265,11 +260,7 @@ impl LayoutEngine {
         active_space: Option<SpaceId>,
     ) -> anyhow::Result<String> {
         self.prepare_persisted_state(window_store, active_space);
-        // Round-trip through the owned form so the live engine is left alone
-        // while the snapshot is made loadable.
-        let mut persisted = PersistedLayout::deserialize(&self.serialize_to_string())?;
-        persisted.prune_spaces_without_layout_state();
-        Ok(persisted.serialize())
+        Ok(self.loadable_snapshot()?.serialize())
     }
 
     /// A loadable snapshot that leaves the engine's own state alone: only the
@@ -282,9 +273,16 @@ impl LayoutEngine {
         window_store: &WindowStore,
     ) -> anyhow::Result<String> {
         self.refresh_window_fingerprints(window_store);
+        Ok(self.loadable_snapshot()?.serialize())
+    }
+
+    /// The engine as the loader wants it, with the desktops that have no
+    /// layout state pruned. Taken through the owned form so the live engine
+    /// is left alone.
+    fn loadable_snapshot(&self) -> anyhow::Result<PersistedLayout> {
         let mut persisted = PersistedLayout::deserialize(&self.serialize_to_string())?;
         persisted.prune_spaces_without_layout_state();
-        Ok(persisted.serialize())
+        Ok(persisted)
     }
 
     fn prepare_persisted_state(
